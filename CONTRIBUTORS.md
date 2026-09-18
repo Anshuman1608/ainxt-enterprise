@@ -1,2 +1,5 @@
-saravanan.r@npci.org.in
-kirubakaran.susai@npci.org.in
+Saravanan R - National Payments Corporation of India - saravanan.r@npci.org.in
+
+Kirubakaran Susai - National Payments Corporation of India - kirubakaran.susai@npci.org.in
+
+Naveen Sakthivel - National Payments Corporation of India - naveen.sakthivel@npci.org.in
