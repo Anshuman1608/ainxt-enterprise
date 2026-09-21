@@ -42,4 +42,5 @@ Jemima Joy Thangaraj - National Payments Corporation of India - jemima.joy@npci.
 
 Sutari Reddy - National Payments Corporation of India - sutari.reddy@npci.org.in
 
+Muthu Narendran - National Payments Corporation of India - muthu.narendran@npci.org.in
 Aditya Metha - National Payments Corporation of India - adityamohan.metha@npci.org.in
