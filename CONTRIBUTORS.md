@@ -32,3 +32,5 @@ Pavan Ms - National Payments Corporation of India - pavan.ms@npci.org.in
 Priyadharshan R - National Payments Corporation of India - priyadharshan.r@npci.org.in
 
 Jayesh Bhere - National Payments Corporation of India - jayesh.bhere@npci.org.in
+
+Ranga Rajan - National Payments Corporation of India - ranga.raajan@npci.org.in
