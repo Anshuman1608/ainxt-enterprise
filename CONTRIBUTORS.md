@@ -34,6 +34,7 @@ Priyadharshan R - National Payments Corporation of India - priyadharshan.r@npci.
 
 Jayesh Bhere - National Payments Corporation of India - jayesh.bhere@npci.org.in
 
+Ranga Rajan - National Payments Corporation of India - ranga.raajan@npci.org.in
 Patil Utkarsh - National Payments Corporation of India - patil.utkarsh@npci.org.in
 
 Jemima Joy Thangaraj - National Payments Corporation of India - jemima.joy@npci.org.in
