@@ -51,3 +51,5 @@ Saravanan A - National Payments Corporation of India - saravanan.a@npci.org.in
 Sangeetha Murugesan - National Payments Corporation of India - sangeetha.murugesan@npci.org.in
 
 Manikanda Sakthi Subramaniam - National Payments Corporation of India - manikanda.sakthi@npci.org.in
+
+Kishan Kumar - National Payments Corporation of India - kishan.kumar@npci.org.in
