@@ -27,8 +27,11 @@ Lakshmanan S - National Payments Corporation of India - lakshmanan.s@npci.org.in
 Harshvardhan Singh Parihar - National Payments Corporation of India - harshvardhan.singh@npci.org.in
 
 Vishnu Kumar - National Payments Corporation of India - vishnukumar.br@npci.org.in
+
 Pavan Ms - National Payments Corporation of India - pavan.ms@npci.org.in
 
 Priyadharshan R - National Payments Corporation of India - priyadharshan.r@npci.org.in
 
 Jayesh Bhere - National Payments Corporation of India - jayesh.bhere@npci.org.in
+
+Jemima Joy Thangaraj - National Payments Corporation of India - jemima.joy@npci.org.in
