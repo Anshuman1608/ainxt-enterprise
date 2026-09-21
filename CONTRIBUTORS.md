@@ -23,3 +23,5 @@ Muthu Selvi V - National Payments Corporation of India - muthuselvi.v@npci.org.i
 Naveen Sakthivel - National Payments Corporation of India - naveen.sakthivel@npci.org.in
 
 Lakshmanan S - National Payments Corporation of India - lakshmanan.s@npci.org.in
+
+Harshvardhan Singh Parihar - National Payments Corporation of India - harshvardhan.singh@npci.org.in
