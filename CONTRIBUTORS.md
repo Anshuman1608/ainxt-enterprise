@@ -52,3 +52,5 @@ Sangeetha Murugesan - National Payments Corporation of India - sangeetha.muruges
 
 Manikanda Sakthi Subramaniam - National Payments Corporation of India - manikanda.sakthi@npci.org.in
 Sandeep Shankar - National Payments Corporation of India - sandeep.s@npci.org.in
+
+Kishan Kumar - National Payments Corporation of India - kishan.kumar@npci.org.in
