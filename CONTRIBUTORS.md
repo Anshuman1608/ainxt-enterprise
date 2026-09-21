@@ -4,4 +4,4 @@ Kirubakaran Susai - National Payments Corporation of India - kirubakaran.susai@n
 
 Naveen Sakthivel - National Payments Corporation of India - naveen.sakthivel@npci.org.in
 
-Anshuman Singh - National Payments Corporation of India - anshuman.s@npci.org.in
+Anshuman Singh - National Payments Corporation of India -  anshuman.s@npci.org.in
