@@ -40,3 +40,5 @@ Patil Utkarsh - National Payments Corporation of India - patil.utkarsh@npci.org.
 Jemima Joy Thangaraj - National Payments Corporation of India - jemima.joy@npci.org.in
 
 Sutari Reddy - National Payments Corporation of India - sutari.reddy@npci.org.in
+
+Muthu Narendran - National Payments Corporation of India - muthu.narendran@npci.org.in
