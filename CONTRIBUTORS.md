@@ -64,3 +64,5 @@ TamilNesan M - National Payments Corporation of India - tamilnesan.m@npci.org.in
 
 Aravind K - National Payments Corporation of India - aravind.k@npci.org.in
 Arun Singaravel - National Payments Corporation of India - arun.singaravel@npci.org.in
+
+Sampath Rangasamy - National Payments Corporation of India - sampath.rangasamy@npci.org.in
