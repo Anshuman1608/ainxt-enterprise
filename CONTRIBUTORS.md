@@ -54,3 +54,4 @@ Manikanda Sakthi Subramaniam - National Payments Corporation of India - manikand
 Sandeep Shankar - National Payments Corporation of India - sandeep.s@npci.org.in
 
 Kishan Kumar - National Payments Corporation of India - kishan.kumar@npci.org.in
+Jovin Johny - National Payments Corporation of India - jovin.johny@npci.org.in
