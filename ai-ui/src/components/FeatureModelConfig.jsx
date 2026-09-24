@@ -356,72 +356,79 @@ export default function FeatureModelConfig() {
   const assignedCount = features.filter(f => f.assignment).length
 
   return (
-    <div className="mx-auto max-w-5xl px-6 py-6">
-      <div className="mb-5 flex items-start gap-3">
-        <Cpu className="mt-1 h-6 w-6 text-blue-600" />
-        <div className="flex-1">
-          <h1 className="text-xl font-semibold text-gray-900">Feature Models</h1>
-          <p className="mt-1 text-sm text-gray-600">
-            Choose which configured LLM serves each platform feature. Models come from
-            the <span className="font-medium">LLM Providers</span> screen; a feature with
-            nothing assigned uses its built-in default.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={load}
-          className="mt-1 flex items-center gap-1 rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700 hover:bg-gray-100"
-        >
-          <RotateCw className="h-3 w-3" /> Refresh
-        </button>
-      </div>
-
-      {!loading && (
-        <p className="mb-4 text-xs text-gray-500">
-          {features.length} feature(s) · {assignedCount} assigned · org <code>{orgId}</code>
-        </p>
-      )}
-
-      {loading && <div className="py-10 text-center text-sm text-gray-500">Loading…</div>}
-
-      {!loading && features.length === 0 && (
-        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          No features are registered yet. Run <code>python db/migrate.py</code> to seed the
-          feature catalogue, or POST <code>/feature-models/sync</code> to re-seed it now.
-        </div>
-      )}
-
-      {groups.map(g => (
-        <div key={g.category} className="mb-4 overflow-hidden rounded-lg border border-gray-200 bg-white">
+    // App.jsx wraps every route in `h-full overflow-hidden`, so a page that
+    // does not own its own scroll container is simply clipped — the content
+    // below the fold becomes unreachable. Same `h-full overflow-y-auto` root
+    // that ModelGovernance.jsx:344 uses; the inner wrapper keeps the centred
+    // max-width layout it previously had on the outer element.
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto max-w-5xl px-6 py-6">
+        <div className="mb-5 flex items-start gap-3">
+          <Cpu className="mt-1 h-6 w-6 text-blue-600" />
+          <div className="flex-1">
+            <h1 className="text-xl font-semibold text-gray-900">Feature Models</h1>
+            <p className="mt-1 text-sm text-gray-600">
+              Choose which configured LLM serves each platform feature. Models come from
+              the <span className="font-medium">LLM Providers</span> screen; a feature with
+              nothing assigned uses its built-in default.
+            </p>
+          </div>
           <button
             type="button"
-            onClick={() => setCollapsed(c => ({ ...c, [g.category]: !c[g.category] }))}
-            className="flex w-full items-center gap-2 border-b border-gray-200 bg-gray-50 px-4 py-2 text-left"
+            onClick={load}
+            className="mt-1 flex items-center gap-1 rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700 hover:bg-gray-100"
           >
-            {collapsed[g.category]
-              ? <ChevronRight className="h-4 w-4 text-gray-400" />
-              : <ChevronDown className="h-4 w-4 text-gray-400" />}
-            <span className="text-sm font-semibold text-gray-700">{g.category}</span>
-            <span className="text-xs text-gray-400">({g.items.length})</span>
+            <RotateCw className="h-3 w-3" /> Refresh
           </button>
-          {!collapsed[g.category] && g.items.map(f => (
-            <FeatureRow
-              key={f.feature_key}
-              feature={f}
-              orgId={orgId}
-              capabilities={capabilities}
-              onSaved={onSaved}
-              onError={onError}
-            />
-          ))}
         </div>
-      ))}
 
-      <Toast
-        message={toast?.message}
-        tone={toast?.tone}
-        onClose={() => setToast(null)}
-      />
+        {!loading && (
+          <p className="mb-4 text-xs text-gray-500">
+            {features.length} feature(s) · {assignedCount} assigned · org <code>{orgId}</code>
+          </p>
+        )}
+
+        {loading && <div className="py-10 text-center text-sm text-gray-500">Loading…</div>}
+
+        {!loading && features.length === 0 && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            No features are registered yet. Run <code>python db/migrate.py</code> to seed the
+            feature catalogue, or POST <code>/feature-models/sync</code> to re-seed it now.
+          </div>
+        )}
+
+        {groups.map(g => (
+          <div key={g.category} className="mb-4 overflow-hidden rounded-lg border border-gray-200 bg-white">
+            <button
+              type="button"
+              onClick={() => setCollapsed(c => ({ ...c, [g.category]: !c[g.category] }))}
+              className="flex w-full items-center gap-2 border-b border-gray-200 bg-gray-50 px-4 py-2 text-left"
+            >
+              {collapsed[g.category]
+                ? <ChevronRight className="h-4 w-4 text-gray-400" />
+                : <ChevronDown className="h-4 w-4 text-gray-400" />}
+              <span className="text-sm font-semibold text-gray-700">{g.category}</span>
+              <span className="text-xs text-gray-400">({g.items.length})</span>
+            </button>
+            {!collapsed[g.category] && g.items.map(f => (
+              <FeatureRow
+                key={f.feature_key}
+                feature={f}
+                orgId={orgId}
+                capabilities={capabilities}
+                onSaved={onSaved}
+                onError={onError}
+              />
+            ))}
+          </div>
+        ))}
+
+        <Toast
+          message={toast?.message}
+          tone={toast?.tone}
+          onClose={() => setToast(null)}
+        />
+      </div>
     </div>
   )
 }
