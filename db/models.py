@@ -18,7 +18,11 @@ from sqlalchemy.orm import relationship
 # pgvector — graceful import (requires pgvector Python package + PG extension)
 try:
     from pgvector.sqlalchemy import Vector as _Vector
-    _VECTOR_TYPE = _Vector(768)   # nomic-embed-text / text-embedding-3-small dimensionality
+    # core.config.EMBED_DIM is the single statement of the stored vector width
+    # (see its comment: this is a schema invariant shared with db/migrate.py's
+    # vector(768) DDL and the embed service, not a tuning knob).
+    from core.config import EMBED_DIM as _EMBED_DIM
+    _VECTOR_TYPE = _Vector(_EMBED_DIM)
     _PGVECTOR_AVAILABLE = True
 except ImportError:
     _Vector = None
@@ -2884,6 +2888,23 @@ class LLMModel(Base):
                            nullable=False, index=True)
     model_id     = Column(String(255), nullable=False)
     display_name = Column(String(255), nullable=False)
+    # What this model DOES. Until this column existed the registry covered
+    # generation only, so an admin could swap the chat model from a dropdown
+    # but had to edit services/embed_svc/.env and restart a container to change
+    # the embedding model — "model-agnostic" was not true of retrieval.
+    #
+    #   generation — chat/completion (every pre-existing row; the default)
+    #   embedding  — vector embeddings. NOT an ordinary dropdown: changing the
+    #                assigned embedding model invalidates every stored vector,
+    #                because vectors from a different model are not comparable
+    #                even at the same width (see core.config.EMBED_DIM and
+    #                EMBED_PROVIDER). Reassignment must be a reindex with an
+    #                atomic cutover, which is why nothing writes this value as
+    #                an active assignment yet.
+    #   rerank     — cross-encoder reranking. Has no such constraint (it scores
+    #                candidates at query time and stores nothing), so it is
+    #                safe to switch live.
+    model_kind   = Column(String(20), nullable=False, default="generation")
     capabilities = Column(JSONB, nullable=False, default=dict)
     enabled      = Column(Boolean, nullable=False, default=True)
     is_default   = Column(Boolean, nullable=False, default=False)

@@ -1355,6 +1355,9 @@ CREATE INDEX IF NOT EXISTS idx_sec_scan_scanned_at ON security_scan_results(scan
     # ── Part AD3: 2026-09-24 — agents_pg.preferred_model holds full model ids ──
     _part_ad3_preferred_model_width_2026_09_24()
 
+    # ── Part AD4: 2026-09-24 — llm_models.model_kind (generation/embedding/rerank)
+    _part_ad4_llm_models_model_kind_2026_09_24()
+
     # ── OSS schema-drift fixes ───────────────────────────────────────────────
     # (_part_oss3 runs at the top of this function — the catalogue seeds need it.)
     _part_oss4_model_permissions_web_search()
@@ -8469,6 +8472,49 @@ def _part_ad3_preferred_model_width_2026_09_24():
     print("  ok Part AD3: agents_pg.preferred_model widened to VARCHAR(255)")
 
 
+def _part_ad4_llm_models_model_kind_2026_09_24():
+    """
+    2026-09-24 — llm_models.model_kind: bring embedding/rerank into the registry.
+
+    The provider registry covered GENERATION only, so an admin could swap the
+    chat model from a dropdown but had to edit services/embed_svc/.env and
+    restart a container to change the embedding or reranking model.
+
+    Every existing row is generation, which is why the column is NOT NULL with
+    a 'generation' default — the backfill is the default, and no data migration
+    is needed.
+
+    A CHECK rather than a Postgres ENUM: adding a value to an enum type needs
+    ALTER TYPE and cannot run inside a transaction on older servers, whereas
+    widening a CHECK is a plain DDL statement. Same reasoning as
+    llm_providers.family, which is also a plain VARCHAR validated in the router.
+    """
+    _run_ddl(
+        "ALTER TABLE llm_models ADD COLUMN IF NOT EXISTS "
+        "model_kind VARCHAR(20) NOT NULL DEFAULT 'generation'",
+        "llm_models.model_kind",
+    )
+    # Idempotent: drop-then-add so a re-run with a widened value list works.
+    _run_ddl(
+        "ALTER TABLE llm_models DROP CONSTRAINT IF EXISTS ck_llm_models_model_kind",
+        "llm_models.drop old model_kind check",
+    )
+    _run_ddl(
+        "ALTER TABLE llm_models ADD CONSTRAINT ck_llm_models_model_kind "
+        "CHECK (model_kind IN ('generation', 'embedding', 'rerank'))",
+        "llm_models.ck_model_kind",
+    )
+    # Every existing picker (GET /all-models, get_cli_style_models, model
+    # governance) filters on this now, and they all read the generation set, so
+    # an index on it keeps those unchanged in cost.
+    _run_ddl(
+        "CREATE INDEX IF NOT EXISTS idx_llm_models_kind "
+        "ON llm_models(model_kind, enabled)",
+        "llm_models.idx_model_kind",
+    )
+    print("  ok Part AD4: llm_models.model_kind added (default 'generation')")
+
+
 # ── Post-migration verification ─────────────────────────────────────────────
 # Objects that the application queries unconditionally on a default install. If
 # any is missing the platform will 500 at runtime, so a migration that leaves one
@@ -8489,6 +8535,7 @@ _REQUIRED_SCHEMA = [
     ("feature_model_config", None),
     ("model_usages", "feature_key"),
     ("llm_spend_daily", "token_type"),
+    ("llm_models", "model_kind"),
 ]
 
 

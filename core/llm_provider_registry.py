@@ -60,6 +60,10 @@ def _load_from_db() -> list[dict]:
                 "model_id": model.model_id,
                 "display_name": model.display_name,
                 "capabilities": model.capabilities or {},
+                # "generation" | "embedding" | "rerank". getattr-guarded so a
+                # process running this code against a database that has not yet
+                # had migrate.py Part AD4 applied still works.
+                "model_kind": getattr(model, "model_kind", None) or "generation",
                 "is_default": model.is_default,
                 "sort_order": model.sort_order,
                 "provider_id": provider.id,
@@ -106,18 +110,28 @@ def invalidate_cache() -> None:
         logger.warning(f"[llm_provider_registry] cache invalidation failed: {exc}")
 
 
-def get_enabled_models(channel: Optional[str] = None) -> list[dict]:
+def get_enabled_models(channel: Optional[str] = None,
+                       kind: Optional[str] = "generation") -> list[dict]:
     """All enabled models across all enabled providers.
 
     `channel` (e.g. "web", "cli", "ide-vscode", "api") filters against each
     model's `capabilities.channels` list; a model with no `channels` entry is
     visible on every channel (the common case — most models aren't
     channel-restricted).
+
+    `kind` filters on llm_models.model_kind and DEFAULTS TO "generation", which
+    is what every pre-existing caller means: the chat/CLI/IDE pickers, model
+    governance and the feature resolver all want models you can send a prompt
+    to. Without that default, adding an embedding model to the registry would
+    make it appear in the chat dropdown. Pass kind=None for every kind.
     """
     models = _read_cache()
     if models is None:
         models = _load_from_db()
         _write_cache(models)
+
+    if kind:
+        models = [m for m in models if m.get("model_kind", "generation") == kind]
 
     if channel:
         models = [
@@ -126,6 +140,24 @@ def get_enabled_models(channel: Optional[str] = None) -> list[dict]:
             or channel in m["capabilities"]["channels"]
         ]
     return models
+
+
+def get_models_by_kind(kind: str) -> list[dict]:
+    """Enabled models of one kind — "generation" | "embedding" | "rerank".
+
+    The embedding and rerank sets are what make retrieval configurable rather
+    than env-only. Note the asymmetry, which callers must respect:
+
+      * rerank models can be switched live — reranking scores candidates at
+        query time and persists nothing.
+      * embedding models cannot. Every stored vector was produced by one
+        specific model and vectors from a different model are not comparable
+        with it, even at the same width (see core.config.EMBED_DIM). Changing
+        the assigned embedding model is a reindex with an atomic cutover, so
+        this returns the CANDIDATES an admin may choose from, not something
+        safe to apply on save.
+    """
+    return get_enabled_models(kind=kind)
 
 
 def get_model(model_id: str) -> Optional[dict]:

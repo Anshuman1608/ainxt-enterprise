@@ -281,6 +281,28 @@ CKMS_ENABLED: bool = os.getenv("CKMS_ENABLED", "false").lower() == "true"
 # already in document_embeddings, even at the same 768 dimensions.
 EMBED_PROVIDER = os.getenv("EMBED_PROVIDER", "ollama").strip().lower()
 
+# ── Stored embedding width ────────────────────────────────────
+# The dimensionality of every vector in the platform, and therefore a SCHEMA
+# INVARIANT, not a tuning knob. It appears as `vector(768)` in db/migrate.py
+# (document_embeddings, kb_edges and the pgvector catch-up DDL), as
+# db/models.py's `_VECTOR_TYPE = Vector(768)`, and as the `dimensions:` OpenAI
+# truncation parameter in services/embed_svc/embedder.py. Those five places
+# were five independent literals that happened to agree; this constant is so
+# the agreement is stated once and can be checked.
+#
+# NOT env-overridable on purpose. Changing it does not migrate anything:
+# Postgres rejects a vector of the wrong width on insert, and a pgvector index
+# built at one width cannot serve queries at another. Changing the stored width
+# is a reindex — drop/rebuild every embedding column and re-embed every chunk —
+# which is why the embedding MODEL is not an ordinary dropdown either. See
+# EMBED_PROVIDER's note above: even at the same 768 dimensions, vectors from a
+# different model are not comparable with what is already stored.
+#
+# It is exported so the embed service can REFUSE a model whose native
+# dimensionality differs, loudly, instead of silently storing vectors that do
+# not match the index.
+EMBED_DIM = 768
+
 # ── Redis ─────────────────────────────────────────────────────
 # Local dev: set REDIS_HOST=localhost (and start Redis, e.g. via
 # `docker compose up -d redis`) in your own .env. Prod: set REDIS_HOST and

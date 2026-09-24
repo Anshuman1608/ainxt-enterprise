@@ -351,10 +351,31 @@ class ProviderUpdate(BaseModel):
     api_key: Optional[str] = None   # rotate when present
 
 
+# What a registered model does. "generation" is every pre-existing row and the
+# default, so nothing changes for a deployment that never sets it.
+#
+# Note the asymmetry an admin UI must respect: a "rerank" model can be switched
+# live (it scores candidates at query time and stores nothing), but an
+# "embedding" model cannot — every stored vector came from one specific model
+# and vectors from a different one are not comparable, even at the same width
+# (core.config.EMBED_DIM). Registering an embedding model here makes it a
+# CANDIDATE; applying it is a reindex with an atomic cutover.
+MODEL_KINDS = ("generation", "embedding", "rerank")
+
+
 class ModelCreate(BaseModel):
     model_id: str
     display_name: str
     capabilities: Optional[dict] = None
+    model_kind: str = "generation"
+
+    @field_validator("model_kind")
+    @classmethod
+    def validate_model_kind(cls, v: str) -> str:
+        v = (v or "generation").strip().lower()
+        if v not in MODEL_KINDS:
+            raise ValueError(f"model_kind must be one of {list(MODEL_KINDS)}, got {v!r}.")
+        return v
 
     @field_validator("model_id")
     @classmethod
@@ -376,6 +397,7 @@ class ModelCreate(BaseModel):
 class ModelUpdate(BaseModel):
     display_name: Optional[str] = None
     capabilities: Optional[dict] = None
+    model_kind: Optional[str] = None
     enabled: Optional[bool] = None
     is_default: Optional[bool] = None
     sort_order: Optional[int] = None
@@ -426,6 +448,7 @@ def _model_out(m: LLMModel) -> dict:
         "model_id": m.model_id,
         "display_name": m.display_name,
         "capabilities": m.capabilities or {},
+        "model_kind": getattr(m, "model_kind", None) or "generation",
         "enabled": m.enabled,
         "is_default": m.is_default,
         "sort_order": m.sort_order,
@@ -869,6 +892,7 @@ def create_model(
         model_id=body.model_id,
         display_name=body.display_name,
         capabilities=capabilities,
+        model_kind=body.model_kind,
         enabled=True,
         source="manual",
         created_by=admin.get("email") or admin.get("sub"),
@@ -898,6 +922,43 @@ def update_model(
         model.display_name = body.display_name.strip() or model.display_name
     if body.capabilities is not None:
         model.capabilities = body.capabilities
+    if body.model_kind is not None:
+        kind = body.model_kind.strip().lower()
+        if kind not in MODEL_KINDS:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"model_kind must be one of {list(MODEL_KINDS)}, got {kind!r}.",
+            )
+        # Changing a model's KIND changes which pickers it appears in, so guard
+        # the two directions that would break something already relying on it.
+        if kind != "generation" and model.is_default:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"'{model.model_id}' is the platform default generation "
+                    f"model. Make another model the default before changing "
+                    f"its kind to '{kind}'."
+                ),
+            )
+        if kind != "generation":
+            try:
+                from db.models import FeatureModelConfig
+                named = [
+                    c.feature_key for c in db.query(FeatureModelConfig).all()
+                    if c.model_id == model.id or model.id in (c.fallback_model_ids or [])
+                ]
+            except Exception:
+                named = []
+            if named:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"'{model.model_id}' is assigned to feature(s) {named}, "
+                        f"which send it prompts. Clear those assignments before "
+                        f"changing its kind to '{kind}'."
+                    ),
+                )
+        model.model_kind = kind
     if body.enabled is not None:
         model.enabled = body.enabled
     if body.is_default is not None:

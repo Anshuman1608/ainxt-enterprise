@@ -13,7 +13,26 @@ OLLAMA_URL       = os.getenv("OLLAMA_URL", "")
 OLLAMA_MODEL     = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text:latest")
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
-OPENAI_DIMS      = 768
+
+# ── Stored vector width ──────────────────────────────────────────────────────
+# Sent to OpenAI as the `dimensions:` parameter, which asks the API to truncate
+# its native output (1536 for text-embedding-3-small, 3072 for -3-large) to
+# this width. That is not a preference: it has to equal the width of the
+# pgvector columns the results are stored in, or Postgres rejects the insert.
+#
+# Derived from core.config.EMBED_DIM rather than restated here, because it was
+# one of five independent 768 literals across db/migrate.py's DDL,
+# db/models.py's Vector(768), and this file that happened to agree. Falls back
+# to a local 768 only when core/ is not importable (this service can be run
+# with services/embed_svc/ as its root).
+#
+# Changing it is a REINDEX, not a config change — see EMBED_DIM's comment.
+try:
+    from core.config import EMBED_DIM as _PLATFORM_EMBED_DIM
+except Exception:      # noqa: BLE001 — standalone run without core/ on the path
+    _PLATFORM_EMBED_DIM = 768
+OPENAI_DIMS      = _PLATFORM_EMBED_DIM
+EMBED_DIM        = _PLATFORM_EMBED_DIM
 
 # ── Nomic Embed (custom / any OpenAI-compatible embeddings endpoint) ─────────
 # Set NOMIC_EMBED_URL to point at a self-hosted or remote embedding gateway
@@ -33,7 +52,11 @@ OPENAI_DIMS      = 768
 NOMIC_EMBED_URL     = os.getenv("NOMIC_EMBED_URL", "").rstrip("/")
 NOMIC_EMBED_API_KEY = os.getenv("NOMIC_EMBED_API_KEY", "")
 NOMIC_EMBED_MODEL   = os.getenv("NOMIC_EMBED_MODEL", "nomic-embed-text-v1.5")
-NOMIC_EMBED_DIMS    = int(os.getenv("NOMIC_EMBED_DIMS", "768"))
+# Native output width of NOMIC_EMBED_MODEL, used only by the startup probe to
+# verify the configured endpoint actually returns vectors the platform can
+# store. Defaults to EMBED_DIM because a value that differs from it cannot be
+# persisted — the probe failing loudly at startup is the point.
+NOMIC_EMBED_DIMS    = int(os.getenv("NOMIC_EMBED_DIMS", str(_PLATFORM_EMBED_DIM)))
 NOMIC_EMBED_TIMEOUT = float(os.getenv("NOMIC_EMBED_TIMEOUT", "60.0"))
 # Batch size for Nomic calls — some gateways may have a lower limit than OpenAI.
 # Default 64 matches Ollama batch size; lower if the gateway returns 413/429.
