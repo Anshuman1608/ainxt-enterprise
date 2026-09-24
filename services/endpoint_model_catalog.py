@@ -185,6 +185,93 @@ def provider_of(model: str) -> str:
     return "unknown"
 
 
+def family_of(model: str) -> str:
+    """
+    'anthropic' | 'openai' | 'gemini' | 'openai_compatible' | 'local' | 'unknown'
+    for any model id — the provider FAMILY, resolved from the DB registry rather
+    than parsed out of the model's name.
+
+    This is the one predicate that replaces name-prefix guessing wherever code
+    needs to know "which vendor contract does this model speak". Three call
+    sites that each inferred it independently, and got it wrong for
+    admin-registered models, now delegate here:
+
+      - services/feedback_processor.py, models/classifier.py,
+        models/hybrid_retriever.py — they hardcoded provider="claude" next to a
+        dynamically resolved model, so repointing a tier at a non-Anthropic
+        model sent a mismatched pair to /llm/generate.
+      - ABStudio app/core/llm_handler._classify_model — its "everything else is
+        local" default routed OpenRouter ids like "anthropic/claude-sonnet-4-6"
+        to the in-house LiteLLM endpoint.
+      - middleware/budget_middleware — see classify_model() for the billing
+        half of the same problem.
+
+    Resolution order (registry first, name heuristics last):
+      1. core.llm_provider_registry — authoritative. Its `family` column is
+         already populated with exactly the five values the admin UI writes.
+         "ollama" is reported as "local" because that is what callers act on.
+      2. classify_model() == "local" — catches in-house LiteLLM ids that have
+         no registry row (the live local catalog).
+      3. provider_of() — the cloud-catalog regexes, for a cloud model the
+         registry lookup missed.
+
+    Returns "unknown" rather than guessing. Callers MUST handle it:
+    "openai_compatible" and "unknown" cannot be served by the three built-in
+    vendor gateways, so a caller whose only options are claude/openai/gemini
+    must fall back, not coerce.
+    """
+    if not model:
+        return "unknown"
+
+    try:
+        from core.llm_provider_registry import get_model as _get_registry_model
+        reg = _get_registry_model(model)
+    except Exception as exc:
+        logger.warning("endpoint_catalog: registry family lookup failed for %r → %s", model, exc)
+        reg = None
+    if reg:
+        fam = (reg.get("family") or "").strip().lower()
+        if fam == "ollama":
+            return "local"
+        if fam in ("anthropic", "openai", "gemini", "openai_compatible"):
+            return fam
+
+    if classify_model(model) == "local":
+        return "local"
+
+    provider = provider_of(model)
+    if provider == "claude":
+        return "anthropic"
+    if provider in ("openai", "gemini"):
+        return provider
+    return "unknown"
+
+
+# Families the built-in vendor gateways (and the llm_proxy's /llm/generate
+# provider field) can actually serve. "openai_compatible" is deliberately
+# absent: those models need their provider row's own base_url, which the
+# three-way provider switch has no way to supply.
+_PROXY_PROVIDER_BY_FAMILY = {
+    "anthropic": "claude",
+    "openai":    "openai",
+    "gemini":    "gemini",
+}
+
+
+def proxy_provider_for(model: str) -> Optional[str]:
+    """
+    The `provider` value to send to the LLM proxy's /llm/generate for `model`,
+    or None when no built-in gateway can serve it.
+
+    /llm/generate resolves its gateway from `provider` alone
+    (services/llm_proxy/main.py::_resolve_gateway, which accepts only
+    claude|openai|gemini) and forwards `model` untouched — so a mismatched pair
+    reaches the wrong vendor's SDK and fails. Callers must treat None as "skip
+    this optional enrichment", never as a reason to guess "claude".
+    """
+    return _PROXY_PROVIDER_BY_FAMILY.get(family_of(model))
+
+
 def has_cloud_models(model_ids: Optional[List[str]]) -> bool:
     """True if any entry in an endpoint's allowlist is a paid cloud model."""
     if not model_ids:

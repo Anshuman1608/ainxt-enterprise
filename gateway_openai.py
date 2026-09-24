@@ -110,15 +110,13 @@ def _log_cache_effectiveness(
 
 class OpenAIGateway:
 
-    def generate_with_model(self, prompt, model):
-
-        from core.model_registry import BLOCKED_MODELS
-
-        if model in BLOCKED_MODELS:
-            raise Exception(f"Blocked model attempted: {model}")
-
-        # compliance check already exists
-        return self.generate(prompt)
+    # `generate_with_model(prompt, model)` was removed here. It validated
+    # `model` against BLOCKED_MODELS and then called `self.generate(prompt)`
+    # WITHOUT forwarding it, so the caller's model was silently replaced by the
+    # deployment default (OPENAI_PRIMARY_MODEL). It had zero callers repo-wide,
+    # and its name promised the opposite of what it did, so it was a trap for
+    # anyone implementing per-feature model assignment. Pass `model=` to
+    # generate() directly — it already accepts it.
 
     def __init__(self):
 

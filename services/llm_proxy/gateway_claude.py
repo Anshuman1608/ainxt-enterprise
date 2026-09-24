@@ -432,7 +432,27 @@ def _convert_oai_messages_to_anthropic(messages, request_id):
 class ClaudeGateway:
     from core.model_registry import BLOCKED_MODELS
 
-    if CLAUDE_MODEL in BLOCKED_MODELS:
+    # CLAUDE_MODEL (= CLAUDE_PRIMARY_MODEL) is blank for any deployment
+    # configured purely through the "LLM Providers" admin screen — install.sh
+    # only ever writes the raw ANTHROPIC_API_KEY, never this role-specific
+    # override. core.model_registry.BLOCKED_MODELS can itself contain ""
+    # (CLAUDE_OPUS_5_MODEL is also blank by default and gets added to it
+    # whenever ENABLE_CLI_OPUS_5 is off — which is the default), so "" in
+    # BLOCKED_MODELS is true on a fresh admin-only install. Without the
+    # `CLAUDE_MODEL and` guard that made "" match, raising this exception at
+    # CLASS-DEFINITION time — meaning gateway_claude.py could never be
+    # imported at all, so EVERY Claude model (not just one) failed with
+    # "Error: no gateway available", regardless of which one was requested.
+    #
+    # Root gateway_claude.py:103-118 already carries this guard; this copy did
+    # not. It stayed latent here only because this service's trimmed
+    # model_registry implemented just ENABLE_OPUS and so never added "" — the
+    # moment the missing kill-switches were ported in, it became live.
+    #
+    # Note this only validates the module-level DEFAULT model. The per-request
+    # model is gated in services/llm_proxy/main.py's /llm/generate handler,
+    # which is the check that actually enforces the kill-switches.
+    if CLAUDE_MODEL and CLAUDE_MODEL in BLOCKED_MODELS:
         raise Exception("Blocked Claude model attempted")
 
     def __init__(self, api_key: str = None):

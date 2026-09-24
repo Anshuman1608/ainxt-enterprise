@@ -36,6 +36,19 @@ CLAUDE_HAIKU         = os.getenv("CLAUDE_HAIKU",         "")   # set via CLAUDE_
 CLAUDE_OPUS_MODEL    = os.getenv("CLAUDE_OPUS_MODEL",    "")   # set via CLAUDE_OPUS_MODEL in .env
 CLAUDE_OPUS_46_MODEL = os.getenv("CLAUDE_OPUS_46_MODEL", "")   # RETIRED — always blocked; set via env if needed
 ENABLE_OPUS          = os.getenv("ENABLE_OPUS", "true").lower() in ("true", "1", "yes")
+# The three switches below MUST stay identical to root core/model_registry.py
+# (same env var, same default). This copy previously declared only ENABLE_OPUS,
+# so ENABLE_CLI_OPUS_48 / ENABLE_CLI_OPUS_5 / ENABLE_SONNET_5 were enforced on
+# the gateway path and silently ignored on the proxy path — see the BLOCKED
+# MODELS section below. scripts/ci/release_checks.py asserts the parity.
+#
+# This module cannot import the root registry to avoid the duplication:
+# services/llm_proxy/main.py deliberately prepends its own directory to
+# sys.path so `core.*` binds to these local copies, which shadows the root
+# package for the whole process.
+ENABLE_SONNET_5      = os.getenv("ENABLE_SONNET_5", "true").lower() in ("true", "1", "yes")
+ENABLE_CLI_OPUS_48   = os.getenv("ENABLE_CLI_OPUS_48", "true").lower() in ("true", "1", "yes")
+ENABLE_CLI_OPUS_5    = os.getenv("ENABLE_CLI_OPUS_5", "false").lower() in ("true", "1", "yes")
 SOLUTION_MODEL       = CLAUDE_OPUS_MODEL if ENABLE_OPUS else CLAUDE_PRIMARY_MODEL
 
 
@@ -127,10 +140,30 @@ BLOCKED_MODELS = {
 
 }
 
-# Opus 4-7 and 4-6 blocked only when ENABLE_OPUS=false (defaults to true)
+# The four gates below mirror root core/model_registry.py:332-452 exactly,
+# including the intentional double-add of CLAUDE_OPUS_48_MODEL (the global
+# switch and the CLI opt-in both block it). Keep in sync.
+#
+# This block previously added CLAUDE_OPUS_46_MODEL where root adds
+# CLAUDE_OPUS_48_MODEL, so Opus 4.8 was never blocked in the proxy under any
+# setting. 4.6 is already covered by the literal "claude-opus-4-6" in the
+# static retired set above, so that add was a no-op as well as wrong.
 if not ENABLE_OPUS:
     BLOCKED_MODELS.add(CLAUDE_OPUS_MODEL)
-    BLOCKED_MODELS.add(CLAUDE_OPUS_46_MODEL)
+    BLOCKED_MODELS.add(CLAUDE_OPUS_48_MODEL)
+
+# Opus 4.8 is CLI/IDE-only; blocked when either the global Opus switch is off
+# OR the CLI-specific opt-in is off.
+if not ENABLE_OPUS or not ENABLE_CLI_OPUS_48:
+    BLOCKED_MODELS.add(CLAUDE_OPUS_48_MODEL)
+
+# Opus 5 is CLI/IDE-only and opt-in. Blocked unless ENABLE_CLI_OPUS_5=true.
+if not ENABLE_CLI_OPUS_5:
+    BLOCKED_MODELS.add(CLAUDE_OPUS_5_MODEL)
+
+# Sonnet 5 kill-switch — no channel gating, only a global on/off.
+if not ENABLE_SONNET_5:
+    BLOCKED_MODELS.add(CLAUDE_SONNET_5_MODEL)
 
 # Operator extension — block additional models without code changes.
 # Format: BLOCKED_MODELS_EXTRA=model-a,model-b

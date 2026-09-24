@@ -497,6 +497,74 @@ def check_model_literals(cfg) -> list[str]:
     ]
 
 
+# Governance kill-switches that MUST exist in both model registries. The proxy
+# runs on its own host with its own sys.path (services/llm_proxy/main.py
+# prepends its directory so `core.*` binds to the local copies), so it cannot
+# import the root registry — the two files are necessarily duplicated and can
+# only be kept honest by a check.
+_KILL_SWITCHES = (
+    "ENABLE_OPUS",
+    "ENABLE_CLI_OPUS_48",
+    "ENABLE_CLI_OPUS_5",
+    "ENABLE_SONNET_5",
+)
+
+_REGISTRY_PAIR = (
+    "core/model_registry.py",
+    "services/llm_proxy/core/model_registry.py",
+)
+
+
+def check_registry_switch_parity(cfg) -> list[str]:
+    """Both model registries must implement the same governance kill-switches.
+
+    services/llm_proxy/ is deployed separately and shadows the root `core`
+    package on sys.path, so `from core.model_registry import BLOCKED_MODELS`
+    resolves to whichever copy the running process bound. The proxy copy
+    implemented only ENABLE_OPUS, so a deployment setting
+    ENABLE_CLI_OPUS_5=false was refused on the gateway path and still served
+    through the proxy path. It also added CLAUDE_OPUS_46_MODEL where root adds
+    CLAUDE_OPUS_48_MODEL, so Opus 4.8 was never blocked in the proxy at all.
+
+    Checks two things per switch: that the env var is read, and that it
+    actually gates a BLOCKED_MODELS.add(). Declaring the flag without using it
+    is precisely the drift that shipped.
+    """
+    bad: list[str] = []
+    srcs: dict[str, str] = {}
+    for rel in _REGISTRY_PAIR:
+        path = ROOT / rel
+        if not path.exists():
+            return [f"{rel}: missing — registry parity cannot be verified"]
+        srcs[rel] = path.read_text(encoding="utf-8", errors="replace")
+
+    for rel, src in srcs.items():
+        for switch in _KILL_SWITCHES:
+            if not re.search(rf'{switch}\s*=\s*os\.getenv\(\s*"{switch}"', src):
+                bad.append(f"{rel}: governance switch {switch} is not read from the environment")
+            elif not re.search(rf"not {switch}\b", src):
+                bad.append(f"{rel}: {switch} is declared but never gates a BLOCKED_MODELS.add()")
+
+    # The static retired-model set must match exactly, or one path serves a
+    # model the other has retired.
+    def _static_set(src: str) -> set[str]:
+        m = re.search(r"BLOCKED_MODELS(?::\s*set\[str\])?\s*=\s*\{(.*?)\n\}", src, re.S)
+        return set(re.findall(r'"([^"]+)"', m.group(1))) if m else set()
+
+    root_set = _static_set(srcs[_REGISTRY_PAIR[0]])
+    proxy_set = _static_set(srcs[_REGISTRY_PAIR[1]])
+    if not root_set or not proxy_set:
+        bad.append("could not parse a BLOCKED_MODELS literal from both registries")
+    elif root_set != proxy_set:
+        only_root = ", ".join(sorted(root_set - proxy_set)) or "-"
+        only_proxy = ", ".join(sorted(proxy_set - root_set)) or "-"
+        bad.append(
+            f"BLOCKED_MODELS static sets diverged — only in root: {only_root}; "
+            f"only in proxy: {only_proxy}"
+        )
+    return bad
+
+
 CHECKS = {
     "docs-tracked":         check_docs_tracked,
     "readme-links":         check_readme_links,
@@ -508,6 +576,7 @@ CHECKS = {
     "python-syntax":        check_python_syntax,
     "model-hint-coverage":  check_model_hint_coverage,
     "model-literals":       check_model_literals,
+    "registry-switch-parity": check_registry_switch_parity,
     "docs-panel-coverage":  check_docs_panel_coverage,
     "readme-feature-table": check_readme_feature_table,
 }

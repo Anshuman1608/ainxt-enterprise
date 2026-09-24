@@ -81,13 +81,27 @@ def _expand_query(question: str) -> str:
     )
     combined_prompt = f"{_system}\n\nQuestion: {question}"
     try:
+        # Resolve the model FIRST, then derive the provider from it — this was
+        # a hardcoded provider="claude" beside a dynamically resolved model,
+        # which sent a mismatched pair once the "haiku" tier pointed at another
+        # vendor. /llm/generate picks its gateway from `provider` alone.
+        from services.endpoint_model_catalog import proxy_provider_for
+        _model = cli_model_for_tier("haiku")
+        _provider = proxy_provider_for(_model)
+        if not _provider:
+            # No built-in gateway can serve it; expansion is optional, so skip.
+            logger.info(
+                "Query expansion: no proxy gateway for model %r — using original query", _model,
+            )
+            return question
+
         tokens: list[str] = []
         from core.proxy_tool_use import llm_proxy_headers as _lph
         with httpx.Client(timeout=httpx.Timeout(15.0, connect=3.0)) as _hc:
             with _hc.stream(
                 "POST",
                 f"{proxy_url}/llm/generate",
-                json={"provider": "claude", "prompt": combined_prompt, "model": cli_model_for_tier("haiku")},
+                json={"provider": _provider, "prompt": combined_prompt, "model": _model},
                     headers=_lph(),
             ) as resp:
                 resp.raise_for_status()
@@ -663,15 +677,30 @@ def _hybrid_retrieve_context_inner(
                     )
                     _prompt = f"{_sys}\n\nQuestion: {q}"
                     try:
+                        from services.endpoint_model_catalog import proxy_provider_for
+                        _dq_model = cli_model_for_tier("haiku")
+                        _dq_provider = proxy_provider_for(_dq_model)
+                        if not _dq_provider:
+                            # No built-in gateway serves this model;
+                            # decomposition is an optional recall boost.
+                            logger.debug(
+                                "query decomposition: no proxy gateway for model %r", _dq_model,
+                            )
+                            return []
+
                         from core.proxy_tool_use import llm_proxy_headers as _lph
+                        from core.proxy_tool_use import llm_proxy_ndjson_text as _ndjson
                         with httpx.Client(timeout=httpx.Timeout(12.0, connect=3.0)) as _hc:
                             resp = _hc.post(
                                 f"{proxy_url}/llm/generate",
-                                json={"provider": "claude", "prompt": _prompt, "model": cli_model_for_tier("haiku")},
+                                json={"provider": _dq_provider, "prompt": _prompt, "model": _dq_model},
                                 headers=_lph(),
                             )
                             resp.raise_for_status()
-                            raw = resp.json().get("text") or resp.text
+                            # /llm/generate returns ndjson, not a JSON document.
+                            # The old resp.json() raised JSONDecodeError every
+                            # call, so decomposition always returned [].
+                            raw = _ndjson(resp.text)
                             # Extract JSON array from response
                             _m = _re_mq.search(r'\[.*?\]', raw, _re_mq.DOTALL)
                             if _m:

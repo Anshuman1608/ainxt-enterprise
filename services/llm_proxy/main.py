@@ -751,6 +751,34 @@ async def generate(req: GenerateRequest, request: Request):
     _default_map = {"claude": _DEFAULT_CLAUDE, "openai": _DEFAULT_OPENAI, "gemini": _DEFAULT_GEMINI}
     resolved_model = req.model or _default_map.get(req.provider, req.provider)
 
+    # ── Governance kill-switch enforcement ────────────────────────────────────
+    # BLOCKED_MODELS is how an operator retires a model or turns one off
+    # (ENABLE_OPUS / ENABLE_CLI_OPUS_48 / ENABLE_CLI_OPUS_5 / ENABLE_SONNET_5,
+    # plus BLOCKED_MODELS_EXTRA). Until now this request path never consulted
+    # it at all: the gateways only check their own module-level default at
+    # class-definition time, so any caller naming a blocked model explicitly
+    # was served it. A deployment that set ENABLE_CLI_OPUS_5=false therefore
+    # still served Opus 5 through the proxy while correctly refusing it on the
+    # direct path — the kill-switch was half-wired.
+    #
+    # This is the authoritative gate; the per-switch parity in
+    # services/llm_proxy/core/model_registry.py is defence in depth behind it.
+    # Guard on truthiness: resolved_model is "" for a deployment configured
+    # purely through the "LLM Providers" admin screen, and BLOCKED_MODELS can
+    # itself contain "" (a blank CLAUDE_OPUS_5_MODEL gets added whenever
+    # ENABLE_CLI_OPUS_5 is off), so an unguarded membership test would reject
+    # every request. Same bug, and same guard, as root gateway_claude.py:103.
+    from core.model_registry import BLOCKED_MODELS as _BLOCKED
+    if resolved_model and resolved_model in _BLOCKED:
+        logger.warning(
+            f"[{req_id}] BLOCKED MODEL rejected | provider={req.provider} | "
+            f"model={resolved_model} | caller={caller}"
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Model {resolved_model!r} is blocked by platform governance.",
+        )
+
     if req.content_blocks is not None:
         _mode = "content_blocks"
     elif req.messages is not None:

@@ -259,26 +259,59 @@ def _usage_from_obj(usage_obj: Any) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Model → provider-family classifier
 # ---------------------------------------------------------------------------
-# Mirrors ``services/llm_proxy/main.py::_provider_from_model`` (line 351) so
-# ABStudio and the proxy agree on which family a given id belongs to. Used
-# by ``get_llm_client`` to dispatch the right runtime client:
+# Used by ``get_llm_client`` to dispatch the right runtime client:
 #   anthropic / openai / gemini → proxy /llm/*-tools-stream
 #   local                       → LiteLLM directly (proxy bypassed)
 # The CLI follows the same split (gateway.py:6236-6321 for local-direct,
 # gateway.py:6323+ for proxy-routed).
+#
+# The DB provider registry is the authoritative source for a model's family,
+# so ask it first and keep the name prefixes only as an offline fallback. The
+# registry is reachable from here: app/main.py puts the platform root on
+# sys.path, this module already imports core.llm_provider_registry inside
+# get_llm_client, and in production ABStudio's routers run inside the gateway
+# process against the same DB (see AgentStudio/backend/Dockerfile).
 
 def _classify_model(model_name: str) -> str:
     """Return ``"anthropic" | "openai" | "gemini" | "local"`` for ``model_name``.
+
+    Resolution order:
+
+    1. ``core.llm_provider_registry`` via ``endpoint_model_catalog.family_of``
+       — the ``family`` column an admin actually configured. ``ollama`` is
+       reported as ``local``, and ``openai_compatible`` as ``openai`` because
+       those endpoints speak the OpenAI chat-completions contract (the caller
+       still needs the provider row's own ``base_url``; see get_llm_client).
+    2. The name prefixes below, for deployments with no registry rows yet.
 
     Unknown ids fall through to ``"local"`` because in-house GPUs host models
     whose ids don't follow any cloud naming convention (e.g. ``qwen-3.6-35B-A3B``,
     ``kimi-k2.6``, ``glm-5.1-fp8``, ``gemma-4-31B-it``). Routing them to
     ``LOCAL_LLM_BASE_URL`` (LiteLLM) is correct; routing them to the cloud
     proxy would 404.
+
+    That ``else → "local"`` default is why step 1 exists. On its own it is
+    unsound once the catalogue is admin-extensible: an OpenRouter id such as
+    ``anthropic/claude-sonnet-4-6`` matches none of the prefixes below
+    (``"anthropic/"`` is not ``"claude"``), so it was dispatched to LiteLLM,
+    which 404s or silently serves a different model. The same held for every
+    Bedrock ``us.anthropic.*`` id, every renamed deployment, and every
+    Cohere/Mistral/Qwen id served from a paid endpoint.
     """
     name = (model_name or "").strip().lower()
     if not name:
         return "local"
+
+    try:
+        from services.endpoint_model_catalog import family_of
+        fam = family_of(model_name)
+    except Exception:  # noqa: BLE001 — registry unavailable: use the prefixes
+        fam = "unknown"
+    if fam in ("anthropic", "gemini", "openai", "local"):
+        return fam
+    if fam == "openai_compatible":
+        return "openai"
+
     if name.startswith("claude"):
         return "anthropic"
     if name.startswith("gemini"):

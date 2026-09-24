@@ -979,6 +979,41 @@ def llm_proxy_headers(extra: dict | None = None) -> dict:
     return headers
 
 
+def llm_proxy_ndjson_text(body: str) -> str:
+    """
+    Concatenate the assistant text out of an /llm/generate response body.
+
+    /llm/generate replies with `application/x-ndjson` — one JSON object per
+    line, text arriving as {"t": "<chunk>"} — never a single JSON document.
+    Callers that did `resp.json()` on it therefore raised JSONDecodeError on
+    every call and silently returned their empty fallback forever
+    (services/feedback_processor.generate_prompt_improvement and
+    models/hybrid_retriever's query decomposition both did exactly this).
+
+    Use this for a buffered `client.post(...)`; for a streaming
+    `client.stream(...)` iterate `resp.iter_lines()` directly, as
+    models/classifier._llm_classify does.
+
+    Unparseable lines are skipped rather than raising, matching the streaming
+    callers' behaviour — a truncated final chunk must not discard the text
+    that already arrived.
+    """
+    import json as _json
+
+    parts: list[str] = []
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = _json.loads(line)
+        except _json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "t" in obj:
+            parts.append(str(obj["t"]))
+    return "".join(parts)
+
+
 def run_tool_use_via_proxy(
         provider:       str,
         model:          str,

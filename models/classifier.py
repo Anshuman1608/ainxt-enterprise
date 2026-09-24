@@ -56,12 +56,29 @@ def _llm_classify(question: str) -> str:
     # format carries the full context (proxy /llm/generate takes one prompt str).
     combined_prompt = f"{_LLM_FALLBACK_SYSTEM}\n\nQuery: {question}"
     try:
+        # Resolve the model FIRST, then derive the provider from it. This was a
+        # hardcoded provider="claude" next to a dynamically resolved model, so
+        # repointing the "haiku" tier at a non-Anthropic model sent a
+        # mismatched pair — /llm/generate selects its gateway from `provider`
+        # alone and forwards `model` untouched.
+        from services.endpoint_model_catalog import proxy_provider_for
+        _model = _cli_model_for_tier("haiku")
+        _provider = proxy_provider_for(_model)
+        if not _provider:
+            # openai_compatible / local / unrecognised — no built-in gateway
+            # serves it. This is already the fallback path for the fast
+            # classifier, so default the tier rather than guess a provider.
+            logger.warning(
+                "LLM classifier: no proxy gateway for model %r — defaulting to medium", _model,
+            )
+            return "medium"
+
         label_tokens: list[str] = []
         from core.proxy_tool_use import llm_proxy_headers as _lph
         with _HTTP_CLIENT.stream(
             "POST",
             f"{proxy_url}/llm/generate",
-            json={"provider": "claude", "prompt": combined_prompt, "model": _cli_model_for_tier("haiku")},
+            json={"provider": _provider, "prompt": combined_prompt, "model": _model},
             headers=_lph(),
         ) as resp:
             resp.raise_for_status()

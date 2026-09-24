@@ -331,14 +331,38 @@ class FeedbackProcessor:
             import httpx
             from core.model_registry import cli_model_for_tier
             from core.proxy_tool_use import llm_proxy_headers as _lph
+            from core.proxy_tool_use import llm_proxy_ndjson_text as _ndjson
+            from services.endpoint_model_catalog import proxy_provider_for
+
+            # Resolve the model FIRST, then derive the provider from it. These
+            # were previously a hardcoded provider="claude" alongside a
+            # dynamically resolved model, so an admin repointing the "haiku"
+            # tier at a non-Anthropic model (which the LLM Providers screen
+            # allows) sent a mismatched pair — /llm/generate picks its gateway
+            # from `provider` alone and forwards `model` untouched.
+            _model = cli_model_for_tier("haiku")
+            _provider = proxy_provider_for(_model)
+            if not _provider:
+                # openai_compatible / local / unrecognised: no built-in gateway
+                # can serve it. This whole method is a best-effort enrichment,
+                # so skip rather than guess a provider and fail the request.
+                logger.info(
+                    "FeedbackProcessor: no proxy gateway for model %r — "
+                    "skipping prompt-improvement suggestion", _model,
+                )
+                return None
+
             with httpx.Client(timeout=httpx.Timeout(20.0, connect=3.0)) as hc:
                 resp = hc.post(
                     f"{proxy_url}/llm/generate",
-                    json={"provider": "claude", "prompt": prompt, "model": cli_model_for_tier("haiku")},
+                    json={"provider": _provider, "prompt": prompt, "model": _model},
                     headers=_lph(),
                 )
                 resp.raise_for_status()
-                suggestion = (resp.json().get("text") or "").strip()
+                # /llm/generate returns ndjson, not a JSON document — the old
+                # resp.json() raised JSONDecodeError on every call, so this
+                # method always returned None.
+                suggestion = _ndjson(resp.text).strip()
                 if suggestion:
                     logger.info(
                         f"FeedbackProcessor: prompt improvement suggestion for "
