@@ -159,6 +159,7 @@ export default function Sidebar({ view, setView, user, onLogout, unreadCount = 0
     ],
     [
       { view: "llm-provider-config", icon: Server,   label: "LLM Providers",   maxLevel: 0 },
+      { view: "feature-models",   icon: Cpu,         label: "Feature Models",  maxLevel: 0 },
       { view: "model-governance",  icon: Shield,      label: "Model Governance",    maxLevel: 1 },
       // { view: "skill-proposals", icon: Lightbulb,   label: "Skill Proposals", maxLevel: 3 },
       { view: "endpoint-manager", icon: Globe,       label: "Endpoints",       maxLevel: 0 },

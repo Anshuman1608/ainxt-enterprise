@@ -422,6 +422,13 @@ def _handle_metrics(records: list) -> None:
                 product_id=rec.get("product_id"),
                 endpoint=rec.get("endpoint"),
                 source_channel=rec.get("source_channel"),
+                # Which platform feature spent this. Nine of the eleven
+                # llm_cost producers publish onto ainxt.metrics, so reading it
+                # here covers nearly all of them at once; producers populate it
+                # as their call sites move to the feature resolver. Absent for
+                # the managed-endpoint and CLI lanes, which are driven by an
+                # external caller rather than a platform feature.
+                feature_key=rec.get("feature_key"),
                 model=rec.get("model", "unknown"),
                 input_tokens=in_tok,
                 output_tokens=out_tok,
@@ -805,6 +812,11 @@ def _handle_agent_events(records: list) -> None:
                     agent_id=agent_name,
                     endpoint=f"/agents/{agent_name}/run",
                     source_channel="AGENTS",
+                    # Agent runs are attributed to the agent-builder feature
+                    # unless the producer names a more specific one. Without
+                    # this the AGENTS channel would be the one lane missing
+                    # from per-feature cost reporting.
+                    feature_key=rec.get("feature_key") or "agents.build",
                     model=model,
                     input_tokens=in_tok,
                     output_tokens=out_tok,

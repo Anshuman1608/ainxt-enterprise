@@ -1267,6 +1267,7 @@ from routers.cached_ask_router import router as cached_ask_router
 from routers.endpoint_mgmt_router import router as endpoint_mgmt_router
 from routers.endpoint_proxy_router import proxy_router as endpoint_proxy_router
 from routers.llm_provider_admin_router import router as llm_provider_admin_router
+from routers.feature_model_config_router import router as feature_model_config_router
 # P10: Prompt version management
 from routers.prompt_mgmt_router import router as prompt_mgmt_router
 # P12: Code review engine
@@ -1469,6 +1470,9 @@ app.include_router(desktop_router,          prefix="")
 # so that the fixed /endpoint-mgmt/ path takes precedence over the dynamic /{slug}/ path.
 app.include_router(endpoint_mgmt_router,    prefix="/ainxt/v1/api")
 app.include_router(llm_provider_admin_router, prefix="/ainxt/v1/api")
+# Feature → model assignment. Must also precede endpoint_proxy_router, whose
+# dynamic /{slug}/ path would otherwise swallow /feature-models/...
+app.include_router(feature_model_config_router, prefix="/ainxt/v1/api")
 app.include_router(endpoint_proxy_router,   prefix="/ainxt/v1/api")
 # Internal key-delivery endpoint — no /ainxt/v1/api prefix, no user auth.
 # Reachable at /internal/ckms/proxy-keys. Protected by X-Proxy-Key-Token

@@ -38,6 +38,7 @@ import Memory from "./components/Memory.jsx";
 import EmailBroadcast from "./components/EmailBroadcast.jsx";
 import EndpointManager from "./components/EndpointManager.jsx";
 import LLMProviderConfig from "./components/LLMProviderConfig.jsx";
+import FeatureModelConfig from "./components/FeatureModelConfig.jsx";
 import ErrorBoundary from "./components/ErrorBoundary.jsx";
 import { ToastProvider, ConfirmProvider } from "./components/ui/DialogProvider.jsx";
 
@@ -602,6 +603,13 @@ export default function App() {
             <ErrorBoundary key={`llm-provider-config-${refreshKey}`}>
               <LLMProviderConfig user={user} />
             </ErrorBoundary>
+          } />
+          <Route path="/feature-models" element={
+            <AdminRoute user={user}>
+              <ErrorBoundary key={`feature-models-${refreshKey}`}>
+                <FeatureModelConfig />
+              </ErrorBoundary>
+            </AdminRoute>
           } />
           <Route path="/dept-metrics" element={
             <ErrorBoundary key={`dept-metrics-${refreshKey}`}>

@@ -419,6 +419,27 @@ const MODULES = [
     ],
   },
   {
+    id: "feature-models",
+    icon: Cpu,
+    label: "Feature Models",
+    what: "Choose which configured LLM serves each platform feature — Skills generation, Teams triage, document generation, the review gates, and so on — with an ordered fallback chain behind each choice.",
+    why: "Which model powers a feature used to be a value compiled into the code, so changing it meant a code change and a redeploy. This is the screen that makes it a runtime decision, and the only place where a deployment with its own models can point the platform's features at them.",
+    who: "Administrators.",
+    when: "After registering providers, when a model is retired or replaced, or when moving a high-volume feature onto a cheaper model.",
+    useCases: [
+      { dept: "Engineering", icon: Cpu, examples: [
+        "Point document generation at a long-context model and leave chat on the default.",
+        "Give a feature a fallback chain so an admin-added model failing does not break it.",
+      ]},
+      { dept: "Finance", icon: DollarSign, examples: [
+        "Move a high-volume, low-difficulty feature onto a cheaper model and compare the spend.",
+      ]},
+      { dept: "Risk", icon: AlertTriangle, examples: [
+        "Confirm that features handling confidential data can only be assigned on-premise models.",
+      ]},
+    ],
+  },
+  {
     id: "model-governance",
     icon: Shield,
     label: "Model Governance",

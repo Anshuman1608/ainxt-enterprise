@@ -426,17 +426,26 @@ def _llm(prompt: str, hint: str = "solution", agent_id: str = None) -> str:
     try:
         from memory.postgres_memory import PostgresMemory as _PM
         _pm = _PM()
+        # These were tokens_in=/tokens_out=, which are NOT parameters of
+        # create_model_usage (it takes input_tokens/output_tokens). Every call
+        # raised TypeError straight into the bare `except` below, so the SDLC
+        # pipeline has never written a single model_usages row — its spend was
+        # invisible in budget and per-department reporting.
         _pm.create_model_usage(
             user_id="sdlc",
             agent_id=agent_id or "sdlc-pipeline",
             endpoint="/sdlc/pipeline",
+            source_channel="SDLC",
+            feature_key="sdlc.pipeline",
             model=_model_used,
-            tokens_in=_tokens_in,
-            tokens_out=_tokens_out,
+            input_tokens=_tokens_in,
+            output_tokens=_tokens_out,
             cost_usd=round(_cost, 6),
         )
-    except Exception:
-        pass
+    except Exception as _usage_exc:
+        # Still non-fatal — telemetry must never fail a pipeline stage — but no
+        # longer silent, which is what hid the bug above for as long as it did.
+        logger.warning(f"[SDLC] model_usages write failed: {_usage_exc}")
     try:
         from services.sdlc_budget_tracker import record_llm_cost as _rec_cost
         _rec_cost(_tokens_in, _tokens_out, round(_cost, 6), run_id=_cv_run_id.get())

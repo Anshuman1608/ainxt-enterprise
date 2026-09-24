@@ -1346,6 +1346,9 @@ CREATE INDEX IF NOT EXISTS idx_sec_scan_scanned_at ON security_scan_results(scan
     # ── Part AC3: 2026-09-01 — remove bogus seeded "local-llm" model rows ──────
     _part_ac3_remove_bogus_local_llm_seed_2026_09_01()
 
+    # ── Part AD1: 2026-09-24 — feature → model assignment + feature_key telemetry
+    _part_ad1_feature_model_config_2026_09_24()
+
     # ── OSS schema-drift fixes ───────────────────────────────────────────────
     # (_part_oss3 runs at the top of this function — the catalogue seeds need it.)
     _part_oss4_model_permissions_web_search()
@@ -8213,6 +8216,157 @@ def _part_ac3_remove_bogus_local_llm_seed_2026_09_01():
         db.close()
 
 
+def _part_ad1_feature_model_config_2026_09_24():
+    """
+    2026-09-24 — Feature → model assignment (the model-agnostic ask).
+
+    Two tables plus a telemetry column:
+
+      feature_registry     — the declared catalogue of assignable features,
+                             upserted from core/feature_registry.py so it can
+                             never drift from the call sites that make the
+                             actual LLM calls. Admins do not create rows here.
+      feature_model_config — the admin's assignments. Intentionally left EMPTY
+                             by this migration: an unassigned platform resolves
+                             every feature to the same model it used before
+                             these tables existed, which is what lets the call
+                             sites migrate one file at a time.
+      model_usages.feature_key — so "what is this feature costing me on this
+                             model versus the alternative?" is answerable from
+                             day one. Retrofitting it later would mean the
+                             comparison data for the rollout period never
+                             exists. model_usages is partitioned; ALTER TABLE
+                             on the parent propagates (same as Part X1).
+    """
+    _run_ddl(
+        """
+        CREATE TABLE IF NOT EXISTS feature_registry (
+            feature_key             VARCHAR(64) PRIMARY KEY,
+            display_name            VARCHAR(255) NOT NULL,
+            category                VARCHAR(64),
+            description             TEXT,
+            owning_module           VARCHAR(255),
+            default_capability      VARCHAR(32),
+            requires_vision         BOOLEAN NOT NULL DEFAULT FALSE,
+            requires_tools          BOOLEAN NOT NULL DEFAULT FALSE,
+            requires_streaming      BOOLEAN NOT NULL DEFAULT FALSE,
+            min_context_tokens      INTEGER,
+            max_data_classification VARCHAR(32),
+            created_at              TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at              TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+        """,
+        "feature_registry",
+    )
+    _run_ddl(
+        "CREATE INDEX IF NOT EXISTS idx_feature_registry_category "
+        "ON feature_registry(category)",
+        "feature_registry.idx_category",
+    )
+    _run_ddl(
+        """
+        CREATE TABLE IF NOT EXISTS feature_model_config (
+            feature_key         VARCHAR(64) NOT NULL
+                                  REFERENCES feature_registry(feature_key) ON DELETE CASCADE,
+            org_id              VARCHAR(255) NOT NULL DEFAULT 'default',
+            model_id            UUID REFERENCES llm_models(id) ON DELETE SET NULL,
+            fallback_model_ids  JSONB NOT NULL DEFAULT '[]'::jsonb,
+            capability_override VARCHAR(32),
+            enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_by          VARCHAR(255),
+            created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+            updated_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (feature_key, org_id)
+        )
+        """,
+        "feature_model_config",
+    )
+    _run_ddl(
+        "CREATE INDEX IF NOT EXISTS idx_fmc_model "
+        "ON feature_model_config(model_id)",
+        "feature_model_config.idx_model",
+    )
+    _run_ddl(
+        "ALTER TABLE model_usages ADD COLUMN IF NOT EXISTS feature_key VARCHAR(64)",
+        "model_usages.feature_key",
+    )
+    _run_ddl(
+        "CREATE INDEX IF NOT EXISTS idx_model_usages_feature "
+        "ON model_usages(feature_key, created_at)",
+        "model_usages.idx_feature_key",
+    )
+
+    # ── Seed / re-seed the declared feature catalogue ────────────────────────
+    # Best-effort: a seeding failure must never fail the migration, so nothing
+    # here prints a leading "! " (see the print() shim above) — "(skipped)"
+    # instead. Each feature commits independently so one bad row cannot roll
+    # back the rest. ON CONFLICT DO UPDATE keeps an existing row's columns in
+    # step with the code while leaving feature_model_config untouched.
+    try:
+        from core.feature_registry import FEATURES
+    except Exception as exc:
+        print(f"  (skipped) Part AD1: could not import the feature catalogue — {exc}")
+        return
+
+    from sqlalchemy import text as _text
+
+    seeded = 0
+    try:
+        with engine.connect() as conn:
+            for spec in FEATURES:
+                try:
+                    conn.execute(_text("""
+                        INSERT INTO feature_registry (
+                            feature_key, display_name, category, description,
+                            owning_module, default_capability,
+                            requires_vision, requires_tools, requires_streaming,
+                            min_context_tokens, max_data_classification, updated_at
+                        ) VALUES (
+                            :feature_key, :display_name, :category, :description,
+                            :owning_module, :default_capability,
+                            :requires_vision, :requires_tools, :requires_streaming,
+                            :min_context_tokens, :max_data_classification, NOW()
+                        )
+                        ON CONFLICT (feature_key) DO UPDATE SET
+                            display_name            = EXCLUDED.display_name,
+                            category                = EXCLUDED.category,
+                            description             = EXCLUDED.description,
+                            owning_module           = EXCLUDED.owning_module,
+                            default_capability      = EXCLUDED.default_capability,
+                            requires_vision         = EXCLUDED.requires_vision,
+                            requires_tools          = EXCLUDED.requires_tools,
+                            requires_streaming      = EXCLUDED.requires_streaming,
+                            min_context_tokens      = EXCLUDED.min_context_tokens,
+                            max_data_classification = EXCLUDED.max_data_classification,
+                            updated_at              = NOW()
+                    """), {
+                        "feature_key":             spec.feature_key,
+                        "display_name":            spec.display_name,
+                        "category":                spec.category,
+                        "description":             spec.description or None,
+                        "owning_module":           spec.owning_module,
+                        "default_capability":      spec.default_capability,
+                        "requires_vision":         spec.requires_vision,
+                        "requires_tools":          spec.requires_tools,
+                        "requires_streaming":      spec.requires_streaming,
+                        "min_context_tokens":      spec.min_context_tokens,
+                        "max_data_classification": spec.max_data_classification,
+                    })
+                    conn.commit()
+                    seeded += 1
+                except Exception as exc:
+                    conn.rollback()
+                    print(f"  (skipped) Part AD1: could not seed feature "
+                          f"'{spec.feature_key}' — {exc}")
+        print(f"  ✓ Part AD1: feature_registry seeded ({seeded}/{len(FEATURES)} features)")
+    except Exception as exc:
+        print(f"  (skipped) Part AD1: feature catalogue seeding unavailable — {exc}")
+
+    # An assignment naming a model that has since been deleted or disabled is
+    # handled at resolution time (the resolver walks fallback_model_ids and
+    # then falls through), so there is nothing to backfill or repair here.
+
+
 # ── Post-migration verification ─────────────────────────────────────────────
 # Objects that the application queries unconditionally on a default install. If
 # any is missing the platform will 500 at runtime, so a migration that leaves one
@@ -8229,6 +8383,9 @@ _REQUIRED_SCHEMA = [
     ("users", "hod_email"),
     ("llm_providers", None),
     ("llm_models", None),
+    ("feature_registry", None),
+    ("feature_model_config", None),
+    ("model_usages", "feature_key"),
 ]
 
 

@@ -488,6 +488,15 @@ class ModelUsage(Base):
     product_id    = Column(UUID(as_uuid=False), ForeignKey("products.id", ondelete="SET NULL"), nullable=True, index=True)
     endpoint      = Column(String(255), nullable=True)
     source_channel = Column(String(32), nullable=True, index=True)
+    # Which platform feature spent this (feature_registry.feature_key, Part AD1).
+    # Nullable because it is only populated by call sites that have been migrated
+    # to the feature resolver, and because the OpenAI-compatible managed-endpoint
+    # and CLI lanes are driven by an external caller, not by a platform feature.
+    # This is the dimension that makes "what is Skills generation costing me on
+    # this model versus the alternative?" answerable — model_usages is the only
+    # table that can carry it (llm_spend_daily holds provider billing-API data,
+    # which has no feature axis at all).
+    feature_key   = Column(String(64), nullable=True, index=True)
     model         = Column(String(100), nullable=False)
     input_tokens  = Column(Integer, nullable=False, default=0)
     output_tokens = Column(Integer, nullable=False, default=0)
@@ -2844,3 +2853,113 @@ class LLMModel(Base):
     created_by   = Column(String(255), nullable=True)
     created_at   = Column(DateTime, nullable=False, default=_now)
     updated_at   = Column(DateTime, nullable=False, default=_now, onupdate=_now)
+
+
+# ============================================================
+# FEATURE → MODEL ASSIGNMENT  (Part AD1)
+# ============================================================
+#
+# The axis the platform was missing: which configured LLM serves which
+# platform feature. llm_providers/llm_models already let an admin register
+# arbitrary providers and models at runtime, and dept_model_permissions /
+# user_model_permissions already gate WHO may use a model — but nothing mapped
+# "the Coach module" or "Skills generation" to a model. That was a tier-name
+# string literal compiled into each call site (model_hint="complex"), so
+# changing it meant editing Python and redeploying.
+#
+# Two tables, deliberately:
+#   FeatureRegistry    — what features EXIST and what each one needs. Seeded
+#                        from code (core/feature_registry.py), never free-text:
+#                        a free-form key field produces an unusable screen and
+#                        silent typo-misses.
+#   FeatureModelConfig — what an admin ASSIGNED, per org. Empty by default, so
+#                        an unconfigured platform behaves exactly as before.
+#
+# Resolution lives in core/feature_model_resolver.py; the admin CRUD is
+# routers/feature_model_config_router.py. Conventions follow LLMProvider /
+# LLMModel below (UUID(as_uuid=False) PKs, org_id defaulting to "default",
+# _now/onupdate timestamps, JSONB for open-ended fields) rather than the
+# governance tables, which have no ORM classes at all and are raw SQL only.
+
+class FeatureRegistry(Base):
+    """One platform feature that can have a model assigned to it.
+
+    Rows are seeded from ``core/feature_registry.py``'s declarations by
+    migrate.py Part AD1, so the catalogue cannot drift from the code that
+    actually makes the LLM calls. An admin never creates rows here — only
+    FeatureModelConfig rows against them.
+
+    The ``requires_*``/``min_context_tokens``/``max_data_classification``
+    columns exist so the admin UI can FILTER the model dropdown and the API can
+    reject an impossible assignment server-side. Offering a text-only model for
+    a vision feature is the single largest source of "I assigned it and it
+    broke", and it has to be blocked in both places — UI filtering alone is
+    bypassable by any API client.
+    """
+    __tablename__ = "feature_registry"
+
+    # The feature_key IS the identity (e.g. "skills.generate"), so it is the PK
+    # rather than a surrogate UUID: call sites reference it as a literal and it
+    # must be stable across environments and re-seeds.
+    feature_key   = Column(String(64), primary_key=True)
+    display_name  = Column(String(255), nullable=False)
+    category      = Column(String(64), nullable=True, index=True)   # UI grouping: "SDLC", "Chat", "Docs"
+    description   = Column(Text, nullable=True)
+    owning_module = Column(String(255), nullable=True)              # e.g. "routers.skills_router"
+    # A capability name from models/model_router.py's _HINT_MAP
+    # (fast|balanced|expert|vision|long-context|local-only) — NOT a vendor tier
+    # name. This is the "leave it to the platform" option in the admin dropdown,
+    # and expressing it as a vendor product name would bake the vendor lock
+    # straight into this schema.
+    default_capability = Column(String(32), nullable=True)
+    requires_vision    = Column(Boolean, nullable=False, default=False)
+    requires_tools     = Column(Boolean, nullable=False, default=False)
+    requires_streaming = Column(Boolean, nullable=False, default=False)
+    min_context_tokens = Column(Integer, nullable=True)
+    # Highest sensitivity this feature may process, from core/rag_acl.py's
+    # ladder: PUBLIC | INTERNAL | CONFIDENTIAL | RESTRICTED | PCI_SENSITIVE.
+    # CONFIDENTIAL and above are pinned to a local model at runtime by
+    # ModelRouter.route()'s privacy floor, so the UI must disable cloud models
+    # for those features rather than let an admin believe an assignment took
+    # effect when it cannot.
+    max_data_classification = Column(String(32), nullable=True)
+    created_at    = Column(DateTime, nullable=False, default=_now)
+    updated_at    = Column(DateTime, nullable=False, default=_now, onupdate=_now)
+
+
+class FeatureModelConfig(Base):
+    """An admin's model assignment for one feature, in one org.
+
+    Absence of a row means "unassigned" — the resolver falls through to the
+    feature's default_capability and then to the call site's own literal, so an
+    unconfigured platform behaves exactly as it did before this table existed.
+    That is what makes the call-site migration safe to land incrementally.
+    """
+    __tablename__ = "feature_model_config"
+
+    feature_key = Column(String(64),
+                         ForeignKey("feature_registry.feature_key", ondelete="CASCADE"),
+                         primary_key=True)
+    # Same multi-tenant convention as llm_providers/managed_endpoints: a literal
+    # "default" row is the platform-wide setting, and a per-org row overrides it.
+    org_id      = Column(String(255), primary_key=True, default="default")
+    # SET NULL rather than CASCADE: deleting a model must not silently delete
+    # the admin's assignment and revert the feature to its hardcoded literal
+    # without trace. (llm_provider_admin_router's delete_model additionally
+    # refuses the delete while a row here names the model.)
+    model_id    = Column(UUID(as_uuid=False),
+                         ForeignKey("llm_models.id", ondelete="SET NULL"),
+                         nullable=True, index=True)
+    # Ordered cascade of llm_models.id values tried after model_id fails, NOT a
+    # single fallback column: admin-registered models get no cross-vendor
+    # fallback from the router's built-in tiers, so every assignment onto one
+    # would otherwise create a new single point of failure.
+    fallback_model_ids = Column(JSONB, nullable=False, default=list)
+    # Alternative to pinning a model: pin a capability and let the router pick.
+    # Mutually exclusive with model_id — enforced in the router, not by a CHECK,
+    # so an admin can switch between the two without a two-step write.
+    capability_override = Column(String(32), nullable=True)
+    enabled     = Column(Boolean, nullable=False, default=True)
+    updated_by  = Column(String(255), nullable=True)
+    created_at  = Column(DateTime, nullable=False, default=_now)
+    updated_at  = Column(DateTime, nullable=False, default=_now, onupdate=_now)

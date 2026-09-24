@@ -143,6 +143,28 @@ def get_model(model_id: str) -> Optional[dict]:
     return None
 
 
+def get_model_by_uuid(pk: str) -> Optional[dict]:
+    """Look up an enabled model by its llm_models.id primary key.
+
+    get_model() above keys on the API model_id string, which is unique only
+    per-provider. Anything holding a FOREIGN KEY to llm_models — currently
+    feature_model_config.model_id / .fallback_model_ids — needs this one
+    instead, and must resolve through it rather than storing the model_id
+    string, so that renaming or re-pointing a model in the admin screen does
+    not silently orphan the reference.
+
+    Returns None when the row is gone or its provider/model has been disabled,
+    which callers must treat as "assignment no longer valid, fall through"
+    rather than an error.
+    """
+    if not pk:
+        return None
+    for m in get_enabled_models():
+        if m["id"] == pk:
+            return m
+    return None
+
+
 def get_provider(provider_id: str) -> Optional[dict]:
     for m in get_enabled_models():
         if m["provider_id"] == provider_id:

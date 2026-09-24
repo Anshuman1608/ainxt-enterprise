@@ -952,6 +952,22 @@ def delete_model(
     except Exception:
         pass
 
+    # A feature→model assignment names this row by UUID, either as the primary
+    # model or somewhere in its fallback cascade. The FK is ON DELETE SET NULL
+    # so the delete would not error — it would silently blank the assignment
+    # and revert that feature to its hardcoded literal with nothing to show the
+    # admin why. Refuse instead, same as for managed endpoints above.
+    try:
+        from db.models import FeatureModelConfig
+        for cfg in db.query(FeatureModelConfig).all():
+            if cfg.model_id == model.id:
+                referenced_by.append(f"feature:{cfg.feature_key}")
+            elif model.id in (cfg.fallback_model_ids or []):
+                referenced_by.append(f"feature-fallback:{cfg.feature_key}")
+    except Exception:
+        # Table may not exist yet on a deployment that has not run migrate.py.
+        pass
+
     if referenced_by:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

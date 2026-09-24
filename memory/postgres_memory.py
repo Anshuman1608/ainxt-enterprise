@@ -1343,8 +1343,15 @@ class PostgresMemory:
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         source_channel: Optional[str] = None,
+        feature_key: Optional[str] = None,
     ) -> None:
-        """Record per-request model usage for cost and token tracking."""
+        """Record per-request model usage for cost and token tracking.
+
+        feature_key is the feature_registry key that spent this, so per-feature
+        cost is answerable once call sites move to the feature resolver. Most
+        producers reach model_usages via Kafka (ainxt.metrics) rather than this
+        method; the three that call it directly pass it through.
+        """
         if not self.available:
             return
         # Sanitise user_id — must be a valid UUID string or NULL.
@@ -1364,8 +1371,10 @@ class PostgresMemory:
                 (id, user_id, agent_id, project_id, endpoint, model,
                  input_tokens, output_tokens, total_tokens,
                  latency_ms, cost_usd, request_id, created_at,
-                 cache_read_tokens, cache_write_tokens, source_channel)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 cache_read_tokens, cache_write_tokens, source_channel,
+                 feature_key)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s)
         """
         try:
             from core.time_utils import now_ist as _now_ist_pm
@@ -1377,6 +1386,7 @@ class PostgresMemory:
                     latency_ms, cost_usd, request_id,
                     _now_ist_pm(),  # IST, not UTC — matches ModelUsage.created_at default
                     cache_read_tokens, cache_write_tokens, source_channel,
+                    feature_key,
                 ))
             self._conn.commit()
             logger.info(
