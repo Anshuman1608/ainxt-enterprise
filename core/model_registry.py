@@ -377,7 +377,14 @@ def models_without_temperature() -> tuple[str, ...]:
 #   code_review            → solution (Opus POST-code code-review GATE)
 #   cross_model_review     → medium  (GPT — deliberately a different model family)
 
-_SDLC_STAGE_HINTS_ALLOWED = {"haiku", "medium", "complex", "solution", "deep"}
+# The five legacy tier names, plus the provider-neutral capability vocabulary
+# defined in models/model_router.py's _HINT_MAP. Membership here is what marks a
+# SDLC_MODEL_<STAGE> value as "a tier" rather than "a concrete model id" — so
+# without the capability names, SDLC_MODEL_CODER=balanced would be handed to the
+# router verbatim as a model id and fail to resolve. Additive: every legacy name
+# keeps its meaning.
+_SDLC_CAPABILITY_HINTS = {"fast", "balanced", "expert", "vision", "long-context", "local-only"}
+_SDLC_STAGE_HINTS_ALLOWED = {"haiku", "medium", "complex", "solution", "deep"} | _SDLC_CAPABILITY_HINTS
 
 SDLC_STAGE_MODEL_DEFAULTS: dict = {
     "classify":           "haiku",
@@ -416,7 +423,9 @@ def sdlc_stage_hint(stage: str, default: str = "complex") -> str:
     special-case Opus availability.
 
     ``SDLC_MODEL_<STAGE>`` accepts EITHER a router tier name
-    (haiku|medium|complex|solution|deep) OR a concrete model id of any provider.
+    (haiku|medium|complex|solution|deep), OR one of the provider-neutral
+    capability names (fast|balanced|expert|vision|long-context|local-only),
+    OR a concrete model id of any provider.
     A concrete id is returned verbatim: the model router resolves it via the
     admin-configured provider registry (``models/model_router.py`` route() step
     1a), so a harness with no Anthropic provider can pin any stage to its own
@@ -432,7 +441,11 @@ def sdlc_stage_hint(stage: str, default: str = "complex") -> str:
     if hint not in _SDLC_STAGE_HINTS_ALLOWED:
         hint = base
     # Read ENABLE_OPUS at call time so deploy-time changes apply without re-import.
-    if hint == "solution" and os.getenv("ENABLE_OPUS", "true").lower() in ("false", "0", "no"):
+    # "expert" is the capability name for the same Opus-backed tier as
+    # "solution" (both resolve to TIER_SOLUTION), so the kill-switch must
+    # downgrade it identically or the switch would be bypassable by naming the
+    # capability instead of the tier.
+    if hint in ("solution", "expert") and os.getenv("ENABLE_OPUS", "true").lower() in ("false", "0", "no"):
         hint = "complex"
     return hint
 
@@ -619,7 +632,27 @@ def cli_model_for_tier(hint: str) -> str:
         "medium":    (_tier_env_override("medium")   or OPENAI_CODING_MODEL,  "openai",    "medium"),
         "deep":      (_tier_env_override("deep")     or OPENAI_LATEST_MODEL,  "openai",    "deep"),
     }
+    # Provider-neutral capability names (models/model_router.py _HINT_MAP) map
+    # onto the same roles. Without these the fallthrough below would treat
+    # "balanced" as a concrete model id and return the literal string
+    # "balanced" as a model to call. Aliased rather than duplicated so each
+    # capability keeps honouring the same SDLC_TIER_<TIER>_MODEL override as
+    # the tier it shadows.
+    _tier_to_role["fast"]         = _tier_to_role["haiku"]
+    _tier_to_role["balanced"]     = _tier_to_role["complex"]
+    _tier_to_role["expert"]       = _tier_to_role["solution"]
+    # No CLI role exists for a long-window or a vision model — the CLI/SDLC
+    # paths that call this never need either — so they resolve to the nearest
+    # available role rather than escaping as a bogus model id.
+    _tier_to_role["long-context"] = _tier_to_role["deep"]
+    _tier_to_role["vision"]       = _tier_to_role["complex"]
+
     _key = (hint or "").strip().lower()
+    # "local-only" is a posture, not a role: it must never resolve to a cloud
+    # model id, so it short-circuits to the locally served model exactly as the
+    # is_local_only() branch above does.
+    if _key == "local-only":
+        return LOCAL_LLM_MODEL_NAME
     if _key not in _tier_to_role:
         # Not a known tier: treat a non-empty hint as a concrete model id and
         # return it verbatim (the router resolves it via the provider registry).

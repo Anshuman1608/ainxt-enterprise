@@ -782,6 +782,51 @@ _HINT_MAP = {
     "luna":               TIER_LUNA,
     "gpt-5.6-luna":       TIER_LUNA,
     OPENAI_LUNA_MODEL:    TIER_LUNA,
+
+    # ── Capability vocabulary (provider-neutral) ─────────────────────────────
+    # Every tier name above is either a vendor product name ("haiku",
+    # "sonnet-5", "opus-5", "gemini", "tera", "luna") or an internal
+    # complexity label whose vendor is implicit ("complex" is Anthropic,
+    # "medium" is OpenAI). Neither is something to put in front of an admin:
+    # a deployment that has configured only OpenRouter and Ollama should not
+    # have to pick an Anthropic product name for a feature that will never
+    # touch Anthropic. These six names are the vocabulary the per-feature
+    # admin dropdown and feature_registry.default_capability are expressed in.
+    #
+    # STRICTLY ADDITIVE. Not one existing key above is repointed, because
+    # aliasing is only behaviour-preserving if each legacy name keeps resolving
+    # to the tier it resolves to today. Two traps in particular:
+    #
+    #   * "simple" dispatches to the IN-HOUSE GPU (_dispatch -> _try_local_simple),
+    #     not to a cheap cloud model. Folding it into "fast" would move its 17
+    #     call sites off-prem — a cost AND privacy regression.
+    #   * "medium" (_try_openai_coding, OpenAI) and "complex"
+    #     (_try_claude_sonnet, Anthropic) are DIFFERENT VENDORS, not different
+    #     capability levels. Folding both into "balanced" would silently switch
+    #     vendor for 39 call sites.
+    #
+    # So the mapping runs one way only: a capability name resolves to the tier
+    # that best matches it today. The legacy names keep working untouched, and
+    # _dispatch()/_dispatch_stream() are not modified at all.
+    "fast":          TIER_HAIKU,       # cheapest/lowest-latency cloud model
+    "balanced":      TIER_COMPLEX,     # the default workhorse
+    "expert":        TIER_SOLUTION,    # highest-capability reasoning / review gates
+    "long-context":  TIER_TERA,        # large-window requirement
+    "local-only":    TIER_SIMPLE,      # must not leave the perimeter
+    # "vision" is already a capability name and already maps to TIER_VISION
+    # above, so it needs no new entry — it is listed here only so the six-name
+    # vocabulary reads complete: fast / balanced / expert / vision /
+    # long-context / local-only.
+    #
+    # Named "expert" rather than the "deep" this vocabulary was first drafted
+    # with: "deep" is ALREADY a live key mapping to TIER_DEEP (GPT-5-5), and
+    # repointing it to TIER_SOLUTION (Opus) would change vendor for existing
+    # callers — exactly the mistake the note above rules out.
+    #
+    # Deliberately NOT added: "opus-4-6". It reads like a missing alias, but
+    # claude-opus-4-6 is retired and sits in BLOCKED_MODELS, so an alias would
+    # route callers at a blocked model. Falling through to complexity
+    # classification is the correct behaviour. No production call site uses it.
 }
 
 # ── Falsy-key guard ───────────────────────────────────────────────────────────
@@ -791,14 +836,12 @@ _HINT_MAP = {
 # Strip them out now, then hard-fail so the operator knows which env var to fix.
 _HINT_MAP = {k: v for k, v in _HINT_MAP.items() if k}
 
-_empty_keys = [k for k in _HINT_MAP if not k]
-if _empty_keys:
-    raise ValueError(
-        "Model routing map contains empty-string keys — check that all "
-        "OPENAI_*/ANTHROPIC_*/GEMINI_* model env vars are set. "
-        "An empty key matches every model ID via startswith('') and routes "
-        "everything to the first provider."
-    )
+# The hard-fail that used to follow ("raise ValueError if any key is empty")
+# was unreachable — the comprehension above has already dropped every falsy
+# key, so the check could never see one. A blank model env var is a routine
+# state on an admin-configured deployment (install.sh writes the raw API keys,
+# not the role-specific model overrides), so silently dropping the key is the
+# correct behaviour and raising would have been wrong even if it had fired.
 
 # ============================================================
 # PRIVACY FLOOR (hard enterprise safety invariant)

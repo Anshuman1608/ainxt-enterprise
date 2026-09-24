@@ -465,6 +465,24 @@ AINXT_TIER_MAP: dict = {
     "sonnet":     AINXT_MODEL_COMPLEX,
     "gpt":        AINXT_MODEL_MEDIUM,    # GPT → medium tier (gpt-5.4)
     "gemini":     AINXT_MODEL_DEFAULT,   # Gemini → default (no dedicated tier yet)
+    # ── Capability vocabulary ────────────────────────────────────────────────
+    # The provider-neutral names defined in models/model_router.py's _HINT_MAP.
+    # This map is a SEPARATE vocabulary from that one (it has auto/default and
+    # lacks haiku/deep/tera/luna/opus-*), which is why the same tier name can
+    # mean different things depending on which resolver a code path reaches —
+    # the three vocabularies converge on these six names so a per-feature admin
+    # assignment has one meaning everywhere.
+    #
+    # Additive only: every key above keeps its current target. Note that here
+    # all tiers resolve to in-house vLLM model ids, so "local-only" is not a
+    # different posture from the rest — it is pinned to AINXT_MODEL_LOCAL for
+    # consistency with the router, where the distinction is real.
+    "fast":         AINXT_MODEL_SIMPLE,
+    "balanced":     AINXT_MODEL_MEDIUM,
+    "expert":       AINXT_MODEL_COMPLEX,
+    "long-context": AINXT_MODEL_DEFAULT,   # no dedicated long-window tier here
+    "local-only":   AINXT_MODEL_LOCAL,
+    "vision":       AINXT_MODEL_DEFAULT,   # no in-house vision tier yet
 }
 
 

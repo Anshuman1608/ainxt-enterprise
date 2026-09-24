@@ -10655,7 +10655,20 @@ _OAI_MODEL_MAP.pop("", None)
 # NOTE: _tools_claude_stream flattens content to text and CANNOT carry images.
 # Complete, drift-proof set (includes "opus-4-8" and "opus-5"). Used ONLY by
 # the browser-agent passthrough lane.
-_CLAUDE_TOOL_HINTS = frozenset({"claude", "solution", "haiku", "opus-4-8", "opus-5", "sonnet-5"})
+#
+# "fast"/"balanced"/"expert" are the provider-neutral capability names from
+# models/model_router.py's _HINT_MAP, and all three resolve to Anthropic tiers
+# (TIER_HAIKU / TIER_COMPLEX / TIER_SOLUTION), so they belong here alongside
+# the vendor names they shadow. Omitting them would send a feature assigned
+# "balanced" to the OpenAI tools-stream while the same feature assigned
+# "claude" went to Anthropic — the exact vendor leak the capability vocabulary
+# exists to remove. The other three capability names are deliberately absent:
+# "long-context" is OpenAI (TIER_TERA), "vision" is Gemini, and "local-only"
+# never leaves the perimeter.
+_CLAUDE_TOOL_HINTS = frozenset({
+    "claude", "solution", "haiku", "opus-4-8", "opus-5", "sonnet-5",
+    "fast", "balanced", "expert",
+})
 
 # Deep research models — require `tools` to be supplied by the caller
 _DEEP_RESEARCH_MODELS: set[str] = {_DR_MINI, _DR_FULL, "o4-mini-deep-research", "o3-deep-research"}
@@ -12382,8 +12395,16 @@ def openai_chat_completions(
                     if _force_proxy_for_image:
                         _use_claude = False
                 else:
-                    # IDE path — unchanged, byte-identical to today.
-                    _use_claude = _model_hint in ("claude", "solution", "haiku")
+                    # IDE path — a deliberately narrower set than the
+                    # passthrough lane's _CLAUDE_TOOL_HINTS above (no opus-4-8
+                    # / opus-5 / sonnet-5 here). The capability names are
+                    # included because each one shadows a hint already in this
+                    # tuple and resolves to the same Anthropic tier, so an IDE
+                    # turn must not change vendor depending on which of the two
+                    # names the caller used.
+                    _use_claude = _model_hint in (
+                        "claude", "solution", "haiku", "balanced", "expert", "fast",
+                    )
                 _tool_gen = _tools_claude_stream() if _use_claude else _tools_proxy_stream()
                 for raw_chunk in _tool_gen:
                     if not raw_chunk:

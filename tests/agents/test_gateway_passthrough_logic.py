@@ -32,10 +32,22 @@ GATEWAY_PATH = os.path.join(
 # ── reference implementations (mirror gateway.py) ───────────────────────────
 
 # gateway.py:6482
-_CLAUDE_TOOL_HINTS = frozenset({"claude", "solution", "haiku", "opus-4-6", "opus-4-8"})
+# The passthrough lane's hint set. Kept in step with gateway._CLAUDE_TOOL_HINTS.
+# This reference had drifted: it still listed the retired "opus-4-6" (which is
+# in BLOCKED_MODELS) and was missing "opus-5"/"sonnet-5". The capability names
+# "fast"/"balanced"/"expert" are present because each resolves to an Anthropic
+# tier (TIER_HAIKU/TIER_COMPLEX/TIER_SOLUTION); "long-context" (OpenAI),
+# "vision" (Gemini) and "local-only" must NOT appear.
+_CLAUDE_TOOL_HINTS = frozenset({
+    "claude", "solution", "haiku", "opus-4-8", "opus-5", "sonnet-5",
+    "fast", "balanced", "expert",
+})
 
-# gateway.py:7942 — the IDE dispatch tuple (intentionally omits "opus-4-8")
-_IDE_CLAUDE_HINTS = ("claude", "solution", "opus-4-6", "haiku")
+# The IDE dispatch tuple — deliberately narrower than the passthrough set
+# above (no opus-4-8/opus-5/sonnet-5), but it carries the same capability
+# aliases so an IDE turn never changes vendor based on which of two names for
+# the same tier the caller used.
+_IDE_CLAUDE_HINTS = ("claude", "solution", "haiku", "balanced", "expert", "fast")
 
 
 class _Msg:
@@ -122,9 +134,44 @@ def test_passthrough_set_superset_of_ide_tuple():
 
 # ── dispatch decision ───────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("hint", ["claude", "solution", "haiku", "opus-4-6", "opus-4-8"])
+# "opus-4-6" used to be in this list. It only passed because the reference set
+# above was stale — the real gateway._CLAUDE_TOOL_HINTS has never contained it,
+# and claude-opus-4-6 is retired and sits in BLOCKED_MODELS, so the case was
+# asserting a routing decision the gateway does not make.
+@pytest.mark.parametrize(
+    "hint",
+    ["claude", "solution", "haiku", "opus-4-8", "opus-5", "sonnet-5",
+     "fast", "balanced", "expert"],
+)
 def test_passthrough_text_turn_routes_claude_hints_to_claude(hint):
     assert _resolve_use_claude(hint, passthrough=True, has_image=False) is True
+
+
+@pytest.mark.parametrize("hint", ["long-context", "vision", "local-only"])
+def test_capability_names_for_other_vendors_do_not_route_to_claude(hint):
+    """The three capability names that are NOT Anthropic-backed must use the proxy.
+
+    "long-context" resolves to TIER_TERA (OpenAI), "vision" to Gemini, and
+    "local-only" to the in-house tier — routing any of them to the Claude
+    tools-stream would silently change vendor.
+    """
+    assert _resolve_use_claude(hint, passthrough=True, has_image=False) is False
+    assert _resolve_use_claude(hint, passthrough=False, has_image=False) is False
+
+
+@pytest.mark.parametrize("hint", ["fast", "balanced", "expert"])
+def test_capability_names_route_the_same_way_as_the_tier_they_shadow(hint):
+    """A capability name and its legacy tier name must pick the same vendor.
+
+    Otherwise a per-feature assignment would change which provider serves a
+    tool-call turn purely by which of two names for the same tier was used.
+    """
+    shadowed = {"fast": "haiku", "balanced": "claude", "expert": "solution"}[hint]
+    for passthrough in (True, False):
+        assert (
+            _resolve_use_claude(hint, passthrough=passthrough, has_image=False)
+            == _resolve_use_claude(shadowed, passthrough=passthrough, has_image=False)
+        )
 
 
 def test_passthrough_non_claude_hint_uses_proxy():
