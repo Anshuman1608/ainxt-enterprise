@@ -37,8 +37,9 @@ export const BACKEND_MAX_TOKENS_LIMIT = 32000;
 // (DEFAULT_MAX_TOKENS) for any model id not listed here.
 //
 // Keep keys lowercase; lookup normalises before matching.
-// Keys MUST match the model ids served by the backend catalogue
-// (ABStudio/backend/app/api/generation.py :: _static_model_catalogue).
+// This table is now the FALLBACK, not the source of truth: limits recorded on
+// the "LLM Providers" admin screen arrive via GET /llm/models and are consulted
+// first (see registerModelLimits below).
 const MODEL_MAX_TOKENS = {
     // Claude
     'claude-sonnet-4-6':          32000,
@@ -77,6 +78,59 @@ const MODEL_MAX_TOKENS = {
 // matching what most OSS models ship with out of the box.
 export const DEFAULT_MAX_TOKENS_CAP = 4096;
 
+// ── Live limits from the admin-managed catalogue ─────────────────────────────
+// MODEL_MAX_TOKENS above is keyed by the model ids this project ships with, so
+// every model an operator registers through the "LLM Providers" screen missed
+// it and silently received DEFAULT_MAX_TOKENS_CAP (4096) plus a wrong
+// context-usage meter. GET /llm/models now carries `max_output_tokens` and
+// `context_window` straight from llm_models.capabilities, so a caller that has
+// fetched the catalogue can register it here and have it consulted BEFORE the
+// static table.
+//
+// Same "live map first, static table second, derived fallback last" shape that
+// ai-ui/src/components/ModelGovernance.jsx uses for its display metadata — a
+// synchronous getter stays synchronous, and a deployment that never registers
+// anything behaves exactly as before.
+const _liveLimits = new Map();   // normalised id -> { maxOutput, contextWindow }
+
+/**
+ * Register per-model limits from a fetched /llm/models payload.
+ *
+ * Entries without a recorded limit are skipped rather than stored as 0, so a
+ * model an admin has not filled in still falls through to the static table.
+ * Safe to call repeatedly; later calls replace earlier values for the same id.
+ */
+export function registerModelLimits(models) {
+    if (!Array.isArray(models)) return;
+    for (const m of models) {
+        const id = _normalise(m?.id || m?.modelId || m?.hint);
+        if (!id) continue;
+        const maxOutput = Number(m?.max_output_tokens) || null;
+        const contextWindow = Number(m?.context_window) || null;
+        if (maxOutput == null && contextWindow == null) continue;
+        _liveLimits.set(id, { maxOutput, contextWindow });
+        // Gateways return both bare and namespaced ids (`openai/gpt-5.5`);
+        // register the trailing segment too so either form resolves.
+        const slash = id.lastIndexOf('/');
+        if (slash !== -1) _liveLimits.set(id.slice(slash + 1), { maxOutput, contextWindow });
+    }
+}
+
+/** Drop all registered limits. Exposed for tests. */
+export function clearModelLimits() {
+    _liveLimits.clear();
+    _unknownLimitModels.clear();
+}
+
+function _liveMaxOutput(id) {
+    if (!id) return null;
+    const direct = _liveLimits.get(id);
+    if (direct?.maxOutput) return direct.maxOutput;
+    const slash = id.lastIndexOf('/');
+    const bare = slash !== -1 ? id.slice(slash + 1) : id;
+    return _liveLimits.get(bare)?.maxOutput || null;
+}
+
 function _normalise(modelId) {
     if (!modelId || typeof modelId !== 'string') return '';
     return modelId.trim().toLowerCase();
@@ -97,10 +151,13 @@ function warnUnknownModelLimit(id, fallback) {
     _unknownLimitModels.add(key);
     try {
         console.warn(
-            `modelMaxTokens: no context-window entry for model "${key}" - using ` +
+            `modelMaxTokens: no limit recorded for model "${key}" - using ` +
             `default ${fallback}. The context-usage meter for this model is an ` +
-            `estimate. Add it to MODEL_MAX_TOKENS in ` +
-            `ABStudio/frontend/src/utils/modelMaxTokens.js.`
+            `estimate. Record max_output_tokens / context_window in the ` +
+            `model's capabilities on the "LLM Providers" admin screen (served ` +
+            `via GET /llm/models and picked up by registerModelLimits), or add ` +
+            `it to MODEL_MAX_TOKENS in ` +
+            `AgentStudio/frontend/src/utils/modelMaxTokens.js.`
         );
     } catch (e) { /* never break rendering over a log line */ }
 }
@@ -115,6 +172,11 @@ function warnUnknownModelLimit(id, fallback) {
  */
 export function getMaxTokensForModel(modelId) {
     const id = _normalise(modelId);
+
+    // The admin-managed catalogue wins over the static table: an operator who
+    // recorded a limit for their own model should see it honoured.
+    const live = _liveMaxOutput(id);
+    if (live) return Math.min(live, BACKEND_MAX_TOKENS_LIMIT);
 
     let raw = DEFAULT_MAX_TOKENS_CAP;
     if (id) {

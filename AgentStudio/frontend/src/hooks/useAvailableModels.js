@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { API_BASE, PLATFORM_API_BASE } from '../config/api';
 import { RECOMMENDED_MODEL } from '../config/models';
+import { registerModelLimits } from '../utils/modelMaxTokens';
 
 /**
  * Status values exposed by useAvailableModels. Exported so consumers can
@@ -101,6 +102,21 @@ export default function useAvailableModels() {
     // Grouped catalogue from ABStudio /llm/models, with platform /all-models
     // used only as a fallback.
     const [allModelProviders, setAllModelProviders] = useState([]);
+
+    // Register per-model token limits alongside the catalogue itself.
+    // /llm/models carries max_output_tokens / context_window straight from
+    // llm_models.capabilities, so the Max Tokens control stops falling back to
+    // modelMaxTokens.js's static table — which is keyed by the ids this project
+    // ships with, and therefore gave every admin-registered model a
+    // conservative 4096 cap and a wrong context-usage meter.
+    const _applyProviders = (providers) => {
+        try {
+            registerModelLimits(providers.flatMap(p => p?.models || []));
+        } catch {
+            // Never let limit registration block rendering the picker.
+        }
+        setAllModelProviders(providers);
+    };
     // Optional frontend allowlist. The backend already applies governance on
     // /llm/models; apply this only when using platform /all-models fallback.
     const [allowedModels, setAllowedModels] = useState([]);
@@ -148,7 +164,7 @@ export default function useAvailableModels() {
                 if (cancelled) return;
                 if (d && Array.isArray(d.providers) && d.providers.length > 0) {
                     setUsingPlatformFallback(false);
-                    setAllModelProviders(d.providers);
+                    _applyProviders(d.providers);
                     return;
                 }
                 return authFetch(`${PLATFORM_API_BASE}/all-models`)
@@ -157,7 +173,7 @@ export default function useAvailableModels() {
                         if (cancelled) return;
                         if (fallback && Array.isArray(fallback.providers) && fallback.providers.length > 0) {
                             setUsingPlatformFallback(true);
-                            setAllModelProviders(fallback.providers);
+                            _applyProviders(fallback.providers);
                         } else {
                             setFetchError(prev => prev || 'No models available');
                         }
@@ -171,7 +187,7 @@ export default function useAvailableModels() {
                         if (cancelled) return;
                         if (fallback && Array.isArray(fallback.providers) && fallback.providers.length > 0) {
                             setUsingPlatformFallback(true);
-                            setAllModelProviders(fallback.providers);
+                            _applyProviders(fallback.providers);
                         } else {
                             setFetchError(prev => prev || 'Could not load models');
                         }

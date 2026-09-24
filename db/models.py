@@ -308,7 +308,29 @@ class AgentRecord(Base):
     visibility      = Column(String(10), nullable=False, default="private")  # public | private
     department      = Column(String(255), nullable=True)
     kb_namespace    = Column(String(255), nullable=True)   # e.g. "docs_kb:hr" — scopes retrieve tool
-    preferred_model = Column(String(50),  nullable=True)   # auto|claude|gpt|ollama
+    # The model_hint this agent's runs are made with, passed straight through
+    # to ModelRouter.route() by agents/agent_builder.py. Holds any of:
+    #   * NULL or "auto"          — no preference; the router picks by complexity
+    #   * a capability name       — fast|balanced|expert|vision|long-context|local-only
+    #   * a legacy tier alias     — claude|gpt|haiku|complex|... (_HINT_MAP keys)
+    #   * a concrete model id     — resolved against llm_models by route() step 1a
+    #
+    # Deliberately NOT a foreign key to llm_models, despite pointing at a model
+    # most of the time: "auto" and the capability/tier names are not models, so
+    # an FK could not represent the column's actual domain and there is no safe
+    # mapping for the existing values. Referential safety comes from the read
+    # side instead — route() falls through to complexity classification for an
+    # unrecognised hint, and agent_builder retries with model_hint=None when the
+    # preferred model fails — so a model deleted underneath an agent degrades
+    # rather than breaking it.
+    #
+    # Widened from String(50), which was too small for real provider-prefixed
+    # ids ("accounts/fireworks/models/llama-v3p1-70b-instruct" is 49 characters,
+    # "publishers/google/models/gemini-3.5-flash" is 41). 255 matches
+    # llm_models.model_id. The old comment claimed the domain was
+    # "auto|claude|gpt|ollama", which has not been true since route() gained
+    # registry-model resolution.
+    preferred_model = Column(String(255), nullable=True)
     # Governance: template-instance provenance (ABStudio approval layer)
     source_template_id   = Column(String(255), nullable=True)
     source_template_hash = Column(String(64),  nullable=True)

@@ -1352,6 +1352,9 @@ CREATE INDEX IF NOT EXISTS idx_sec_scan_scanned_at ON security_scan_results(scan
     # ── Part AD2: 2026-09-24 — llm_spend_daily reproducible DDL + token_type ──
     _part_ad2_llm_spend_daily_schema_2026_09_24()
 
+    # ── Part AD3: 2026-09-24 — agents_pg.preferred_model holds full model ids ──
+    _part_ad3_preferred_model_width_2026_09_24()
+
     # ── OSS schema-drift fixes ───────────────────────────────────────────────
     # (_part_oss3 runs at the top of this function — the catalogue seeds need it.)
     _part_oss4_model_permissions_web_search()
@@ -8441,6 +8444,29 @@ def _part_ad2_llm_spend_daily_schema_2026_09_24():
         "llm_spend_daily.idx_usage_date",
     )
     print("  ✓ Part AD2: llm_spend_daily schema reconciled with the upsert writer")
+
+
+def _part_ad3_preferred_model_width_2026_09_24():
+    """
+    2026-09-24 — widen agents_pg.preferred_model from VARCHAR(50) to VARCHAR(255).
+
+    The column holds whatever is passed to ModelRouter.route() as model_hint,
+    which since route() gained registry-model resolution includes CONCRETE
+    model ids of any provider. 50 characters is too small for real
+    provider-prefixed ids — "accounts/fireworks/models/llama-v3p1-70b-instruct"
+    is 49 and "publishers/google/models/gemini-3.5-flash" is 41, so an
+    OpenRouter- or Vertex-style id set as an agent's preferred model was liable
+    to be rejected on write. 255 matches llm_models.model_id.
+
+    Widening a VARCHAR is a metadata-only change in PostgreSQL — no table
+    rewrite, no lock beyond a brief ACCESS EXCLUSIVE — and cannot truncate
+    existing values.
+    """
+    _run_ddl(
+        "ALTER TABLE agents_pg ALTER COLUMN preferred_model TYPE VARCHAR(255)",
+        "agents_pg.preferred_model VARCHAR(255)",
+    )
+    print("  ok Part AD3: agents_pg.preferred_model widened to VARCHAR(255)")
 
 
 # ── Post-migration verification ─────────────────────────────────────────────

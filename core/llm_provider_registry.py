@@ -231,10 +231,18 @@ def get_cli_style_models(channel: Optional[str] = None) -> list[dict]:
     "LLM Providers" screen (DB row, no matching env var) showed up on the web
     Chat picker but not on the CLI, Agent Studio, or any IDE plugin.
 
-    Returns ``[{"id", "hint", "provider", "label", "tag", "billing_tier"}, ...]``.
+    Returns ``[{"id", "hint", "provider", "label", "tag", "billing_tier",
+    "context_window", "max_output_tokens"}, ...]``.
     In-house (ollama) ids are prefixed ``local:`` to match the prefix
     convention those three callers already use for locally-discovered models,
     so registry-sourced and live-discovered local entries dedupe cleanly.
+
+    The two limit fields come straight from ``llm_models.capabilities`` and are
+    ``None`` when an admin has not recorded them. They exist so pickers stop
+    carrying their own hardcoded per-model limit tables — see
+    AgentStudio/frontend/src/utils/modelMaxTokens.js, whose static table gives
+    every admin-added model a conservative 4096 cap and a wrong
+    context-usage meter.
     """
     out = []
     for m in get_enabled_models(channel=channel):
@@ -251,6 +259,10 @@ def get_cli_style_models(channel: Optional[str] = None) -> list[dict]:
             "label": f"{m['display_name']} ({raw_id})",
             "tag": f"{m['provider_name']} · {billing_tier}",
             "billing_tier": billing_tier,
+            # None when unrecorded — callers must keep their own fallback, and
+            # must not treat a missing limit as zero.
+            "context_window": caps.get("context_window"),
+            "max_output_tokens": caps.get("max_output_tokens") or caps.get("reserved_output"),
         })
     return out
 
