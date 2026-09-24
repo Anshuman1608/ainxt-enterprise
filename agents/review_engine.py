@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 
 @dataclass
@@ -183,7 +184,7 @@ class ReviewEngine:
         """Run a review prompt on a single model."""
         try:
             from models.model_router import get_router
-            raw = get_router().generate(prompt, model_hint="simple", temperature=0.0).strip()
+            raw = get_router().generate(prompt, model_hint=resolve_feature_model("sdlc.review", default="simple"), temperature=0.0).strip()
 
             # Parse JSON response
             import json
@@ -376,7 +377,7 @@ class ReviewEngine:
             )
 
             from models.model_router import get_router
-            raw = get_router().generate(prompt, model_hint="simple", temperature=0.0).strip()
+            raw = get_router().generate(prompt, model_hint=resolve_feature_model("sdlc.review", default="simple"), temperature=0.0).strip()
 
             import json as _json
             m = re.search(r'\{.*\}', raw, re.DOTALL)

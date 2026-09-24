@@ -23,6 +23,7 @@ from core.security_validation import (
     validate_product_name,
     validate_repo_name,
 )
+from core.feature_model_resolver import resolve_feature_model
 
 router = APIRouter(tags=["projects"])
 
@@ -353,7 +354,7 @@ def ask_project(
             logger.warning(f"ProjectAsk: orchestrator failed — falling back to GPT direct: {e}")
             try:
                 from models.model_router import model_router as _fallback_mr
-                for _token in _fallback_mr.stream(orch_question, model_hint="medium"):
+                for _token in _fallback_mr.stream(orch_question, model_hint=resolve_feature_model("projects.assist", default="medium")):
                     # Skip dict sentinel (see model_router.stream docstring)
                     if isinstance(_token, dict):
                         continue

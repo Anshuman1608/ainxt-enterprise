@@ -30,6 +30,7 @@ from core.logger import logger
 from agents.compliance_engine import compliance_engine
 from sandbox.docker_executor import docker_executor
 from models.model_router import model_router
+from core.feature_model_resolver import resolve_feature_model
 
 
 # ============================================================
@@ -337,7 +338,7 @@ RULES:
             # ====================================================
 
             healed_code = model_router.generate(
-                repair_prompt, model_hint="solution"
+                repair_prompt, model_hint=resolve_feature_model("sandbox.self_heal", default="solution")
             )
 
             # Strip any wrapping markdown fence the model added despite the prompt —

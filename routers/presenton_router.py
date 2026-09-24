@@ -44,6 +44,7 @@ from core.security_validation import (
     _flatten_errors,
 )
 from models.model_router import model_router
+from core.feature_model_resolver import resolve_feature_model
 
 router = APIRouter(tags=["ppt"])
 
@@ -180,7 +181,7 @@ def generate_outline(req: OutlineRequest, _user=Depends(get_current_user)):
     )
 
     try:
-        raw = model_router.generate(sanitize(prompt), model_hint="complex")
+        raw = model_router.generate(sanitize(prompt), model_hint=resolve_feature_model("presentations.generate", default="complex"))
         raw = (raw or "").strip()
         raw = re.sub(r"^```[a-z]*\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw.strip())

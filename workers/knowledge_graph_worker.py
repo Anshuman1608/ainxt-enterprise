@@ -21,6 +21,7 @@ import json
 import re
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 # ── DB helpers (PGS01) ──────────────────────────────────────────────────────
 
@@ -430,7 +431,7 @@ def cluster_domains_job(payload: dict) -> dict:
     domains = []
     try:
         from models.model_router import model_router
-        raw = model_router.generate(prompt, model_hint="complex") or ""
+        raw = model_router.generate(prompt, model_hint=resolve_feature_model("kb.graph", default="complex")) or ""
         m = re.search(r"\[.*\]", raw, re.DOTALL)
         if m:
             domains = json.loads(m.group(0))

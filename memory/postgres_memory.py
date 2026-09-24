@@ -20,6 +20,7 @@ from core.config import (
     POSTGRES_SCHEMA,
 )
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 
 # ============================================================
@@ -386,7 +387,7 @@ class PostgresMemory:
         )
         try:
             from models.model_router import get_router
-            merged = get_router().generate(_MERGE_PROMPT, model_hint="simple").strip()
+            merged = get_router().generate(_MERGE_PROMPT, model_hint=resolve_feature_model("memory.merge", default="simple")).strip()
             if merged:
                 return merged[:500]
         except Exception as e:

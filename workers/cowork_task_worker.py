@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 import sqlalchemy as sa
 
 from core.logger import logger, mask_email
+from core.feature_model_resolver import resolve_feature_model
 
 # Output is collected (not streamed) — cap the headless run so a runaway
 # plan cannot tie up an agent worker indefinitely.
@@ -168,7 +169,7 @@ def run_scheduled_task(payload) -> dict:
             # Cowork is cloud-only, Claude-primary (per the Cowork/SDLC model policy:
             # Claude Sonnet 4.6 primary, never the local in-house model). 'complex'
             # → Claude Sonnet, the same model the desktop agent uses successfully.
-            model_hint="complex",
+            model_hint=resolve_feature_model("cowork.tasks", default="complex"),
             request_id=run_id,
             # MUST be the FRAMED question, not the bare prompt. In office mode the
             # final generation prompt is built from `raw_question`
@@ -1040,7 +1041,7 @@ def _reask_email_envelope(raw_output: str, prompt: str, task_id: str = "") -> di
             f"[ORIGINAL TASK]\n{prompt}\n\n"
             f"[ASSISTANT RESPONSE TO CONVERT]\n{raw_output}"
         )
-        reply = model_router.generate(repair_prompt, model_hint="complex")
+        reply = model_router.generate(repair_prompt, model_hint=resolve_feature_model("cowork.tasks", default="complex"))
         parsed = _parse_email_envelope(str(reply or ""))
         if parsed is not None:
             logger.info(
@@ -1153,7 +1154,7 @@ def _reask_teams_envelope(raw_output: str, prompt: str, task_id: str = "") -> di
             f"[ORIGINAL TASK]\n{prompt}\n\n"
             f"[ASSISTANT RESPONSE TO CONVERT]\n{raw_output}"
         )
-        reply = model_router.generate(repair_prompt, model_hint="complex")
+        reply = model_router.generate(repair_prompt, model_hint=resolve_feature_model("cowork.tasks", default="complex"))
         parsed = _parse_teams_envelope(str(reply or ""))
         if parsed is not None:
             logger.info(

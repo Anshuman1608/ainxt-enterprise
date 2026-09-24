@@ -36,6 +36,7 @@ import asyncio
 from typing import Optional
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 # ── Config ──────────────────────────────────────────────────────────────
 TEAMS_SDK_ENABLED       = os.getenv("TEAMS_SDK_ENABLED", "false").lower() == "true"
@@ -158,7 +159,7 @@ async def _stream_answer(ctx, command: str) -> None:
     acc: list[str] = []
     pending = 0
     try:
-        for tok in model_router.stream(command, model_hint="complex"):
+        for tok in model_router.stream(command, model_hint=resolve_feature_model("teams.triage", default="complex")):
             if isinstance(tok, dict):  # __stream_meta__ sentinel — ignore
                 continue
             if not tok:

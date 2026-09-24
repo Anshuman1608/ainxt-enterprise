@@ -155,3 +155,56 @@ def test_lookup_helpers() -> None:
     assert len(categories()) == len({f.category for f in FEATURES})
     # categories() preserves first-declaration order (the UI's group order)
     assert categories()[0] == FEATURES[0].category
+
+# ── the catalogue must match the call sites ──────────────────────────────────
+
+def _referenced_keys() -> set[str]:
+    """Every feature_key passed to resolve_feature_model() in non-test code."""
+    import pathlib
+    import re
+    import subprocess
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    out = subprocess.run(
+        ["grep", "-rn", "--include=*.py", "resolve_feature_model(", "."],
+        cwd=root, capture_output=True, text=True,
+    ).stdout
+    keys: set[str] = set()
+    for line in out.splitlines():
+        path, _, text = line.split(":", 2)
+        path = path.lstrip("./")
+        if path.startswith("tests/") or "/tests/" in path:
+            continue
+        m = re.search(r'resolve_feature_model\(\s*"([^"]+)"', text)
+        if m:
+            keys.add(m.group(1))
+    return keys
+
+
+def test_every_declared_feature_is_actually_referenced() -> None:
+    """No dead rows.
+
+    A feature an admin can assign but that no call site resolves is worse than
+    no row at all: the assignment appears to take effect and silently does
+    nothing. chat.respond and sdlc.patch were removed for exactly this reason —
+    see the note at the top of core/feature_registry.py.
+    """
+    dead = sorted(set(FEATURES_BY_KEY) - _referenced_keys())
+    assert not dead, (
+        f"declared but never passed to resolve_feature_model(): {dead}. "
+        f"Either wire the call site or remove the declaration."
+    )
+
+
+def test_every_referenced_key_is_declared() -> None:
+    """No silent no-ops.
+
+    resolve_feature_model() returns the caller's `default` for an unknown key,
+    so a typo'd or undeclared key fails silently — the feature simply never
+    becomes assignable and nothing reports it.
+    """
+    undeclared = sorted(_referenced_keys() - set(FEATURES_BY_KEY))
+    assert not undeclared, (
+        f"passed to resolve_feature_model() but not declared in FEATURES: "
+        f"{undeclared}. These resolve to the call site's default forever."
+    )

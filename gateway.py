@@ -1266,6 +1266,7 @@ from routers.templates_router import (
 from routers.cached_ask_router import router as cached_ask_router
 from routers.endpoint_mgmt_router import router as endpoint_mgmt_router
 from routers.endpoint_proxy_router import proxy_router as endpoint_proxy_router
+from core.feature_model_resolver import resolve_feature_model
 from routers.llm_provider_admin_router import router as llm_provider_admin_router
 from routers.feature_model_config_router import router as feature_model_config_router
 # P10: Prompt version management
@@ -3433,7 +3434,7 @@ def continue_generation(
                 try:
                     for _tok in _mr_cont.stream(
                             [{"role": "user", "content": _continue_prompt}],
-                            model_hint="medium",
+                            model_hint=resolve_feature_model("chat.continue", default="medium"),
                     ):
                         if isinstance(_tok, dict):
                             _sm = _tok.get("__stream_meta__")
@@ -3543,7 +3544,7 @@ async def chat_followups(body: _FollowupReq, authorization: Optional[str] = _Hea
         # at a real proxy service, or when API keys are configured for direct calls).
         if not _raw:
             from models.model_router import model_router as _mr_fu
-            _raw = _mr_fu.generate(_prompt, model_hint="haiku")
+            _raw = _mr_fu.generate(_prompt, model_hint=resolve_feature_model("chat.followups", default="haiku"))
         # Guard against error strings — model_router.generate returns "Error: …" on failure.
         if _raw and isinstance(_raw, str) and _raw.strip().lower().startswith("error"):
             _raw = ""

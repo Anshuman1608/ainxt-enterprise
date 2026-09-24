@@ -14,6 +14,7 @@ Key exports:
 import logging
 import re
 from typing import Optional
+from core.feature_model_resolver import resolve_feature_model
 
 logger = logging.getLogger("sdlc_context")
 
@@ -360,7 +361,7 @@ def run_exploration_phase(
                 f"Name ACTUAL class names, function names, import paths from the code. "
                 f"Max 400 words. Narrative format (no JSON)."
             )
-            summary_text = _mr.generate(synth_prompt, model_hint="solution")
+            summary_text = _mr.generate(synth_prompt, model_hint=resolve_feature_model("sdlc.explore", default="solution"))
             result["patterns_summary"] = summary_text or ""
             logger.info(
                 f"[IDE] Exploration complete — {len(file_contents)} files read, "

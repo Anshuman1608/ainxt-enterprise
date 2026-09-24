@@ -14,6 +14,7 @@
 import json
 import re
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 _CHARS_PER_TOKEN    = 4
 _TRIGGER_TOKENS     = 800   # only summarise when history exceeds this
@@ -79,7 +80,7 @@ def _call_model(prompt: str) -> str:
     """Call gpt-5-mini (simple tier) via model_router → Local LLM proxy."""
     try:
         from models.model_router import model_router
-        return model_router.generate(prompt, model_hint="simple").strip()
+        return model_router.generate(prompt, model_hint=resolve_feature_model("chat.summarize", default="simple")).strip()
     except Exception as e:
         logger.warning(f"chat_summarizer: model call failed: {e}")
         return ""

@@ -16,6 +16,7 @@ import json
 import uuid
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 
 # ============================================================
@@ -47,7 +48,7 @@ Requirements:
 Return ONLY valid JSON — no markdown, no explanation, no code fences.
 """
 
-    response = model_router.generate(prompt, model_hint="complex")
+    response = model_router.generate(prompt, model_hint=resolve_feature_model("workflows.build", default="complex"))
 
     # Strip markdown code fences if present
     text = (response or "").strip()

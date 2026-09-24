@@ -22,6 +22,7 @@ from dataclasses import asdict
 from auth.dependencies import get_current_user as _require_auth
 from core.logger import set_client_source, set_request_id, set_span_id, set_correlation_id
 from core.logger import logger, mask_email
+from core.feature_model_resolver import resolve_feature_model
 
 
 # Set IDE_DEBUG=true in .env (or shell) to enable per-request DEBUG traces
@@ -506,7 +507,7 @@ async def ide_chat(body: IDEChat, request: Request, _u: dict = Depends(_require_
             logger.exception("[IDE:%s] GPT call also failed: %s", req_id, exc)
             raise HTTPException(status_code=500, detail=f"Model error: {exc}")
         try:
-            answer = await model_router.async_generate(question, model_hint="medium")
+            answer = await model_router.async_generate(question, model_hint=resolve_feature_model("ide.complete", default="medium"))
             logger.info("[IDE:%s] GPT fallback succeeded", req_id)
         except Exception as fallback_exc:
             logger.exception("[IDE:%s] GPT fallback also failed: %s", req_id, fallback_exc)

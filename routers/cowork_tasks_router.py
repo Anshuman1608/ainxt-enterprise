@@ -851,6 +851,7 @@ async def task_history(
 #     the "email adarsh@... every day" style prompts).
 
 import re as _re
+from core.feature_model_resolver import resolve_feature_model
 
 _CRON_TOKEN_RE = _re.compile(
     r"(?:^|\s)"
@@ -958,7 +959,7 @@ async def suggest_cron(
 
     try:
         from models.model_router import model_router
-        raw = model_router.generate(prompt, model_hint="simple") or ""
+        raw = model_router.generate(prompt, model_hint=resolve_feature_model("cowork.suggest_cron", default="simple")) or ""
     except Exception as exc:
         logger.warning(f"cowork_tasks.suggest_cron: LLM call failed: {exc}")
         raise HTTPException(

@@ -19,6 +19,7 @@ from __future__ import annotations
 import re as _re
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 
 def _build_prompt(name: str, description: str, skill_type: str) -> str:
@@ -84,7 +85,7 @@ def synthesize_skill(
     skill_type = skill_type if skill_type in ("execution", "behavioral") else "execution"
     prompt = _build_prompt(name, description, skill_type)
 
-    raw = model_router.generate(prompt, model_hint="claude")
+    raw = model_router.generate(prompt, model_hint=resolve_feature_model("skills.synthesize", default="claude"))
 
     if skill_type == "behavioral":
         code = (raw or "").strip()

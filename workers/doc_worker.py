@@ -45,6 +45,7 @@ from core.logger import logger
 # import here pays that cost once when the worker process starts (or once per
 # fork-parent, if the parent already imported doc_worker), not per job.
 from agents.compliance_engine import compliance_engine
+from core.feature_model_resolver import resolve_feature_model
 
 # DB=6 — document result delivery. Backend selected via REDIS_CLIENT_CONFIG_DB6.
 _R = get_kv(RDB_STREAM, decode_responses=True)
@@ -836,7 +837,7 @@ def _skill_generate(
             # Injected caller (tests) — no meta available; nothing to accumulate.
             return (llm_caller(prompt) or "").strip()
         from models.model_router import model_router
-        result = model_router.generate(prompt, model_hint="complex", return_meta=True)
+        result = model_router.generate(prompt, model_hint=resolve_feature_model("skills.generate", default="complex"), return_meta=True)
         # model_router.generate(return_meta=True) returns {"text": ..., "meta":
         # {model,in_tok,out_tok,tokens,cost_usd,latency}} — the usage lives under
         # "meta" (see model_router.generate). Accumulate across every call.
@@ -1691,7 +1692,7 @@ def _author_pptxgenjs_code(title: str, slides: list,
     from models.model_router import model_router
     # return_meta=True so the (dominant) PPTX code-authoring cost is captured
     # for budget accounting instead of being dropped.
-    result = model_router.generate(prompt, model_hint="complex", return_meta=True)
+    result = model_router.generate(prompt, model_hint=resolve_feature_model("presentations.generate", default="complex"), return_meta=True)
     if isinstance(result, dict):
         raw = result.get("text") or ""
         # Usage lives under "meta" (see model_router.generate return contract).
@@ -1812,7 +1813,7 @@ def _generate_pptx_via_sandbox(
             from models.model_router import model_router as _mr_qa
             _repaired = doc_critic.strip_code_fence(
                 _mr_qa.generate(doc_critic.build_repair_prompt("pptx", code, _crit.issues),
-                                model_hint="complex") or ""
+                                model_hint=resolve_feature_model("presentations.generate", default="complex")) or ""
             )
         except Exception as _re:
             logger.warning(f"[docgen] worker PPTX visual-QA repair gen failed (shipping) | job={job_id}: {_re}")

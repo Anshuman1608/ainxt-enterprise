@@ -28,6 +28,7 @@ from core.security_validation import (
     validate_free_text,
     _flatten_errors,
 )
+from core.feature_model_resolver import resolve_feature_model
 from db.chat_rows import ensure_chat_row
 
 router = APIRouter(tags=["chat"])
@@ -2217,7 +2218,7 @@ def auto_title_chat(chat_id: str, current_user: dict = Depends(get_current_user)
             # at a real proxy service, or when API keys are configured for direct calls).
             if not raw:
                 try:
-                    raw = model_router.generate(prompt, model_hint="haiku")
+                    raw = model_router.generate(prompt, model_hint=resolve_feature_model("chat.title", default="haiku"))
                 except Exception:
                     raw = ""
             # Guard against error strings leaking as the title — model_router.generate

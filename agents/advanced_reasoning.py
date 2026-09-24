@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Callable
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 
 def _advanced_reasoning_enabled() -> bool:
@@ -84,7 +85,7 @@ class TreeOfThoughts:
         Falls back to a single direct LLM call on any error.
         """
         if not _advanced_reasoning_enabled():
-            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint="complex")
+            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint=resolve_feature_model("reasoning.advanced", default="complex"))
 
         try:
             logger.info(f"[ToT] starting n_branches={self.n_branches} max_depth={self.max_depth}")
@@ -136,13 +137,13 @@ class TreeOfThoughts:
                 f"Original question: {goal}\n\n"
                 f"Final answer:"
             )
-            answer = _llm_call(final_prompt, temperature=0.0, model_hint="complex")
+            answer = _llm_call(final_prompt, temperature=0.0, model_hint=resolve_feature_model("reasoning.advanced", default="complex"))
             logger.info(f"[ToT] completed, answer length={len(answer)}")
             return answer or best_thought
 
         except Exception as e:
             logger.error(f"[ToT] failed ({e}), falling back to direct call")
-            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint="complex")
+            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint=resolve_feature_model("reasoning.advanced", default="complex"))
 
     def _score_thought(self, goal: str, thought: str) -> float:
         """Score a thought branch 0.0–1.0 using a lightweight evaluator prompt."""
@@ -156,7 +157,7 @@ class TreeOfThoughts:
             f"Score (0.0-1.0):"
         )
         try:
-            raw = _llm_call(prompt, temperature=0.0, model_hint="simple")
+            raw = _llm_call(prompt, temperature=0.0, model_hint=resolve_feature_model("reasoning.advanced_support", default="simple"))
             m = re.search(r"(\d+\.?\d*)", raw)
             if m:
                 score = float(m.group(1))
@@ -191,7 +192,7 @@ class SelfConsistency:
         Falls back to a single direct LLM call on any error.
         """
         if not _advanced_reasoning_enabled():
-            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint="simple")
+            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint=resolve_feature_model("reasoning.advanced_support", default="simple"))
 
         try:
             logger.info(f"[SC] starting n_samples={self.n_samples}")
@@ -209,7 +210,7 @@ class SelfConsistency:
 
             samples = [s for s in samples if s.strip()]
             if not samples:
-                return _llm_call(prompt, temperature=0.0, model_hint="simple")
+                return _llm_call(prompt, temperature=0.0, model_hint=resolve_feature_model("reasoning.advanced_support", default="simple"))
 
             # Cluster by string similarity (simple overlap)
             best = self._majority_vote(samples)
@@ -218,7 +219,7 @@ class SelfConsistency:
 
         except Exception as e:
             logger.error(f"[SC] failed ({e}), falling back to direct call")
-            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint="simple")
+            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint=resolve_feature_model("reasoning.advanced_support", default="simple"))
 
     def _majority_vote(self, samples: List[str]) -> str:
         """Return the sample from the largest similarity cluster."""
@@ -316,7 +317,7 @@ class ChainOfVerification:
                 f"Please provide a corrected answer that removes or fixes the contradicted claims. "
                 f"Keep all verified information. Be concise."
             )
-            corrected = _llm_call(correction_prompt, temperature=0.0, model_hint="complex")
+            corrected = _llm_call(correction_prompt, temperature=0.0, model_hint=resolve_feature_model("reasoning.advanced", default="complex"))
             if corrected:
                 logger.info(
                     f"[CoVe] regenerated answer after {len(contradicted)} contradiction(s), "
@@ -340,7 +341,7 @@ class ChainOfVerification:
             f"No explanation.\n\nText: {answer[:1500]}"
         )
         try:
-            raw = _llm_call(prompt, temperature=0.0, model_hint="simple")
+            raw = _llm_call(prompt, temperature=0.0, model_hint=resolve_feature_model("reasoning.advanced_support", default="simple"))
             m = re.search(r'\[.*?\]', raw, re.DOTALL)
             if m:
                 import json
@@ -392,7 +393,7 @@ class ChainOfVerification:
                 f"Evidence: {rag_text[:800]}\n\n"
                 f"Output ONLY one word: VERIFIED, CONTRADICTED, or UNVERIFIED."
             )
-            result = _llm_call(verify_prompt, temperature=0.0, model_hint="simple").upper().strip()
+            result = _llm_call(verify_prompt, temperature=0.0, model_hint=resolve_feature_model("reasoning.advanced_support", default="simple")).upper().strip()
             if "CONTRADICTED" in result:
                 return "CONTRADICTED"
             if "VERIFIED" in result:

@@ -52,6 +52,7 @@ from tools.doc_generator import (
     smart_filename,
     get_palette,
 )
+from core.feature_model_resolver import resolve_feature_model
 
 # Persistent storage (see core.config.DOC_STORAGE_DIR). NOT /tmp.
 DOC_DIR = DOC_STORAGE_DIR
@@ -747,7 +748,9 @@ def build_summary_and_preview(
         logger.info(f"[md_agent] summary LLM call | context={ctx!r} "
                     f"prompt_len={len(prompt_text)}")
         result = model_router.generate(
-            prompt_text, model_hint="haiku", return_meta=True
+            prompt_text,
+            model_hint=resolve_feature_model("docs.outline", default="haiku"),
+            return_meta=True,
         )
         raw = (result.get("text") or "").strip()
         meta = result.get("meta") or {}

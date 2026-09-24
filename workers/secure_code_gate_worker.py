@@ -29,6 +29,7 @@ from tools.security_scan_tools import (
     secrets_scan,
     semgrep_scan,
 )
+from core.feature_model_resolver import resolve_feature_model
 
 GATE_ENABLED     = os.getenv("SECURE_CODE_GATE_ENABLED", "true").lower() == "true"
 MAX_GATE_ATTEMPTS = int(os.getenv("MAX_GATE_ATTEMPTS", "3"))
@@ -123,7 +124,7 @@ def _llm_fix(path: str, content: str, findings: list[dict], language: str) -> st
     )
     try:
         from models.model_router import model_router
-        out = model_router.generate(prompt, model_hint="complex") or ""
+        out = model_router.generate(prompt, model_hint=resolve_feature_model("security.code_gate", default="complex")) or ""
         fixed = _strip_fences(out)
         return fixed or None
     except Exception as e:

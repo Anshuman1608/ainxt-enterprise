@@ -23,6 +23,7 @@ from core.security_validation import (
     validate_hitl_request,
     validate_reaction_request,
 )
+from core.feature_model_resolver import resolve_feature_model
 
 router = APIRouter(tags=["threads"])
 
@@ -222,7 +223,7 @@ def _ainxt_flow(thread_id: str, message_content: str, repo: str, product_id: str
             f"Analysis summary: {fix_analysis}"
         )
         try:
-            priority_raw = model_router.generate(priority_prompt, model_hint="medium").strip()
+            priority_raw = model_router.generate(priority_prompt, model_hint=resolve_feature_model("threads.flow", default="medium")).strip()
         except Exception:
             priority_raw = "Medium"
         priority = priority_raw if priority_raw in ("High", "Medium", "Low") else "Medium"

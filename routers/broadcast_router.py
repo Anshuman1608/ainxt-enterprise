@@ -48,6 +48,7 @@ from core.rate_limiter import SENSITIVE_ADMIN, enforce_rate_limit_with_behaviour
 from core.security_validation import validate_broadcast_send_request, _flatten_errors
 from db.database import get_db
 from workers.broadcast_worker import submit_broadcast_recipient
+from core.feature_model_resolver import resolve_feature_model
 
 
 router = APIRouter(prefix="/broadcast", tags=["broadcast"])
@@ -434,7 +435,7 @@ def templates_suggest(
 
     try:
         from models.model_router import model_router
-        result = model_router.generate(full_prompt, model_hint="claude", return_meta=True)
+        result = model_router.generate(full_prompt, model_hint=resolve_feature_model("broadcast.compose", default="claude"), return_meta=True)
     except Exception as exc:
         logger.error(f"broadcast_router: model_router.generate failed: {exc}")
         raise HTTPException(502, "Template generation failed")

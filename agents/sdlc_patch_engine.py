@@ -389,6 +389,13 @@ class PatchEngine:
     def _patch_attempts(
         self, *, path, existing_content, desc, solution_text, dep_block, rag_context,
         cs_block, prior_block, language, jira_key, run_id, sandbox_image,
+        # model_hint is deliberately NOT routed through resolve_feature_model
+        # here. It is a PARAMETER DEFAULT, so a resolver call would be evaluated
+        # once at import time and freeze the admin's assignment for the life of
+        # the process. It is also only reached when a caller omits the argument,
+        # and the real callers pass `sdlc_stage_hint("coder")` — the per-stage
+        # SDLC_MODEL_<STAGE> mechanism, which is meant to win. The sdlc.patch
+        # feature assignment applies at those call sites, not to this fallback.
         file_view, file_view_note, max_attempts, model_hint="complex",
     ) -> dict:
         """
@@ -536,6 +543,13 @@ class PatchEngine:
     def _run_patch_large(
         self, *, path, existing_content, desc, solution_text, dep_block, rag_context,
         cs_block, prior_block, language, jira_key, run_id, sandbox_image,
+        # model_hint is deliberately NOT routed through resolve_feature_model
+        # here. It is a PARAMETER DEFAULT, so a resolver call would be evaluated
+        # once at import time and freeze the admin's assignment for the life of
+        # the process. It is also only reached when a caller omits the argument,
+        # and the real callers pass `sdlc_stage_hint("coder")` — the per-stage
+        # SDLC_MODEL_<STAGE> mechanism, which is meant to win. The sdlc.patch
+        # feature assignment applies at those call sites, not to this fallback.
         max_attempts, cap, model_hint="complex",
     ) -> dict:
         """

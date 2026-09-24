@@ -22,6 +22,7 @@ import uuid as _uuid
 from typing import Optional
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 
 def _strip_fences(text: str) -> str:
@@ -90,7 +91,7 @@ def revise(
             "Preserve everything the user did not ask to change.\n\n"
             f"CHANGE REQUESTED: {instruction}\n\n"
             f"CURRENT DOCUMENT (\"{ref.title}\"):\n{source[:80000]}",
-            model_hint="complex",   # cloud authoring model — quality
+            model_hint=resolve_feature_model("docs.revise", default="complex"),   # cloud authoring model — quality
             return_meta=True,
         )
         if isinstance(_res, dict):

@@ -77,6 +77,25 @@ def _f(*args, **kwargs) -> FeatureSpec:
     return FeatureSpec(*args, **kwargs)
 
 
+# NOT YET ASSIGNABLE, and therefore deliberately absent — a row an admin can
+# set that has no effect is worse than no row:
+#
+#   chat.respond   The main conversational answer path routes with NO hint at
+#                  all (route() picks a tier by complexity), and the Chat UI's
+#                  own model picker supplies the hint when a user chooses one.
+#                  Threading a feature default through without overriding the
+#                  user's explicit choice is a design question, not a
+#                  one-argument substitution — it needs gateway.py's inline
+#                  `if tier ==` branches collapsed onto the router first.
+#   sdlc.patch     Its two model_hint values are PARAMETER DEFAULTS, so a
+#                  resolver call there would be evaluated once at import time
+#                  and freeze the assignment. The real callers pass
+#                  sdlc_stage_hint("coder"), which is already provider-agnostic
+#                  and admin-settable via SDLC_MODEL_CODER.
+#
+# tests/core/test_feature_registry.py asserts every declared key is actually
+# referenced by a call site, so this list cannot grow stale rows by accident.
+
 # ── The catalogue ────────────────────────────────────────────────────────────
 # Grouped by category, which is also how the admin screen groups its rows.
 
@@ -95,23 +114,33 @@ FEATURES: tuple[FeatureSpec, ...] = (
     _f("reasoning.orchestrate", "Agent orchestration", "Reasoning",
        "agents.orchestrator", default_capability="balanced",
        description="Plans and sequences multi-agent runs.", requires_tools=True),
+    _f("reasoning.orchestrate_support", "Agent orchestration — planning pass", "Reasoning",
+       "agents.orchestrator", default_capability="local-only",
+       description="The cheap plan-shaping pass inside an orchestration run."),
     _f("reasoning.route", "Agent routing", "Reasoning",
        "agents.router_agent", default_capability="local-only",
        description="Picks which agent should handle a request. High volume, "
                    "short prompts."),
 
     # ── Chat ─────────────────────────────────────────────────────────────────
-    _f("chat.respond", "Chat — answer generation", "Chat",
-       "workers.chat_worker", default_capability="balanced",
-       description="The main conversational answer path.",
-       requires_tools=True, requires_streaming=True, min_context_tokens=128000),
     _f("chat.summarize", "Chat — history summarisation", "Chat",
        "memory.chat_summarizer", default_capability="local-only",
        description="Condenses older turns to keep a conversation inside the "
                    "context window."),
     _f("chat.title", "Chat — thread titling", "Chat",
-       "routers.threads_router",
+       "routers.chat_router", default_capability="fast",
        description="Generates a short title for a conversation."),
+    _f("chat.continue", "Chat — continue a truncated answer", "Chat",
+       "gateway",
+       description="Resumes generation when an answer hit the output limit."),
+    _f("chat.followups", "Chat — follow-up suggestions", "Chat",
+       "gateway", default_capability="fast",
+       description="Proposes follow-up questions after an answer."),
+    _f("chat.pipeline", "Chat — pipeline pre/post passes", "Chat",
+       "workers.chat_worker", default_capability="local-only",
+       description="The cheap classification and shaping passes around a chat "
+                   "turn. Separate from chat.respond so assigning a cloud model "
+                   "to answering does not move these onto it."),
     _f("context.compress", "Context compression", "Chat",
        "core.context_manager", default_capability="local-only",
        description="Compresses prompt context when a turn would overflow."),
@@ -120,6 +149,13 @@ FEATURES: tuple[FeatureSpec, ...] = (
     _f("retrieval.query_rewrite", "Query rewriting / expansion", "Knowledge",
        "models.query_rewriter", default_capability="local-only",
        description="Rephrases a question to improve retrieval recall."),
+    _f("retrieval.intent_classify", "Query intent classification", "Knowledge",
+       "models.router", default_capability="local-only",
+       description="Classifies what a query is asking for, to pick a retrieval "
+                   "strategy. High volume, short prompts."),
+    _f("memory.merge", "Durable memory merge", "Knowledge",
+       "memory.postgres_memory", default_capability="local-only",
+       description="Merges a new observation into a user's durable memory."),
     _f("kb.graph", "Knowledge-graph extraction", "Knowledge",
        "workers.knowledge_graph_worker", default_capability="balanced",
        description="Extracts entities and relations from indexed documents.",
@@ -162,9 +198,13 @@ FEATURES: tuple[FeatureSpec, ...] = (
        description="Pipeline stages not covered by SDLC_MODEL_<STAGE>. Per-stage "
                    "overrides still win over anything assigned here.",
        requires_tools=True, min_context_tokens=128000),
-    _f("sdlc.patch", "SDLC — patch generation", "SDLC",
-       "agents.sdlc_patch_engine", default_capability="balanced",
-       description="Produces code patches.", min_context_tokens=128000),
+    _f("sdlc.explore", "SDLC — exploration phase", "SDLC",
+       "agents.sdlc_context", default_capability="expert",
+       description="Explores a codebase to build the context a change needs.",
+       min_context_tokens=128000),
+    _f("sdlc.conflict_resolution", "SDLC — conflict resolution", "SDLC",
+       "agents.sdlc_pipeline", default_capability="expert",
+       description="Resolves conflicting findings between pipeline stages."),
     _f("sdlc.review", "SDLC — review gates", "SDLC",
        "agents.review_engine", default_capability="local-only",
        description="Pre- and post-code review gates."),
@@ -183,6 +223,9 @@ FEATURES: tuple[FeatureSpec, ...] = (
     _f("cowork.tasks", "Buddy — task execution", "Workspace",
        "workers.cowork_task_worker", default_capability="balanced",
        description="Runs scheduled and ad-hoc Buddy tasks.", requires_tools=True),
+    _f("cowork.suggest_cron", "Buddy — schedule suggestion", "Workspace",
+       "routers.cowork_tasks_router", default_capability="local-only",
+       description="Turns a plain-English schedule into a cron expression."),
     _f("projects.assist", "Workspace assistance", "Workspace",
        "routers.projects_router",
        description="Answers questions scoped to a project workspace."),
@@ -205,6 +248,9 @@ FEATURES: tuple[FeatureSpec, ...] = (
     _f("mcp.document_revise", "MCP — document revision tool", "Integrations",
        "connectors.mcp_bridge", default_capability="balanced",
        description="The revise-document tool exposed to external MCP clients."),
+    _f("threads.flow", "Discussion thread assistance", "Integrations",
+       "routers.threads_router",
+       description="Answers and summarises inside a discussion thread."),
     _f("agents.build", "Agent builder", "Integrations",
        "agents.agent_builder",
        description="Builds user-defined agents. Note: an agent's own "

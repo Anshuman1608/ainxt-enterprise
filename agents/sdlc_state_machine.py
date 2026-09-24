@@ -33,6 +33,7 @@ from core.config import (
 )
 from core.model_registry import CLAUDE_PRIMARY_MODEL as _CLAUDE_PRIMARY_MODEL
 from store.sdlc_store import get_run, update_run_state, add_run_event
+from core.feature_model_resolver import resolve_feature_model
 
 
 def _s(item) -> str:
@@ -97,7 +98,7 @@ def _llm(prompt: str, hint: str = "solution") -> str:
             raise ValueError("empty response from Claude")
     except Exception as _claude_err:
         logger.warning(f"[SDLC] primary tier '{_model_used}' unavailable ({_claude_err}) — falling back to GPT-5.4 (medium)")
-        result = model_router.generate(prompt, model_hint="medium")  # GPT-5.4
+        result = model_router.generate(prompt, model_hint=resolve_feature_model("sdlc.pipeline", default="medium"))  # GPT-5.4
         _model_used = "medium"
 
     # Token + cost (char/4 estimate, same as sdlc_pipeline._llm for HOD-rollup

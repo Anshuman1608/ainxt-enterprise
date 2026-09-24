@@ -9,6 +9,7 @@ from core.config import RDB_CACHE
 from core.kv import get_kv
 from core.prompts import INTENT_CLASSIFIER_PROMPT
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 
 # KV cache (DB=0). Backend selected via REDIS_CLIENT_CONFIG_DB0.
@@ -46,7 +47,7 @@ def classify_intent(question: str) -> str:
         )
 
         from models.model_router import model_router
-        raw = model_router.generate(prompt, model_hint="simple").strip().upper()
+        raw = model_router.generate(prompt, model_hint=resolve_feature_model("retrieval.intent_classify", default="simple")).strip().upper()
 
         if raw == "CODE":
             intent = "code"

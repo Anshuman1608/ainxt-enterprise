@@ -30,6 +30,7 @@ from core.logger import logger
 from core.config import REDIS_HOST as _REDIS_HOST, REDIS_PORT as _REDIS_PORT
 from agents.compliance_engine import compliance_engine
 from core.model_registry import MODEL_COST_PER_1M as _MODEL_COST_PER_1M
+from core.feature_model_resolver import resolve_feature_model
 
 
 # ── Cost estimator (mirrors gateway.py _estimate_cost) ───────────────────────
@@ -1248,7 +1249,7 @@ class AgentRunner:
                 f"```\n\n"
                 f"Now generate for: '{human_name}'"
             )
-            raw = model_router.generate(prompt, model_hint="gpt")
+            raw = model_router.generate(prompt, model_hint=resolve_feature_model("agents.build", default="gpt"))
             # Extract code block
             import re as _re
             match = _re.search(r"```python\s*(.*?)```", raw, _re.DOTALL)

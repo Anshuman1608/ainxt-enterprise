@@ -17,6 +17,7 @@ import re
 from typing import Optional
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 
 _CONFIDENCE_THRESHOLD = 0.65   # below this → fall through to OrchestratorAgent
@@ -73,7 +74,7 @@ class RouterAgent:
         )
 
         from models.model_router import model_router
-        raw = model_router.generate(prompt, model_hint="simple")
+        raw = model_router.generate(prompt, model_hint=resolve_feature_model("reasoning.route", default="simple"))
 
         # Extract JSON from response (LLM may wrap in prose)
         m = re.search(r'\{[^{}]+\}', raw, re.DOTALL)

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 try:
     from core.config import DOC_INTENT_MODEL as _INTENT_MODEL
@@ -462,8 +463,14 @@ def classify(text: str, *, has_attachments: bool = False,
         # classifier survives a local-model outage automatically. Only a TOTAL
         # outage (every provider down) yields the "Error: no gateway available"
         # sentinel below.
-        raw = (model_router.generate(prompt, model_hint=_INTENT_MODEL,
-                                     return_meta=False) or "").strip()
+        raw = (model_router.generate(
+            prompt,
+            # _INTENT_MODEL (core.config.DOC_INTENT_MODEL, default "local")
+            # stays the fallback, so an operator's existing env setting keeps
+            # working; an admin assignment for docs.intent now wins over it.
+            model_hint=resolve_feature_model("docs.intent", default=_INTENT_MODEL),
+            return_meta=False,
+        ) or "").strip()
         if not raw or raw.startswith("Error:"):
             raise RuntimeError(f"all models unavailable ({raw[:80]!r})")
         data = _parse_json(raw)

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 _MAX_ACTIVE_REPOS     = 10
 _MAX_ACTIVE_TICKETS   = 20
@@ -219,7 +220,7 @@ def _rebuild_summary(user_id: str, latest_q: str, latest_a: str) -> None:
             )
 
             from models.model_router import model_router
-            new_summary = model_router.generate(prompt, model_hint="simple")
+            new_summary = model_router.generate(prompt, model_hint=resolve_feature_model("context.compress", default="simple"))
             if new_summary:
                 rec.summary    = new_summary[:1000]
                 rec.updated_at = _now()

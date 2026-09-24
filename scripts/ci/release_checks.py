@@ -565,6 +565,92 @@ def check_registry_switch_parity(cfg) -> list[str]:
     return bad
 
 
+# Files allowed to contain a literal model_hint=, and only these:
+#   sdlc_patch_engine's two are PARAMETER DEFAULTS, where a resolver call would
+#   be evaluated once at import time and freeze the admin's assignment for the
+#   life of the process (see the comments at those two signatures).
+#   skills_router's are inside triple-quoted SKILL SOURCE TEMPLATES shipped to
+#   users — generated files that do not import the resolver.
+_MODEL_HINT_ALLOWED = {
+    "agents/sdlc_patch_engine.py",
+    "routers/skills_router.py",
+}
+
+# Recorded count of literal model_hint= keywords outside the allowlist,
+# measured after the Phase 2 migration. A ratchet, like the model-literals
+# check above: it may fall, never rise.
+_MODEL_HINT_BASELINE = 0
+
+
+def check_model_hint_literals(cfg) -> list[str]:
+    """No NEW hardcoded routing tier at a call site.
+
+    Which model serves which feature is an admin decision, held in
+    feature_model_config and read through core.feature_model_resolver. A tier
+    name written into a call site takes that decision away again: it cannot be
+    changed without a code change and a redeploy, which is the whole problem
+    the feature registry exists to solve. 68 such literals were migrated; this
+    is what stops them growing back faster than they are removed.
+
+    The replacement is a one-argument substitution, because
+    ModelRouter.route() already resolves whatever the resolver returns:
+
+        model_router.generate(prompt, model_hint="complex")
+        model_router.generate(prompt, model_hint=resolve_feature_model(
+            "skills.generate", default="complex"))
+
+    Passing the current literal as `default=` keeps the call site's behaviour
+    identical until an admin assigns something.
+
+    Matched with the AST, not a regex: the first pass at this migration used
+    grep and mangled four docstrings, three comments and four strings of
+    generated skill source, none of which are call sites.
+    """
+    import ast
+
+    per_file: dict[str, int] = {}
+    for f in tracked("*.py"):
+        if f in _MODEL_HINT_ALLOWED:
+            continue
+        if f.startswith("tests/") or "/tests/" in f:
+            continue
+        try:
+            tree = ast.parse((ROOT / f).read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue
+        count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if (kw.arg == "model_hint"
+                            and isinstance(kw.value, ast.Constant)
+                            and isinstance(kw.value.value, str)):
+                        count += 1
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # keyword-only parameter defaults
+                for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+                    if (arg.arg == "model_hint"
+                            and isinstance(default, ast.Constant)
+                            and isinstance(default.value, str)):
+                        count += 1
+        if count:
+            per_file[f] = count
+
+    total = sum(per_file.values())
+    if total <= _MODEL_HINT_BASELINE:
+        return []
+
+    worst = sorted(per_file.items(), key=lambda kv: -kv[1])[:5]
+    detail = ", ".join(f"{f} ({n})" for f, n in worst)
+    return [
+        f"hardcoded model_hint tier literals rose to {total}, above the "
+        f"recorded baseline of {_MODEL_HINT_BASELINE}. Use "
+        f"resolve_feature_model(\"<feature.key>\", default=\"<the literal>\") "
+        f"and declare the feature in core/feature_registry.py. "
+        f"Highest counts: {detail}"
+    ]
+
+
 CHECKS = {
     "docs-tracked":         check_docs_tracked,
     "readme-links":         check_readme_links,
@@ -577,6 +663,7 @@ CHECKS = {
     "model-hint-coverage":  check_model_hint_coverage,
     "model-literals":       check_model_literals,
     "registry-switch-parity": check_registry_switch_parity,
+    "model-hint-literals":  check_model_hint_literals,
     "docs-panel-coverage":  check_docs_panel_coverage,
     "readme-feature-table": check_readme_feature_table,
 }

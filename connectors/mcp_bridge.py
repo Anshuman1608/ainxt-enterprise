@@ -24,6 +24,7 @@ import re as _re_recip
 from concurrent.futures import ThreadPoolExecutor
 
 from core.logger import logger, mask_email
+from core.feature_model_resolver import resolve_feature_model
 
 # Dedicated thread pool for BLOCKING tool work (connector I/O, doc enqueue) so it
 # never runs on the event loop. Bounded → natural back-pressure under 2k users.
@@ -914,7 +915,7 @@ def _revise_artifact(user_id: str, args: dict) -> dict:
         f"You are editing a {kind} (the current source is below). Apply this change EXACTLY and return "
         f"ONLY the full revised {'markdown' if is_md else 'script'} — no commentary, no code fences.\n\n"
         f"CHANGE REQUESTED: {instruction}\n\nCURRENT SOURCE:\n{source[:60000]}",
-        model_hint="complex") or "").strip()
+        model_hint=resolve_feature_model("mcp.document_revise", default="complex")) or "").strip()
     # Strip accidental code fences the model may add.
     if revised.startswith("```"):
         revised = revised.split("\n", 1)[-1]

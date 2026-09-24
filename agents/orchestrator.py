@@ -167,6 +167,7 @@ HIGH_CONFIDENCE_THRESHOLD = 6
 # recover depth. The policy floors at MAX_ITERATIONS so this can only match or
 # deepen today's behavior, never regress. Default-on; env opt-out; fail-safe.
 import os as _os_lp
+from core.feature_model_resolver import resolve_feature_model
 _ADAPTIVE_LOOP_DEPTH = _os_lp.getenv("ADAPTIVE_LOOP_DEPTH", "true").lower() == "true"
 
 
@@ -286,7 +287,7 @@ Return JSON array only:"""
             # tier — the simple model errors/ignores the tool catalogue and the
             # planner falls back to retrieve+generate (so connectors like Outlook
             # are never called from scheduled tasks / server office mode).
-            raw = model_router.generate(prompt, model_hint="complex").strip()
+            raw = model_router.generate(prompt, model_hint=resolve_feature_model("reasoning.orchestrate", default="complex")).strip()
             logger.info(f"OFFICE PLAN RAW → {raw[:200]}")
             start, end = raw.find("["), raw.rfind("]") + 1
             if start >= 0 and end > start:
@@ -468,7 +469,7 @@ Return JSON array only:"""
 
         try:
             from models.model_router import model_router
-            raw = model_router.generate(prompt, model_hint="simple").strip()
+            raw = model_router.generate(prompt, model_hint=resolve_feature_model("reasoning.orchestrate_support", default="simple")).strip()
             logger.info(f"AGENT PLAN RAW → {raw[:200]}")
 
             # Extract JSON array from response

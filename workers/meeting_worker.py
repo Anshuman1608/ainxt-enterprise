@@ -25,6 +25,7 @@ from sqlalchemy import text as _text
 
 from core.logger import logger
 from db.database import SessionLocal, DB_SCHEMA
+from core.feature_model_resolver import resolve_feature_model
 
 _LOCK_TTL = 900  # seconds — covers a full job; prevents double-processing
 _TERMINAL = ("done", "distributing", "summarizing", "fetching")
@@ -164,7 +165,7 @@ def run_post_meeting_job(payload: dict) -> dict:
         # 5. Generate MoM INSIDE AiNxt (model-agnostic)
         _update(meeting_id, "summarizing", subject=subject, transcript_id=transcript_id)
         prompt = mt.build_mom_prompt(subject, transcript_text, part_names)
-        mom = model_router.generate(prompt, model_hint="complex") or ""
+        mom = model_router.generate(prompt, model_hint=resolve_feature_model("meetings.summarize", default="complex")) or ""
 
         # 6. Audit
         graph_audit.record(

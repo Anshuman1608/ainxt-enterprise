@@ -33,6 +33,7 @@ from core.config import RDB_CACHE, RDB_QUEUE, RDB_STREAM
 from core.kv import get_kv
 
 from core.logger import logger
+from core.feature_model_resolver import resolve_feature_model
 
 # ── Document generation — slash command routing ────────────────────────────────
 # Each supported output format has its own slash command prefix.
@@ -787,7 +788,7 @@ def _handle_doc_generation(
 
     try:
         from models.model_router import model_router as _mr
-        _doc_result   = _mr.generate(struct_prompt, model_hint="complex", return_meta=True)
+        _doc_result   = _mr.generate(struct_prompt, model_hint=resolve_feature_model("docs.generate", default="complex"), return_meta=True)
         raw           = (_doc_result["text"] or "").strip()
         _doc_llm_meta = _doc_result["meta"]
 
@@ -1145,7 +1146,7 @@ def _handle_pptx_generation(
         from models.model_router import model_router as _mr
         _pptx_result  = _mr.generate(
             _build_pptx_prompt(_pptx_question[:6000]),
-            model_hint="complex",
+            model_hint=resolve_feature_model("presentations.generate", default="complex"),
             return_meta=True,
         )
         raw           = (_pptx_result["text"] or "").strip()
@@ -1553,7 +1554,7 @@ def _run_pipeline(payload: dict, stream_key: str) -> None:
                     )
                     try:
                         logger.info("[chat worker] : Chat summarizing call to LLM")
-                        cached_summary = _mr_sum.generate(sum_prompt, model_hint="simple")
+                        cached_summary = _mr_sum.generate(sum_prompt, model_hint=resolve_feature_model("chat.pipeline", default="simple"))
                         # Cache the summary for 30 minutes to avoid re-generating each turn
                         _rc.setex(_sum_key, 1800, cached_summary)
                     except Exception as _se:

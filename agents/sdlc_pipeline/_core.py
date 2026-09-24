@@ -328,6 +328,7 @@ from store.sdlc_store import (
     create_run, get_run, update_run_state, add_run_event,
     patch_run_context, SDLCCancelled, SDLCUserTokenMissing,
 )
+from core.feature_model_resolver import resolve_feature_model
 
 
 # ── Model router shortcut ─────────────────────────────────────
@@ -397,7 +398,7 @@ def _llm(prompt: str, hint: str = "solution", agent_id: str = None) -> str:
         logger.warning(f"[SDLC] Claude unavailable ({_ce}) — falling back to GPT-5.4 (medium)")
         try:
             result = get_breaker("openai").call(
-                lambda: model_router.generate(prompt, model_hint="medium")
+                lambda: model_router.generate(prompt, model_hint=resolve_feature_model("sdlc.pipeline", default="medium"))
             )  # GPT-5.4
             if not result or not result.strip():
                 raise ValueError("GPT-5.4 returned empty response")
@@ -9052,14 +9053,14 @@ def _generate_conflict_resolution(conflict_context: str) -> str:
     system = "You are an expert at resolving Git merge conflicts."
     try:
         result = get_breaker("claude").call(
-            lambda: model_router.generate(prompt, model_hint="solution", system_prompt=system)
+            lambda: model_router.generate(prompt, model_hint=resolve_feature_model("sdlc.conflict_resolution", default="solution"), system_prompt=system)
         )
         if result and result.strip():
             return result
         raise ValueError("empty response from Claude")
     except Exception as _ce:
         logger.warning(f"[SDLC] Claude conflict resolution unavailable ({_ce}) — falling back to GPT-5.2")
-        return model_router.generate(prompt, model_hint="medium", system_prompt=system)
+        return model_router.generate(prompt, model_hint=resolve_feature_model("sdlc.pipeline", default="medium"), system_prompt=system)
 
 
 
