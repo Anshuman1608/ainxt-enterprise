@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Model-Agnostic LLM Architecture — Findings</title>
+<style>
+  :root { color-scheme: light dark; }
+
+  * { box-sizing: border-box; }
+
+  .viz-root {
+    /* light (default) */
+    --surface-1:      #fcfcfb;
+    --surface-2:      #ffffff;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --success-text:   #006300;
+    --series-1:       #2a78d6;
+    --series-1-tint:  #cde2fb;
+    --status-good:    #0ca30c;
+    --status-warning: #fab219;
+    --status-serious: #ec835a;
+    --status-critical:#d03b3b;
+    --status-muted:   #898781;
+    --status-good-bg:     #e4f6e4;
+    --status-warning-bg:  #fff2d9;
+    --status-serious-bg:  #fce6dc;
+    --status-critical-bg: #fbe1e1;
+    --status-muted-bg:    #ececea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      --surface-1:      #1a1a19;
+      --surface-2:      #222221;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --success-text:   #0ca30c;
+      --series-1:       #3987e5;
+      --series-1-tint:  #184f95;
+      --status-good-bg:     #123018;
+      --status-warning-bg:  #3a2c0c;
+      --status-serious-bg:  #3a1f16;
+      --status-critical-bg: #391414;
+      --status-muted-bg:    #262625;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    --surface-1:      #1a1a19;
+    --surface-2:      #222221;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --success-text:   #0ca30c;
+    --series-1:       #3987e5;
+    --series-1-tint:  #184f95;
+    --status-good-bg:     #123018;
+    --status-warning-bg:  #3a2c0c;
+    --status-serious-bg:  #3a1f16;
+    --status-critical-bg: #391414;
+    --status-muted-bg:    #262625;
+  }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 24px 80px; }
+
+  header.top {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 20px; padding-bottom: 20px; border-bottom: 1px solid var(--border);
+    margin-bottom: 24px; flex-wrap: wrap;
+  }
+  header.top h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  header.top .sub { color: var(--text-secondary); font-size: 14px; margin: 0; }
+  header.top .meta { color: var(--text-muted); font-size: 12.5px; margin-top: 4px; }
+
+  .theme-toggle {
+    border: 1px solid var(--border); background: var(--surface-2);
+    color: var(--text-secondary); border-radius: 8px; padding: 8px 12px;
+    font-size: 13px; cursor: pointer; white-space: nowrap;
+  }
+  .theme-toggle:hover { color: var(--text-primary); }
+
+  nav.tabs {
+    display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 24px;
+    border-bottom: 1px solid var(--gridline);
+  }
+  nav.tabs button {
+    appearance: none; border: none; background: transparent;
+    color: var(--text-secondary); font-size: 14px; font-weight: 600;
+    padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  nav.tabs button:hover { color: var(--text-primary); }
+  nav.tabs button.active { color: var(--series-1); border-bottom-color: var(--series-1); }
+
+  section.panel { display: none; }
+  section.panel.active { display: block; }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px;
+  }
+
+  h2.section-title { font-size: 17px; margin: 32px 0 14px; }
+  h2.section-title:first-child { margin-top: 0; }
+  p.lede { color: var(--text-secondary); font-size: 14px; line-height: 1.6; max-width: 78ch; }
+
+  /* KPI row */
+  .kpi-row {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px; margin-bottom: 8px;
+  }
+  .kpi {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 16px 14px; border-top: 3px solid var(--kpi-color, var(--series-1));
+  }
+  .kpi .value { font-size: 30px; font-weight: 700; line-height: 1; margin-bottom: 8px; font-variant-numeric: proportional-nums; }
+  .kpi .label { font-size: 12.5px; color: var(--text-secondary); line-height: 1.4; }
+
+  .verdict {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-left: 3px solid var(--series-1); border-radius: 8px;
+    padding: 16px 18px; font-size: 14px; line-height: 1.65; color: var(--text-primary);
+    margin: 18px 0;
+  }
+  .verdict strong { color: var(--series-1); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  thead th {
+    text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--text-muted); font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--gridline);
+  }
+  tbody td { padding: 10px 10px; border-bottom: 1px solid var(--gridline); vertical-align: top; color: var(--text-secondary); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody td.primary { color: var(--text-primary); font-weight: 600; }
+  code.cite {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 6px; color: var(--text-secondary); white-space: nowrap;
+  }
+  .table-wrap { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 6px 16px; overflow-x: auto; }
+
+  /* status badges */
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 700;
+    letter-spacing: .02em; padding: 3px 9px 3px 7px; border-radius: 999px; white-space: nowrap; color: var(--text-primary); }
+  .badge .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .badge.critical { background: var(--status-critical-bg); }
+  .badge.critical .dot { background: var(--status-critical); }
+  .badge.serious { background: var(--status-serious-bg); }
+  .badge.serious .dot { background: var(--status-serious); }
+  .badge.warning { background: var(--status-warning-bg); }
+  .badge.warning .dot { background: var(--status-warning); }
+  .badge.good { background: var(--status-good-bg); }
+  .badge.good .dot { background: var(--status-good); }
+  .badge.muted { background: var(--status-muted-bg); color: var(--text-muted); }
+  .badge.muted .dot { background: var(--status-muted); }
+
+  /* revision-2 verification status pills */
+  .vstat {
+    display: inline-flex; align-items: center; font-size: 10.5px; font-weight: 700;
+    letter-spacing: .06em; text-transform: uppercase; padding: 2px 8px;
+    border-radius: 4px; white-space: nowrap; border: 1px solid transparent;
+  }
+  .vstat.confirmed { background: transparent; color: var(--text-muted); border-color: var(--border); }
+  .vstat.corrected { background: var(--status-warning-bg); color: var(--text-primary); border-color: var(--status-warning); }
+  .vstat.new       { background: var(--series-1-tint); color: var(--text-primary); border-color: var(--series-1); }
+
+  /* filter row */
+  .filter-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .filter-chip {
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+    border-radius: 999px; padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+  }
+  .filter-chip:hover { color: var(--text-primary); }
+  .filter-chip.active { background: var(--series-1); border-color: var(--series-1); color: #fff; }
+  .filter-count { color: var(--text-muted); font-size: 12.5px; margin-bottom: 12px; }
+
+  /* accordion */
+  .accordion-item { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+  .accordion-header {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 14px 16px; cursor: pointer; user-select: none;
+  }
+  .accordion-header .title-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .accordion-header .id { color: var(--text-muted); font-size: 12.5px; font-weight: 700; min-width: 34px; }
+  .accordion-header h3 { font-size: 14.5px; margin: 0; color: var(--text-primary); }
+  .accordion-header .chev { color: var(--text-muted); transition: transform .15s ease; flex: none; }
+  .accordion-item.open .chev { transform: rotate(90deg); }
+  .accordion-body { max-height: 0; overflow: hidden; transition: max-height .2s ease; }
+  .accordion-item.open .accordion-body { max-height: 900px; }
+  .accordion-body-inner { padding: 0 16px 16px; }
+  .accordion-body-inner p { font-size: 13.5px; color: var(--text-secondary); line-height: 1.65; margin: 0 0 10px; }
+  .cite-list { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  /* architecture cards */
+  .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px,1fr)); gap: 14px; margin-bottom: 8px; }
+  .gw-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .gw-card .n { font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+  .gw-card h4 { font-size: 14.5px; margin: 6px 0 8px; color: var(--text-primary); overflow-wrap: anywhere; word-break: break-word; }
+  .gw-card .loc { font-size: 22px; font-weight: 700; color: var(--series-1); margin-bottom: 6px; }
+  .gw-card p { font-size: 12.5px; color: var(--text-secondary); line-height: 1.55; margin: 0; }
+  .quad-note { text-align: center; color: var(--text-muted); font-size: 13px; margin: 6px 0 28px; }
+
+  /* flow diagram */
+  .flow { display: flex; align-items: stretch; gap: 6px; flex-wrap: wrap; margin: 18px 0 28px; }
+  .flow-box {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; font-size: 12.5px; color: var(--text-secondary); flex: 1 1 140px; min-width: 140px;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .flow-box strong { display: block; color: var(--text-primary); font-size: 13px; margin-bottom: 3px; }
+  .flow-box.new { border-color: var(--series-1); background: var(--series-1-tint); color: var(--text-primary); }
+  .flow-arrow { display: flex; align-items: center; color: var(--text-muted); font-size: 18px; flex: 0 0 auto; }
+
+  /* bar chart (phases) */
+  .bar-row { display: grid; grid-template-columns: 190px 1fr 56px; align-items: center; gap: 12px; padding: 9px 0; }
+  .bar-row .name { font-size: 13px; color: var(--text-primary); font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .bar-track { background: var(--surface-2); border: 1px solid var(--gridline); border-radius: 6px; height: 20px; position: relative; overflow: hidden; }
+  .bar-fill { background: var(--series-1); height: 100%; border-radius: 5px; position: relative; }
+  .bar-row .size-label { font-size: 12.5px; color: var(--text-secondary); text-align: right; font-weight: 700; }
+  .risk-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  [title] { cursor: help; }
+
+  .two-col { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 20px; }
+  @media (max-width: 860px) { .two-col { grid-template-columns: 1fr; } }
+
+  footer.foot { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 12px; }
+  footer.foot code { font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+<div class="wrap">
+
+  <header class="top">
+    <div>
+      <h1>Model-Agnostic LLM Architecture — Findings</h1>
+      <p class="sub">ainxt-enterprise platform · admin-configurable, per-module LLM provider audit</p>
+      <p class="meta">Read-only architecture audit · no code changed · 2026-09-23 · <strong>revision 2, re-verified against source</strong> · full detail in <code>docs/llm/model_agnostic_architecture_audit.md</code></p>
+    </div>
+    <button class="theme-toggle" id="themeToggle" type="button">🌙 Dark mode</button>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="active" data-tab="overview">Overview</button>
+    <button data-tab="coupling">Coupling Map</button>
+    <button data-tab="findings">Findings</button>
+    <button data-tab="architecture">Architecture</button>
+    <button data-tab="roadmap">Roadmap</button>
+  </nav>
+
+  <!-- ============ OVERVIEW ============ -->
+  <section class="panel active" id="panel-overview">
+    <p class="lede">The platform already has a working, DB-backed provider/model registry with full admin CRUD. What's missing is the one layer that matters for "admin picks the LLM per module/feature": today that choice is a hardcoded string literal compiled into each feature's source code.</p>
+
+    <div class="kpi-row" id="kpiRow"></div>
+
+    <div class="verdict">
+      <strong>Bottom line —</strong> the hard infrastructure (credential vaulting, provider CRUD, model discovery, a central router) is already built. The gap is a <strong>feature → model</strong> mapping that is admin-editable, expressed in a <strong>capability vocabulary rather than vendor product names</strong>, and actually consulted by the <strong>76</strong> call sites that currently hardcode a tier.
+    </div>
+
+    <div class="verdict" style="border-left-color: var(--status-good)">
+      <strong style="color: var(--status-good)">What most changes the plan —</strong> <code class="cite">models/model_router.py:1666-1700</code> shows <code class="cite">route()</code> step 1a <em>already</em> resolves an arbitrary admin-registered <code class="cite">model_id</code> passed as <code class="cite">model_hint</code>, checked before the hardcoded <code class="cite">_HINT_MAP</code>. So the call-site migration is a one-argument substitution needing <strong>no router change</strong>, and gateway consolidation is <strong>not</strong> a prerequisite for shipping the capability.
+    </div>
+
+    <div class="verdict" style="border-left-color: var(--status-critical)">
+      <strong style="color: var(--status-critical)">Revision 2 —</strong> all 12 original findings were re-checked against source. <strong>8 confirmed exactly</strong>, <strong>4 corrected</strong> (3.2's count and its central claim, 3.4's drift evidence, 3.9's copy count, 3.11's scope), and <strong>9 new findings added</strong>. Three of the new ones — budget-enforcement bypass, AgentStudio provider misrouting, and a governance kill-switch gap in the proxy — are <em>live defects today</em> that worsen the moment admins start assigning models, and have moved into Phase 0.
+    </div>
+
+    <h2 class="section-title">What already works today</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:30%">Capability</th><th style="width:14%">Status</th><th>Key files</th></tr></thead>
+        <tbody id="worksTable"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ COUPLING MAP ============ -->
+  <section class="panel" id="panel-coupling">
+    <p class="lede">Every top-level directory that could call an LLM, rated by how tightly it's bound to a specific provider today. Filter to see where the work actually is.</p>
+
+    <div class="filter-row" id="filterRow"></div>
+    <div class="filter-count" id="filterCount"></div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:16%">Directory</th><th style="width:16%">Coupling</th><th style="width:30%">Representative citation</th><th>Note</th></tr></thead>
+        <tbody id="couplingTable"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ FINDINGS ============ -->
+  <section class="panel" id="panel-findings">
+    <p class="lede">Twenty-one concrete findings, most-severe first. Each is backed by direct file reads — click to expand citations. Every finding carries a revision-2 verification status: <strong>Confirmed</strong> (re-verified as written), <strong>Corrected</strong> (revision 1 was wrong or overstated), or <strong>New</strong> (found in revision 2).</p>
+    <div class="filter-row" id="statusFilterRow"></div>
+    <div class="filter-count" id="statusFilterCount"></div>
+    <div id="findingsAccordion"></div>
+  </section>
+
+  <!-- ============ ARCHITECTURE ============ -->
+  <section class="panel" id="panel-architecture">
+    <h2 class="section-title" style="margin-top:0">The same provider logic exists in four places</h2>
+    <p class="lede">A fix to "how we talk to Claude" today has to be applied up to four times — and already hasn't been. <strong>Corrected in revision 2:</strong> the stale-blocklist example cited in revision 1 does not hold — the two static blocklists were diffed and are <em>identical</em>. The real, verified drift is that the 142-line proxy registry copy <strong>silently drops three governance kill-switches</strong> (<code class="cite">ENABLE_CLI_OPUS_48 / ENABLE_CLI_OPUS_5 / ENABLE_SONNET_5</code>, finding 3.16) and the proxy Claude gateway is <strong>missing a blank-model guard the root already fixed</strong> after an outage (finding 3.17).</p>
+    <div class="grid-4" id="gwCards"></div>
+    <p class="quad-note">↳ no shared interface enforces consistency between them — see the drift table below.</p>
+
+    <h2 class="section-title">Gateway interface drift</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:16%">Aspect</th><th>Claude</th><th>OpenAI</th><th>Gemini</th><th>Local</th></tr></thead>
+        <tbody id="driftTable"></tbody>
+      </table>
+    </div>
+
+    <h2 class="section-title">Target resolution flow</h2>
+    <p class="lede">New pieces highlighted — everything else already exists and is reused as-is.</p>
+    <div class="flow" id="flowDiagram"></div>
+  </section>
+
+  <!-- ============ ROADMAP ============ -->
+  <section class="panel" id="panel-roadmap">
+    <h2 class="section-title" style="margin-top:0">Relative effort by phase</h2>
+    <p class="lede">Recommended sequencing: <strong>0 → 1 → 2 → 5 → 3 → 4 → 6</strong>. Phases 0/1/2/5 alone deliver the requested capability. Phase 3 is the long-term maintainability payoff and is explicitly <strong>not</strong> a blocker, because <code class="cite">route()</code> already resolves registry models without it. Phase 6 (embeddings) is required before "model-agnostic" is true of retrieval as well as generation. Revision 2 shifts effort <em>into</em> Phases 0 and 1 and <em>out of</em> Phase 2.</p>
+    <div class="card" id="phaseChart" style="margin-bottom:28px"></div>
+
+    <h2 class="section-title">File impact by phase</h2>
+    <div id="phaseAccordion"></div>
+  </section>
+
+  <footer class="foot">
+    Source audit: <code>docs/llm/model_agnostic_architecture_audit.md</code> · Generated for internal demonstration purposes.
+  </footer>
+
+</div>
+</div>
+
+<script>
+// ---------- DATA ----------
+const kpis = [
+  { value: "0",   label: "Feature / module entities in the DB schema", tone: "critical" },
+  { value: "76",  label: "Hardcoded tier literals baked into call sites (rev 1 said “40+”)", tone: "critical" },
+  { value: "4×",  label: "Independent gateway/adapter implementations", tone: "serious" },
+  { value: "3",   label: "Parallel, inconsistent tiering vocabularies — all vendor-branded", tone: "serious" },
+  { value: "8×",  label: "Duplicated “is local model” heuristics, each with a different word list", tone: "warning" },
+  { value: "6",   label: "Live defects found, all worsened by per-feature assignment", tone: "critical" },
+  { value: "3",   label: "Governance kill-switches missing from the proxy registry", tone: "critical" },
+  { value: "0",   label: "Admin control over embedding / reranking models", tone: "critical" },
+  { value: "✓",   label: "route() already resolves registry model ids — the hook point exists", tone: "good" },
+];
+
+const worksRows = [
+  ["Admin registers a provider account (Anthropic / OpenAI / Gemini / any OpenAI-compatible endpoint / Ollama)", "good", "db/models.py:2784 · routers/llm_provider_admin_router.py"],
+  ["Admin registers/discovers models, sets a single global default", "good", "db/models.py:2816 · ai-ui/.../LLMProviderConfig.jsx"],
+  ["Credentials vaulted, not hardcoded", "good", "core/llm_provider_registry.py — resolve_credential()"],
+  ["Department / user allow-list on which models they may use", "good", "routers/model_governance_router.py · ModelGovernance.jsx"],
+  ["route() resolves an arbitrary registry model_id given as model_hint — the hook point the resolver plugs into", "good", "models/model_router.py:1666-1700 (step 1a)"],
+  ["SDLC stages resolve their model from env, accepting any provider's concrete model id — the closest existing precedent", "good", "core/model_registry.py — sdlc_stage_hint() / SDLC_MODEL_&lt;STAGE&gt;"],
+  ["Feature code calls a tier instead of a raw model ID", "warning", "models/model_router.py — but the tier is a literal per call site, and the tier names are vendor products"],
+  ["Circuit breakers / fallback chains for built-in tiers", "warning", "core/circuit_breaker.py — but TIER_REGISTRY (admin-added) models get neither"],
+  ["Per-workflow-node model choice (AgentStudio)", "warning", "ConfigPanel.jsx — scoped to one workflow's JSON, not platform-wide"],
+  ["Per-agent preferred model, correctly passed to route()", "warning", "db/models.py:311 — bare String(50) “auto|claude|gpt|ollama”, no FK to llm_models"],
+  ["Admin assigns an embedding or reranking model", "critical", "Not possible — services/embed_svc/config.py is env-only, outside the registry"],
+  ["Per-feature cost / usage visibility", "critical", "Not possible — model_usages has no feature_key dimension"],
+];
+
+const couplingData = [
+  ["services/", "critical", "services/managed_endpoint_direct_llm.py:226", "Raw anthropic/openai SDK instantiation + a duplicate proxy gateway stack"],
+  ["models/", "critical", "models/model_router.py:1409", "The central router itself is full of inline literals + a direct gateway import"],
+  ["routers/", "critical", "routers/messages_compat_router.py:336-367", "Literal model-id / provider chains across 7+ router files"],
+  ["AgentStudio/", "critical", "AgentStudio/backend/app/core/llm_handler.py:2091-2125", "A fully independent, parallel LLM client stack"],
+  ["ai-ui/", "critical", "ai-ui/src/components/ModelGovernance.jsx:14-23", "Frontend hardcodes model catalogs independently in 6 files"],
+  ["agents/", "serious", "agents/react_orchestrator.py:1189-1226", "Mostly tier-hint based; some direct gateway imports + its own fallback loop"],
+  ["workers/", "serious", "workers/doc_worker.py:5227-5270", "Duplicated cloud-prefix tuple + provider branching"],
+  ["db/", "serious", "db/migrate.py:2867-2877", "Canonical seed catalog — hardcoding by design, hand-maintained per release"],
+  ["sandbox/", "serious", "sandbox/doc_critic.py:170-171", "Tier-hint based; one direct Gemini-specific vision accessor"],
+  ["middleware/", "critical", "middleware/budget_middleware.py:44-56", "REVISED ↑ — the prefix tuple isn't just drift: paid admin-registered models skip budget enforcement entirely (3.14)"],
+  ["services/embed_svc/", "critical", "services/embed_svc/config.py:12-30", "NEW — embeddings/reranking are env-only, entirely outside the provider registry; OPENAI_DIMS hardcoded to 768 (3.19)"],
+  ["services/llm_spend/", "warning", "services/llm_spend/approved_models.py", "NEW — a fifth model catalogue; sources from env defaults + observed usage, never from llm_models (3.20)"],
+  ["connectors/", "warning", "connectors/mcp_bridge.py:912-999", "Deliberately model-agnostic; tier vocabulary still leaks Claude-ish naming"],
+  ["grounding/", "warning", "grounding/nli_invoker.py:42", "Intentionally local-only for data privacy — by design, not an oversight"],
+  ["workflows/", "warning", "workflows/engine.py:659-671", "Routes through the router with no hint at all"],
+  ["mcp/", "good", "mcp/registry.py:168-180", "Tool servers don't call LLMs; the router is exposed as a callable tool"],
+  ["cil/", "good", "cil/intent.py:36-39", "Routed via config / registry"],
+  ["memory/", "good", "memory/chat_summarizer.py:78-84", "model_router.generate(model_hint=\"simple\")"],
+  ["workflow/ (singular)", "muted", "workflow/summarize.py:14-16", "Pure decision logic — not an LLM caller"],
+  ["pipeline/", "muted", "pipeline/dispatch.py:56-84", "Pure routing logic — not an LLM caller"],
+  ["planner/", "muted", "planner/shape.py:47-90", "Pure decision logic — not an LLM caller"],
+  ["evolution/", "muted", "evolution/tier2.py:68-100", "Pure gating engine — not an LLM caller"],
+  ["evals/", "muted", "evals/harness.py:90-140", "Generic probe harness — not an LLM caller"],
+  ["indexers/", "muted", "indexers/jira_indexer.py:138-155", "Embeddings / proxy calls only — not a generation caller"],
+  ["integrations/, tools/, skills/, context/, store/, profiles/", "muted", "—", "No provider/model literals or SDK imports found in any of these"],
+  ["office-addin/", "muted", "—", "No LLM coupling at all"],
+  ["desktop/", "muted", "—", "Comments only, referencing an external CLI runtime"],
+  ["auth/", "muted", "auth/sso.py", "False positives only — SSO providers (keycloak/azure_ad), not LLM providers"],
+];
+
+const filters = [
+  { key: "all", label: "All" },
+  { key: "critical", label: "Heavy" },
+  { key: "serious", label: "Moderate" },
+  { key: "warning", label: "Light" },
+  { key: "good", label: "Clean / abstracted" },
+  { key: "muted", label: "N/A" },
+];
+
+const findingsV2 = [
+  { id: "3.1", tone: "critical", status: "confirmed", title: "No “module/feature” entity exists — the central gap",
+    body: "Nothing in the 94-class schema represents “a feature” or “a module.” A repo-wide search for <code class='cite'>feature_model</code>, <code class='cite'>feature_key</code>, <code class='cite'>FeatureModelConfig</code> and <code class='cite'>FeatureRegistry</code> returns <strong>zero</strong> hits outside <code class='cite'>docs/</code>. Every other finding here is downstream of this one gap.",
+    cites: ["db/models.py — 94 ORM classes, none representing a feature"] },
+
+  { id: "3.2", tone: "critical", status: "corrected", title: "Hardcoded tier literals at 76 call sites — and the “no env var” claim was wrong",
+    body: "<strong>Correction:</strong> revision 1 said “~40+ call sites” and claimed <em>“None of these read from an env var, DB row, or per-tenant config.”</em> The real count is <strong>76</strong>, and the blanket claim is <strong>false for the SDLC path</strong> — <code class='cite'>core/model_registry.py:sdlc_stage_hint()</code> resolves each stage through <code class='cite'>SDLC_MODEL_&lt;STAGE&gt;</code> and, per its own docstring, accepts “EITHER a router tier name OR a concrete model id of any provider… so a harness with no Anthropic provider can pin any stage to its own model.” That is exactly the shape the feature resolver generalises — it should be cited as the <em>template</em>, not lumped in with the hardcoded sites.",
+    cites: ["agents/advanced_reasoning.py (10)","gateway.py (6)","routers/skills_router.py:303,352,418,482","agents/doc_generator_agent.py (4)","workers/doc_worker.py (3)","workers/cowork_task_worker.py (3)","workers/chat_worker.py (3)","services/teams_adapter.py (3)","agents/sdlc_pipeline/_core.py (3)","+ ~30 files with 1–2 each"] },
+
+  { id: "3.13", tone: "critical", status: "new", title: "The tier vocabulary is itself vendor-branded — this blocks the fix",
+    body: "<code class='cite'>TIER_HAIKU</code>, <code class='cite'>TIER_SONNET_5</code>, <code class='cite'>TIER_OPUS_5</code>, <code class='cite'>TIER_GEMINI</code>, <code class='cite'>TIER_TERA</code>, <code class='cite'>TIER_LUNA</code> — these are <strong>vendor product names, not capability descriptions</strong>, and <code class='cite'>_HINT_MAP</code> keys include <code class='cite'>\"claude\"</code>, <code class='cite'>\"sonnet\"</code>, <code class='cite'>\"opus\"</code>, <code class='cite'>\"gpt\"</code>. <strong>Why this blocks the work:</strong> the admin UI's per-feature dropdown needs a “leave it to the platform” option. If that option is <code class='cite'>\"haiku\"</code>, an admin running only OpenRouter and Ollama is being asked to pick an Anthropic product name for a feature that will never touch Anthropic. A feature→model table built on today's tiers bakes the vendor lock into the new schema. Fix: a capability vocabulary (fast / balanced / deep / vision / long-context / local-only) with every current name demoted to an alias — cheap, but it must land in <strong>Phase 1</strong>.",
+    cites: ["models/model_router.py:693-715 — TIER_* constants","models/model_router.py:720 — _HINT_MAP keys","core/config.py:466-469 — AINXT_TIER_MAP","core/model_registry.py:380 — _SDLC_STAGE_HINTS_ALLOWED","db/models.py:311 — preferred_model “auto|claude|gpt|ollama”"] },
+
+  { id: "3.14", tone: "critical", status: "new", title: "Budget enforcement is bypassed for admin-registered models (live defect)",
+    body: "<code class='cite'>_is_inhouse_model()</code> classifies anything <em>not</em> matching seven known cloud prefixes as in-house — and its own docstring states “Budget enforcement is SKIPPED for in-house models.” So every model an admin registers via the <code class='cite'>openai_compatible</code> family whose id doesn't start with <code class='cite'>gpt-/claude-/gemini-/openai/anthropic/google/azure</code> is treated as free and <strong>exempted from budget enforcement entirely</strong> — including genuinely paid models like <code class='cite'>mistralai/mixtral-8x7b-instruct</code>, <code class='cite'>meta-llama/llama-3.1-70b-instruct</code> or <code class='cite'>deepseek-chat</code>. This is the already-shipped consequence of pairing an open provider registry with a closed prefix heuristic. <strong>Phase 0.</strong>",
+    cites: ["middleware/budget_middleware.py:44 — _CLOUD_PREFIXES","middleware/budget_middleware.py:48-56 — _is_inhouse_model()"] },
+
+  { id: "3.15", tone: "critical", status: "new", title: "AgentStudio infers provider from the model-name prefix and misroutes (live defect)",
+    body: "<code class='cite'>_classify_model()</code> does <code class='cite'>startswith(\"claude\")→anthropic</code>, <code class='cite'>\"gemini\"→gemini</code>, <code class='cite'>\"gpt\"/\"o1\"/\"o3\"→openai</code>, <strong>else→local</strong>. The fallback is deliberate (in-house GPU ids follow no convention) but unsound once the catalogue is admin-extensible: an OpenRouter id like <code class='cite'>anthropic/claude-sonnet-4-6</code> matches <em>none</em> of these — <code class='cite'>\"anthropic/\"</code> is not <code class='cite'>\"claude\"</code> — and is routed to the local LiteLLM endpoint, which 404s or silently serves something else. Same class of defect as 3.10, in a second codebase. Fixing it means reading <code class='cite'>family</code> from <code class='cite'>llm_models</code>, which does <em>not</em> require the gateway consolidation — so this belongs in <strong>Phase 0</strong>, not Phase 3.",
+    cites: ["AgentStudio/backend/app/core/llm_handler.py:270-295"] },
+
+  { id: "3.10", tone: "critical", status: "confirmed", title: "Concrete provider/model mismatch bug (live, not hypothetical)",
+    body: "Four call sites across three files send <code class='cite'>{\"provider\": \"claude\", \"model\": cli_model_for_tier(\"haiku\")}</code> — provider hardcoded while model is resolved dynamically. If an admin repoints the <code class='cite'>haiku</code> tier to a non-Anthropic model (already possible today), these sites send a mismatched pair. <em>Revision 2 note: 4 sites, not 3 — <code class='cite'>hybrid_retriever.py</code> has it at both :90 and :670.</em>",
+    cites: ["services/feedback_processor.py:337","models/classifier.py:64","models/hybrid_retriever.py:90","models/hybrid_retriever.py:670"] },
+
+  { id: "3.16", tone: "serious", status: "new", title: "The llm_proxy registry silently drops three governance kill-switches",
+    body: "The root registry gates availability on four switches; the 142-line proxy copy implements <strong>only <code class='cite'>ENABLE_OPUS</code></strong> and <code class='cite'>BLOCKED_MODELS_EXTRA</code>. <code class='cite'>ENABLE_CLI_OPUS_48</code>, <code class='cite'>ENABLE_CLI_OPUS_5</code> and <code class='cite'>ENABLE_SONNET_5</code> do not exist in it at all. Because the proxy gateway does a bare <code class='cite'>from core.model_registry import BLOCKED_MODELS</code>, <strong>which registry is enforced depends on the proxy process's sys.path</strong> — so a deployment setting <code class='cite'>ENABLE_CLI_OPUS_5=false</code> may still serve Opus 5 through the proxy while correctly refusing it on the direct path. This is a compliance finding, and it is the <em>real</em> evidence for finding 3.4's drift claim.",
+    cites: ["core/model_registry.py:332-334,443-452 — four switches","services/llm_proxy/core/model_registry.py:131-142 — only one","services/llm_proxy/gateway_claude.py:433 — bare import"] },
+
+  { id: "3.4", tone: "serious", status: "corrected", title: "Quadruplicated gateway / dispatch implementations",
+    body: "The same “talk to vendor X” logic exists independently in four places: root gateways (3,163 lines), <code class='cite'>services/llm_proxy/</code> (6,584), <code class='cite'>managed_endpoint_direct_llm.py</code> (477, raw SDK + a forked message converter its own comment calls “a LOCAL fork, not imported”), and AgentStudio's <code class='cite'>llm_handler.py</code> (2,171). <strong>Correction:</strong> revision 1's evidence — a “stale retired-model blocklist” in the proxy copy — <strong>does not hold</strong>. The two static blocklists were diffed and are <em>identical</em> (same five Claude ids, same two OpenAI ids). The real drift is findings <strong>3.16</strong> and <strong>3.17</strong>; cite those instead.",
+    cites: ["gateway_{claude,openai,gemini,generic_openai,local_llm,ollama}.py — 3,163 lines","services/llm_proxy/ — 6,584 lines","services/managed_endpoint_direct_llm.py:94,226 — 477 lines","AgentStudio/backend/app/core/llm_handler.py — 2,171 lines"] },
+
+  { id: "3.5", tone: "serious", status: "confirmed", title: "Direct bypass of the router/registry (~20 files)",
+    body: "These import a specific gateway singleton or vendor SDK directly instead of going through <code class='cite'>model_router</code> / <code class='cite'>llm_provider_registry</code>, including one that reimplements its own fallback loop. Note <code class='cite'>coach_router.py:948-951</code>, whose docstring claims the function “never calls the provider SDK directly” while being hardcoded to OpenAI — <strong>vendor lock presented as an abstraction</strong>. Avoiding the raw SDK is not the same as being provider-agnostic.",
+    cites: ["agents/react_orchestrator.py:1189-1226,1450,1560","agents/agent_builder.py:1433","agents/brd_fsd_pipeline.py:101","routers/coach_router.py:945-953","routers/messages_compat_router.py:336-367,692,1247,1507","routers/chat_router.py:724,921,1349","workers/doc_worker.py:5340,5358","models/local_model.py","core/document_parser.py:368","sandbox/doc_critic.py:170-171","gateway.py — 6 inline dispatch branches"] },
+
+  { id: "3.3", tone: "serious", status: "confirmed", title: "Three parallel, inconsistent tiering vocabularies",
+    body: "A “tier name” means a different thing depending on which resolver handles it. Concretely: <code class='cite'>\"claude\"</code> maps to <code class='cite'>TIER_COMPLEX</code> in <code class='cite'>_HINT_MAP</code> but to <code class='cite'>AINXT_MODEL_COMPLEX</code> — an in-house vLLM model id — in <code class='cite'>AINXT_TIER_MAP</code>. Any admin config surface must reconcile these or the UI will show a tier whose effect differs by module.",
+    cites: ["models/model_router.py:698-791 — _HINT_MAP, ~35 aliases","core/config.py:440-467 — AINXT_TIER_MAP","core/model_registry.py:382-437 — SDLC_STAGE_MODEL_DEFAULTS, 17 stages"] },
+
+  { id: "3.6", tone: "serious", status: "confirmed", title: "ModelRouter itself is not a clean dispatch table",
+    body: "The 3,381-line central router is a hand-written if/elif chain on tier name, duplicated across <code class='cite'>_tier_label()</code>, <code class='cite'>_dispatch()</code> and <code class='cite'>_dispatch_stream()</code> — 14 branches each. Only <code class='cite'>TIER_REGISTRY</code> (admin-added models) is DB-driven, and the code comment states plainly it has “No cross-vendor fallback (unlike every other tier above)” — nor a circuit breaker.",
+    cites: ["models/model_router.py:1102 — _tier_label()","models/model_router.py:1844 — _dispatch()","models/model_router.py:2300 — _dispatch_stream()","models/model_router.py:708-714 — the no-fallback comment"] },
+
+  { id: "3.8", tone: "serious", status: "confirmed", title: "Interface inconsistencies across the 4 real gateways",
+    body: "All four <code class='cite'>generate()</code> signatures were re-read and match the drift table on the Architecture tab verbatim, including Gemini's argument-order swap. <code class='cite'>models/provider_protocol.py</code> documents the drift in its own docstring and has <strong>zero importers anywhere in the repo</strong>. Worse: <strong>compliance/PII gating is not uniform</strong> — provider choice today silently changes whether a second compliance pass runs on a turn.",
+    cites: ["models/provider_protocol.py — 84 lines, 0 importers","models/model_router.py:1520 — _filter_kwargs_for() papers over the drift via inspect.signature()"] },
+
+  { id: "3.17", tone: "serious", status: "new", title: "The proxy Claude gateway is missing a blank-model guard the root already fixed",
+    body: "Root <code class='cite'>gateway_claude.py:103-118</code> carries a 14-line comment describing a production outage: <code class='cite'>\"\"</code> can land in <code class='cite'>BLOCKED_MODELS</code> on an admin-only install, and the check runs at <strong>class-definition time</strong>, so the import fails and “EVERY Claude model failed with ‘no gateway available’.” The fix was a <code class='cite'>CLAUDE_MODEL and</code> guard. The proxy copy still has the <strong>unguarded original</strong>. Trigger is conditional — it needs <code class='cite'>\"\"</code> in whichever blocklist resolves — so it doesn't fire by default today, but it does if <code class='cite'>ENABLE_OPUS=false</code> with a blank Opus model, or if the proxy resolves the root registry. One-line fix.",
+    cites: ["gateway_claude.py:103-118 — guarded (fixed)","services/llm_proxy/gateway_claude.py:432-436 — unguarded"] },
+
+  { id: "3.18", tone: "serious", status: "new", title: "generate_with_model() validates a model then discards it",
+    body: "<code class='cite'>def generate_with_model(self, prompt, model)</code> checks <code class='cite'>model</code> against <code class='cite'>BLOCKED_MODELS</code>, then calls <code class='cite'>self.generate(prompt)</code> — <strong>never forwarding <code class='cite'>model</code></strong>, so the gateway falls back to its own default. A caller asking for a specific OpenAI model gets whatever the default is. Present identically in <em>both</em> copies, so a shared bug rather than drift — and it undercuts any per-feature assignment routed through this method.",
+    cites: ["gateway_openai.py:113-121","services/llm_proxy/gateway_openai.py:66-73"] },
+
+  { id: "3.19", tone: "serious", status: "new", title: "Embeddings and reranking sit entirely outside the provider registry",
+    body: "The <code class='cite'>llm_providers</code>/<code class='cite'>llm_models</code> registry covers <strong>generation only</strong>. Embedding and reranking selection is env-only — no DB row, no admin UI, no governance — and <code class='cite'>OPENAI_DIMS</code> is hardcoded to 768 even though dimensionality varies by model. “Model-agnostic” isn't true while an admin swaps the generation model from a dropdown but must edit <code class='cite'>.env</code> and restart a container to change the embedding model. This needs its <em>own</em> flow, not a row in the same table, for a hard reason: <strong>changing an embedding model invalidates every stored vector</strong>, so it must be migration-aware (reindex job → atomic cutover).",
+    cites: ["services/embed_svc/config.py:12-30","services/embed_svc/reranker.py","core/kb_retrieval.py","models/coverage_gate.py"] },
+
+  { id: "3.7", tone: "warning", status: "confirmed", title: "Fixed 5-family provider enum",
+    body: "Provider family is a closed enum (anthropic / openai / gemini / openai_compatible / ollama). <code class='cite'>openai_compatible</code> is a real escape hatch for any OpenAI-shaped API, but a genuinely different protocol (Bedrock, Vertex-native, Cohere) needs a new family value, a new gateway module, and a new dispatch branch — a code change, not an admin action.",
+    cites: ["db/models.py:2787-2791","routers/llm_provider_admin_router.py:79-92"] },
+
+  { id: "3.9", tone: "warning", status: "corrected", title: "Cross-cutting duplicated logic — 5 copies, not 3",
+    body: "<strong>Correction:</strong> the cloud-prefix tuple is duplicated in <strong>5 locations across 4 files</strong>, not 3 — plus a <strong>6th divergent variant</strong> at <code class='cite'>messages_compat_router.py:381</code> with a different member list, so two call paths classify the same model id differently. The “is local model” heuristic is reimplemented in 8+ places, <em>each with a different substring list</em>; the comment at <code class='cite'>governance.py:177</code> concedes “a pure substring heuristic misses them.” Both should read the DB <code class='cite'>family</code> column instead.",
+    cites: ["middleware/budget_middleware.py:44","workers/chat_worker.py:1439","gateway.py:5408","gateway.py:10927","routers/ide_router.py:313","routers/messages_compat_router.py:381 — divergent","agents/agent_builder.py:40","routers/projects_router.py:387","routers/memory_router.py:27","routers/coach_router.py:72","models/model_router.py:961-962","AgentStudio/.../llm_handler.py:621","AgentStudio/.../governance.py:177,200","AgentStudio/.../cli_runtime/runner.py:225","ai-ui/src/components/Coach.jsx:1564"] },
+
+  { id: "3.11", tone: "warning", status: "corrected", title: "Frontend hardcoded catalogs — narrower than reported, but sharper where it's real",
+    body: "<strong>Correction:</strong> revision 1 overstated the <code class='cite'>ai-ui/</code> side. <code class='cite'>Chat.jsx</code>, <code class='cite'>Office.jsx</code> and <code class='cite'>ModelGovernance.jsx</code> <strong>all fetch <code class='cite'>/all-models</code> live</strong> and check a <code class='cite'>dynamicMeta</code> map <em>before</em> the static table, falling through to a string-derived <code class='cite'>providerMeta()</code>. Those literals are correctly-designed cosmetic fallbacks. The genuine defect is narrower and sits in <strong>AgentStudio's frontend</strong>, where literals feed <em>request parameters</em>: an admin-added model missing from <code class='cite'>MODEL_MAX_TOKENS</code> gets a <strong>wrong token budget on every request</strong>, not merely a wrong label.",
+    cites: ["AgentStudio/frontend/src/utils/modelMaxTokens.js:42-72 — FUNCTIONAL","AgentStudio/frontend/src/config/models.js","AgentStudio/backend/workflow_factory/pipeline.py:194-217","ai-ui/.../ModelGovernance.jsx:7,14-23 — cosmetic, live fetch in front"] },
+
+  { id: "3.20", tone: "warning", status: "new", title: "A fifth model catalogue: spend tracking",
+    body: "<code class='cite'>approved_models.py</code> (322 lines) builds its tracking allowlist from the union of env-default model ids and ids observed in <code class='cite'>model_usages</code> over 90 days. It <strong>never consults <code class='cite'>llm_models</code></strong>, so an admin-registered model is bucketed as <code class='cite'>'other'</code> in <code class='cite'>llm_spend_daily</code> until it organically accumulates usage — the first weeks of spend on a newly assigned model are unattributed.",
+    cites: ["services/llm_spend/approved_models.py"] },
+
+  { id: "3.21", tone: "warning", status: "new", title: "No per-feature cost or usage telemetry",
+    body: "<code class='cite'>model_usages</code> records model and user, but there is <strong>no <code class='cite'>feature_key</code> dimension anywhere in the telemetry path</strong>. The moment admins can assign models per feature, their first question is “what is this feature costing me on this model versus the alternative?” — and today that is unanswerable. Adding the dimension is small, but it must land <strong>with</strong> Phase 1: retrofitting it later means the comparison data doesn't exist for the period that matters most, immediately after rollout.",
+    cites: ["model_usages — no feature dimension","services/llm_spend/"] },
+
+  { id: "3.12", tone: "good", status: "confirmed", title: "An unwired policy engine already exists — the recommended foundation",
+    body: "<code class='cite'>router/policy.py</code> (163 lines) + <code class='cite'>profiles/routing.py</code> (151) / <code class='cite'>schema.py</code> (77) implement exactly the right shape — a DomainProfile → RoutingPolicy weighted-scoring chooser with a privacy floor — but their <strong>only importers are test files</strong>. Wire this up rather than inventing a fifth mechanism. <strong>Revision 2 caveat:</strong> a <em>second</em>, unrelated <code class='cite'>DomainProfile</code> exists at <code class='cite'>cil/policy.py:30</code>. Reconcile the two first, or the platform ships two things with one name meaning different things.",
+    cites: ["router/policy.py — 163 lines, test-only callers","profiles/routing.py — 151 lines","profiles/schema.py:68 — DomainProfile","cil/policy.py:30 — a SECOND DomainProfile"] },
+];
+
+const gwCards = [
+  { n: "1 · Root", h: "gateway_claude / openai / gemini / local_llm / generic_openai / ollama", loc: "3,163 lines", d: "The originally-intended adapter layer, called directly from gateway.py in at least 6 separate ad hoc branches. provider_protocol.py (84 lines) documents the drift but has zero importers." },
+  { n: "2 · Proxy service", h: "services/llm_proxy/gateway_*.py + main.py", loc: "6,584 lines", d: "A near-duplicate copy of gateway 1. Verified drift: its 142-line registry copy drops three governance kill-switches (3.16), and its Claude gateway is missing a blank-model guard the root added after an outage (3.17)." },
+  { n: "3 · Managed endpoints", h: "services/managed_endpoint_direct_llm.py", loc: "477 lines", d: "A third, raw-SDK implementation (anthropic.Anthropic(), openai.OpenAI()) used when LLM_PROXY_URL is unset — plus a forked message converter its own comment calls “a LOCAL fork, not imported.”" },
+  { n: "4 · AgentStudio product", h: "AgentStudio/backend/app/core/llm_handler.py", loc: "2,171 lines", d: "A fully independent client factory with its own hardcoded vendor base URLs, credential resolvers, and a model-name-prefix provider heuristic that misroutes admin-registered models (3.15)." },
+];
+
+const driftRows = [
+  ["generate() signature", "(prompt, model=, temperature=0, max_tokens=32000, stream=True)", "(prompt, model=None, precleared=False, precleared_findings=None)", "(prompt, precleared=False, precleared_findings=None, model=None) — argument order drift", "(prompt, model=None, tier=\"simple\", *, max_tokens=None, disable_reasoning=False)"],
+  ["Streaming shape", "Anthropic SSE event types", "chunk.choices[0].delta.content", "candidates[0].content.parts[].thought", "OpenAI-shaped + reasoning-content fallback buffer"],
+  ["Tool schema", "input_schema (de facto standard)", "private converter", "private converter", "N/A"],
+  ["Cache economics", "10% / 125% read/write", "50% automatic", "25% explicit", "0% (KV-cache)"],
+  ["Compliance gate", "None (assumes pre-cleared)", "compliance_engine.validate_input()", "Same as OpenAI", "None"],
+  ["Errors", "plain string returned", "plain string returned", "plain string returned", "raises in one method, string elsewhere"],
+];
+
+const flowSteps = [
+  { t: "Feature call site", d: "e.g. Skills generation, Coach rewrite", cls: "" },
+  { t: "resolve_feature_model()", d: "new — canonical resolution chain, returns a plain string", cls: "new" },
+  { t: "feature_model_config", d: "new — DB table, admin-editable", cls: "new" },
+  { t: "ModelRouter.route() step 1a", d: "EXISTING — already resolves a registry model_id given as model_hint", cls: "" },
+  { t: "llm_provider_registry", d: "existing — provider/model catalog", cls: "" },
+  { t: "Shared gateway", d: "existing (consolidated) — vendor adapter", cls: "" },
+];
+
+const phases = [
+  { p: "Phase 0", d: "Live defect fixes", size: "S-M", pct: 16, risk: "good", note: "REVISED ↑ 8 files (was 3) — now also budget bypass (3.14), AgentStudio misroute (3.15), proxy kill-switch gap (3.16), blank-model guard (3.17), dropped model arg (3.18)" },
+  { p: "Phase 1", d: "Capability vocab + schema + resolver + UI", size: "M-L", pct: 45, risk: "good", note: "REVISED ↑ ~10 files — the capability vocabulary (3.13) and feature_key telemetry (3.21) must land here" },
+  { p: "Phase 2", d: "Call-site migration", size: "M", pct: 34, risk: "warning", note: "REVISED ↓ 76 literals but route() already resolves registry ids — a one-argument substitution, scriptable" },
+  { p: "Phase 3", d: "Gateway consolidation", size: "L-XL", pct: 100, risk: "critical", note: "~15 files incl. AgentStudio rewrite — highest risk, and NOT a blocker for shipping" },
+  { p: "Phase 4", d: "Cross-cutting cleanup", size: "M", pct: 42, risk: "warning", note: "~18 files — duplicated heuristics, frontend catalogs, spend catalogue" },
+  { p: "Phase 5", d: "Resilience & policy engine", size: "M", pct: 38, risk: "serious", note: "~5 files, architecturally significant — wire up 3.12 after reconciling the duplicate DomainProfile" },
+  { p: "Phase 6", d: "Embeddings & reranking", size: "M", pct: 40, risk: "serious", note: "NEW — ~6 files + a reindex worker; required before “model-agnostic” is true of retrieval too (3.19)" },
+];
+
+const phaseFiles = [
+  { p: "Phase 0 — Live defect fixes (8 files, expanded in rev 2)", rows: [
+      ["services/feedback_processor.py:337", "Derive provider from the resolved model's family instead of hardcoding “claude” (3.10)"],
+      ["models/classifier.py:64", "Same fix"],
+      ["models/hybrid_retriever.py:90,670", "Same fix — TWO sites, not one"],
+      ["middleware/budget_middleware.py:44-56", "NEW — replace the prefix heuristic with a registry lookup; paid admin-registered models currently skip budget enforcement (3.14)"],
+      ["AgentStudio/.../llm_handler.py:270-295", "NEW — _classify_model() must read family from llm_models, not parse the model name (3.15)"],
+      ["services/llm_proxy/core/model_registry.py", "NEW — add the missing ENABLE_CLI_OPUS_48 / ENABLE_CLI_OPUS_5 / ENABLE_SONNET_5 gates, or import the root registry (3.16)"],
+      ["services/llm_proxy/gateway_claude.py:432-436", "NEW — add the `CLAUDE_MODEL and` guard the root already has (3.17)"],
+      ["gateway_openai.py:113-121 + proxy copy :66-73", "NEW — forward `model` to self.generate() instead of discarding it (3.18)"],
+  ]},
+  { p: "Phase 1 — Capability vocabulary + schema + resolver + admin API/UI", rows: [
+      ["models/model_router.py:693-791", "NEW — the §4.0 capability vocabulary (fast/balanced/deep/vision/long-context/local-only); vendor names demoted to aliases. Alias-only: _dispatch() untouched (3.13)"],
+      ["core/config.py:452-470, core/model_registry.py:380-410", "NEW — adopt the same six names so the three vocabularies converge (3.3)"],
+      ["db/models.py", "Add FeatureRegistry, FeatureModelConfig ORM classes — note llm_models.id is UUID, not Integer"],
+      ["db/migrate.py", "New migration + seed rows for known features"],
+      ["core/feature_model_resolver.py (new)", "Resolution chain: privacy floor → env break-glass → per-org → default → capability → None. Never raises"],
+      ["routers/feature_model_config_router.py (new)", "Admin CRUD, mirrors llm_provider_admin_router.py"],
+      ["ai-ui/src/components/FeatureModelConfig.jsx (new)", "Admin UI — capability-filtered dropdown, ordered fallback chain, effective-model preview, local-only lockout"],
+      ["usage / spend write path", "NEW — add the feature_key dimension; must land WITH this phase, not after (3.21)"],
+  ]},
+  { p: "Phase 2 — Call-site migration (76 literals; one-argument substitution)", rows: [
+      ["agents/*", "advanced_reasoning.py (10), doc_generator_agent.py (4), sdlc_pipeline/_core.py (3), sdlc_patch_engine.py, review_engine.py, orchestrator.py, sdlc_context.py, sdlc_state_machine.py, router_agent.py, agent_builder.py"],
+      ["routers/*", "skills_router.py (4), ide_router.py (2), chat_router.py, presenton_router.py, broadcast_router.py, threads_router.py, projects_router.py, kb_ask_router.py, cowork_tasks_router.py"],
+      ["workers/*", "doc_worker.py (3), cowork_task_worker.py (3), chat_worker.py (3), secure_code_gate_worker.py, meeting_worker.py, knowledge_graph_worker.py"],
+      ["services/*", "teams_adapter.py (3), doc_reviser.py, skill_synthesis.py"],
+      ["gateway.py", "6 literals, plus the 6 inline `if tier ==` dispatch branches from 3.5"],
+      ["CI", "NEW — a lint rejecting new model_hint=\"<literal>\" outside the resolver, or the 76 sites regrow"],
+  ]},
+  { p: "Phase 3 — Gateway consolidation (NOT a blocker for shipping)", rows: [
+      ["models/provider_protocol.py", "Promote from advisory Protocol (84 lines, 0 importers) to an enforced interface + typed LLMError"],
+      ["gateway_*.py (root)", "Normalize signatures, streaming shape, compliance-gate calls"],
+      ["services/llm_proxy/*", "Replace with imports of the shared root gateways; delete the divergent registry copy"],
+      ["services/managed_endpoint_direct_llm.py", "Replace raw-SDK calls with shared gateway calls; delete the forked _oai_messages_to_anthropic_local"],
+      ["AgentStudio/backend/app/core/llm_handler.py", "Rewrite to consume shared gateways + registry (its misroute bug is already fixed in Phase 0)"],
+      ["agents/react_orchestrator.py and other bypass sites", "Replace direct instantiation with model_router calls"],
+  ]},
+  { p: "Phase 4 — Cross-cutting cleanup", rows: [
+      ["5 cloud-prefix copies + 1 divergent variant", "budget_middleware.py:44, chat_worker.py:1439, gateway.py:5408, gateway.py:10927, ide_router.py:313, messages_compat_router.py:381 → one registry-backed helper"],
+      ["8+ files with the “is local model” heuristic", "One shared helper backed by the DB family flag"],
+      ["AgentStudio/frontend/* model catalogs", "FUNCTIONAL — serve max_tokens/capabilities from llm_models.capabilities"],
+      ["ai-ui/* display maps", "COSMETIC — consolidate onto the shared /all-models hook (already behind a live fetch)"],
+      ["services/llm_spend/approved_models.py", "Source the allowlist from llm_models, not env defaults + observed usage (3.20)"],
+      ["db/models.py:311 (agents_pg.preferred_model)", "Migrate from bare String(50) to a validated reference"],
+  ]},
+  { p: "Phase 5 — Resilience & policy engine", rows: [
+      ["core/circuit_breaker.py", "Key breakers by provider/model DB id, not hardcoded vendor name"],
+      ["models/model_router.py:1459-1518", "Add fallback-cascade support for TIER_REGISTRY models"],
+      ["router/policy.py, profiles/routing.py, profiles/schema.py, cil/policy.py", "Reconcile the DUPLICATE DomainProfile first, then wire into ModelRouter as an optional, flag-gated mode"],
+  ]},
+  { p: "Phase 6 — Embeddings & reranking (new in rev 2)", rows: [
+      ["db/models.py, db/migrate.py", "Add model_kind (generation/embedding/rerank) to llm_models; move dimensionality into capabilities"],
+      ["services/embed_svc/config.py:12-30", "Read the assigned embedding model from the registry; remove the hardcoded OPENAI_DIMS = 768"],
+      ["services/embed_svc/reranker.py, core/kb_retrieval.py, models/hybrid_retriever.py, models/coverage_gate.py", "Resolve the reranker from the registry"],
+      ["reindex worker (new)", "Migration-aware embedding cutover — changing the model invalidates every stored vector"],
+  ]},
+];
+
+// ---------- RENDER ----------
+function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html !== undefined) e.innerHTML = html; return e; }
+
+function renderKpis() {
+  const row = document.getElementById('kpiRow');
+  kpis.forEach(k => {
+    const colorVar = { critical: 'var(--status-critical)', serious: 'var(--status-serious)', warning: 'var(--status-warning)', good: 'var(--status-good)' }[k.tone] || 'var(--series-1)';
+    const card = el('div', 'kpi');
+    card.style.setProperty('--kpi-color', colorVar);
+    card.appendChild(el('div', 'value', k.value));
+    card.appendChild(el('div', 'label', k.label));
+    row.appendChild(card);
+  });
+}
+
+function badge(tone, label) {
+  return `<span class="badge ${tone}"><span class="dot"></span>${label}</span>`;
+}
+
+const worksLabel = { good: 'Working', warning: 'Partial', critical: 'Missing' };
+
+function renderWorks() {
+  const tbody = document.getElementById('worksTable');
+  worksRows.forEach(([cap, tone, files]) => {
+    const tr = el('tr');
+    tr.innerHTML = `<td class="primary">${cap}</td><td>${badge(tone, worksLabel[tone] || 'Partial')}</td><td>${files.split(' · ').map(f => `<code class="cite">${f}</code>`).join(' ')}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+const toneLabel = { critical: "Heavy", serious: "Moderate", warning: "Light", good: "Clean / abstracted", muted: "N/A" };
+
+function renderCoupling(filter) {
+  const tbody = document.getElementById('couplingTable');
+  tbody.innerHTML = '';
+  const rows = couplingData.filter(r => filter === 'all' || r[1] === filter);
+  document.getElementById('filterCount').textContent = `Showing ${rows.length} of ${couplingData.length} directories`;
+  rows.forEach(([dir, tone, cite, note]) => {
+    const tr = el('tr');
+    tr.innerHTML = `<td class="primary">${dir}</td><td>${badge(tone, toneLabel[tone])}</td><td>${cite !== '—' ? `<code class="cite">${cite}</code>` : '—'}</td><td>${note}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+function renderFilters() {
+  const row = document.getElementById('filterRow');
+  filters.forEach((f, i) => {
+    const btn = el('button', 'filter-chip' + (i === 0 ? ' active' : ''), f.label);
+    btn.dataset.filter = f.key;
+    btn.addEventListener('click', () => {
+      row.querySelectorAll('.filter-chip').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderCoupling(f.key);
+    });
+    row.appendChild(btn);
+  });
+  renderCoupling('all');
+}
+
+const statusLabel = { confirmed: "Confirmed", corrected: "Corrected", new: "New in rev 2" };
+
+const statusFilters = [
+  { key: "all",       label: "All 21" },
+  { key: "new",       label: "New in rev 2" },
+  { key: "corrected", label: "Corrected" },
+  { key: "confirmed", label: "Confirmed" },
+];
+
+function renderFindings(statusFilter) {
+  const wrap = document.getElementById('findingsAccordion');
+  wrap.innerHTML = '';
+  const rows = findingsV2.filter(f => !statusFilter || statusFilter === 'all' || f.status === statusFilter);
+  const cnt = document.getElementById('statusFilterCount');
+  if (cnt) cnt.textContent = `Showing ${rows.length} of ${findingsV2.length} findings`;
+  rows.forEach(f => {
+    const item = el('div', 'accordion-item');
+    const cites = f.cites.map(c => `<code class="cite">${c}</code>`).join('');
+    item.innerHTML = `
+      <div class="accordion-header">
+        <div class="title-group">
+          <span class="id">${f.id}</span>
+          ${badge(f.tone, toneLabel[f.tone])}
+          <span class="vstat ${f.status}">${statusLabel[f.status]}</span>
+          <h3>${f.title}</h3>
+        </div>
+        <span class="chev">▸</span>
+      </div>
+      <div class="accordion-body"><div class="accordion-body-inner">
+        <p>${f.body}</p>
+        ${cites ? `<div class="cite-list">${cites}</div>` : ''}
+      </div></div>`;
+    item.querySelector('.accordion-header').addEventListener('click', () => item.classList.toggle('open'));
+    wrap.appendChild(item);
+  });
+  if (wrap.children[0]) wrap.children[0].classList.add('open');
+}
+
+function renderStatusFilters() {
+  const row = document.getElementById('statusFilterRow');
+  statusFilters.forEach((f, i) => {
+    const btn = el('button', 'filter-chip' + (i === 0 ? ' active' : ''), f.label);
+    btn.addEventListener('click', () => {
+      row.querySelectorAll('.filter-chip').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderFindings(f.key);
+    });
+    row.appendChild(btn);
+  });
+  renderFindings('all');
+}
+
+function renderGwCards() {
+  const wrap = document.getElementById('gwCards');
+  gwCards.forEach(c => {
+    const card = el('div', 'gw-card');
+    card.innerHTML = `<div class="n">${c.n}</div><h4>${c.h}</h4><div class="loc">${c.loc}</div><p>${c.d}</p>`;
+    wrap.appendChild(card);
+  });
+}
+
+function renderDrift() {
+  const tbody = document.getElementById('driftTable');
+  driftRows.forEach(r => {
+    const tr = el('tr');
+    tr.innerHTML = r.map((c, i) => `<td class="${i === 0 ? 'primary' : ''}">${c}</td>`).join('');
+    tbody.appendChild(tr);
+  });
+}
+
+function renderFlow() {
+  const wrap = document.getElementById('flowDiagram');
+  flowSteps.forEach((s, i) => {
+    const box = el('div', 'flow-box' + (s.cls ? ' ' + s.cls : ''));
+    box.innerHTML = `<strong>${s.t}</strong>${s.d}`;
+    wrap.appendChild(box);
+    if (i < flowSteps.length - 1) wrap.appendChild(el('div', 'flow-arrow', '→'));
+  });
+}
+
+function renderPhaseChart() {
+  const wrap = document.getElementById('phaseChart');
+  const riskColor = { good: 'var(--status-good)', warning: 'var(--status-warning)', serious: 'var(--status-serious)', critical: 'var(--status-critical)' };
+  phases.forEach(ph => {
+    const row = el('div', 'bar-row');
+    row.title = ph.note;
+    row.innerHTML = `
+      <div class="name"><span class="risk-dot" style="background:${riskColor[ph.risk]}"></span>${ph.p} — ${ph.d}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${ph.pct}%"></div></div>
+      <div class="size-label">${ph.size}</div>`;
+    wrap.appendChild(row);
+  });
+}
+
+function renderPhaseAccordion() {
+  const wrap = document.getElementById('phaseAccordion');
+  phaseFiles.forEach((ph, idx) => {
+    const item = el('div', 'accordion-item');
+    const rows = ph.rows.map(([f, note]) => `<tr><td><code class="cite">${f}</code></td><td>${note}</td></tr>`).join('');
+    item.innerHTML = `
+      <div class="accordion-header">
+        <div class="title-group"><h3>${ph.p}</h3></div>
+        <span class="chev">▸</span>
+      </div>
+      <div class="accordion-body"><div class="accordion-body-inner">
+        <table><thead><tr><th style="width:38%">File(s)</th><th>Change</th></tr></thead><tbody>${rows}</tbody></table>
+      </div></div>`;
+    item.querySelector('.accordion-header').addEventListener('click', () => item.classList.toggle('open'));
+    wrap.appendChild(item);
+    if (idx === 0) item.classList.add('open');
+  });
+}
+
+// ---------- TABS ----------
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-tab]');
+  if (!btn) return;
+  document.querySelectorAll('nav.tabs button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('section.panel').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
+});
+
+// ---------- THEME ----------
+const themeBtn = document.getElementById('themeToggle');
+function applyThemeLabel() {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  themeBtn.textContent = isDark ? '☀️ Light mode' : '🌙 Dark mode';
+}
+themeBtn.addEventListener('click', () => {
+  const current = document.documentElement.getAttribute('data-theme');
+  const next = current === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try { localStorage.setItem('viz-theme', next); } catch (e) {}
+  applyThemeLabel();
+});
+try {
+  const saved = localStorage.getItem('viz-theme');
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+} catch (e) {}
+applyThemeLabel();
+
+// ---------- INIT ----------
+renderKpis();
+renderWorks();
+renderFilters();
+renderStatusFilters();
+renderGwCards();
+renderDrift();
+renderFlow();
+renderPhaseChart();
+renderPhaseAccordion();
+</script>
+</body>
+</html>

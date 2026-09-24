@@ -1,0 +1,21 @@
+Task Name,Status,Assignee,Start Date,End Date
+Lock down legacy skill execution (disable for new skills, log all remaining usage),Not started,Backend / Security,2026-09-28,2026-10-02
+Inventory legacy skills and build the migration tool to convert them to the new format,Not started,Backend,2026-09-28,2026-10-07
+Design the marketplace catalog (skills, tools, connectors, versions, installs) and close open product decisions,Not started,Architecture / Product,2026-09-28,2026-10-02
+Define roles, permissions and approval rules (publisher, reviewer, approver, installer; no self-approval),Not started,Backend / Security,2026-09-28,2026-10-02
+Publish the skill/tool build standard, agree the backend-frontend API contract, and set up the shared UI package,Not started,Architecture / Frontend,2026-09-29,2026-10-05
+Build browse, search, filter, item detail and the install / uninstall / enable / disable engine,Not started,Backend,2026-10-05,2026-10-14
+Build the submission-to-publish approval workflow with full activity and audit logging,Not started,Backend,2026-10-05,2026-10-14
+Build connector sign-in on install and clean access revocation on removal,Not started,Backend,2026-10-07,2026-10-14
+Add dependency impact warnings before removal and an emergency kill switch for published items,Not started,Backend,2026-10-12,2026-10-16
+Build automated safety scanning (secrets, personal data, hidden harmful instructions, runtime check, third-party CVEs) and wire it into the build pipeline,Not started,Security / DevOps,2026-10-12,2026-10-21
+Build the isolated sandbox runtime that skills execute in,Not started,Platform / Security,2026-10-12,2026-10-21
+Load default content: built-in skills, standard connectors (M365, Slack, Gmail, GitHub, Jira, Confluence) and read-only MCP server listings,Not started,Backend / Product,2026-10-19,2026-10-28
+Build the marketplace UI: browse page, install consent screen showing required access, and My Ecosystem page,Not started,Frontend,2026-10-12,2026-10-21
+Build the author publishing flow and the reviewer approval screen (scan results, diffs, approve or reject with reason),Not started,Frontend,2026-10-19,2026-10-28
+Add version update prompts, usage analytics, and UI polish for empty, error, loading and accessibility states,Not started,Frontend,2026-10-22,2026-10-30
+Run the migration in staging, verify old skills behave identically, then retire the legacy execution system,Not started,Backend / QA,2026-10-19,2026-11-04
+Launch the Ecosystem hub and integrate it into Agent Studio, Chat and Cowork on one shared catalog (stretch: Office Add-in and Desktop),Not started,Full team,2026-10-26,2026-11-04
+Make disable and removal take effect everywhere within seconds (including scheduled jobs) and add rate limits on submissions and installs,Not started,Backend,2026-10-28,2026-11-04
+Run security review, sandbox escape testing, end-to-end automated journey test, and performance test at thousands of items,Not started,Security / QA,2026-11-02,2026-11-06
+Set up monitoring and alerts, write publisher guide, reviewer checklist and incident runbooks, prepare external contributor model, and complete go-live sign-off with rollback plan,Not started,DevOps / Product,2026-11-02,2026-11-06
