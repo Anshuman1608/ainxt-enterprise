@@ -850,6 +850,17 @@ class DocumentEmbedding(Base):
     content     = Column(Text,        nullable=False)
     # embedding column: Vector(768) when pgvector available, Text fallback
     embedding   = Column(_VECTOR_TYPE, nullable=True)
+    # "<provider>:<model>" that produced `embedding` (core/embedding_model.py).
+    # Nullable with no default: rows written before this column existed have
+    # genuinely unknown provenance, and defaulting them to the current
+    # configuration would assert something untrue — exactly the claim a reindex
+    # must not rely on. NULL means "unknown", i.e. "must re-embed".
+    #
+    # This is what makes changing the embedding model possible at all: vectors
+    # from a different model are not comparable even at the same width, so a
+    # reindex has to be able to identify which rows are stale, and a
+    # half-finished one must not leave two models' vectors indistinguishable.
+    embed_model = Column(String(128), nullable=True, index=True)
     metadata_   = Column("metadata",  JSONB, nullable=False, default=dict)
     # Dedup / change-detection (added Phase 21)
     content_hash = Column(String(64),  nullable=True,  index=True)  # SHA-256 of content

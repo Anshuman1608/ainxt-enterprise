@@ -1928,13 +1928,22 @@ def _bulk_upsert(repo_name: str, chunks: list[dict], embeddings: list[list[float
         deduped_rows.append(row)
     rows = deduped_rows
 
+    # Stamp every row with the model that produced its vector. Resolved once
+    # per batch, not per row: it is derived from process config and cannot
+    # change mid-batch, and a NULL here would mean "unknown provenance" to a
+    # future reindex. See core/embedding_model.py.
+    from core.embedding_model import active_embedding_model as _active_embed_model
+    _embed_tag = _active_embed_model()
+    for row in rows:
+        row["embed_model"] = _embed_tag
+
     sql = _sql("""
         INSERT INTO document_embeddings
             (id, repo, file_path, chunk_index, content, content_hash, embedding, metadata,
              line_start, line_end, classification, allowed_roles, allowed_users,
              product_id, department, branch,
              parent_chunk_id, section_path, is_section_parent, status,
-             created_at)
+             embed_model, created_at)
         VALUES
             (CAST(:id AS uuid), :repo, :file_path, :chunk_index, :content, :content_hash,
              CAST(:embedding AS vector), CAST(:metadata AS jsonb),
@@ -1942,7 +1951,7 @@ def _bulk_upsert(repo_name: str, chunks: list[dict], embeddings: list[list[float
              CAST(:allowed_roles AS jsonb), CAST(:allowed_users AS jsonb),
              CAST(NULLIF(:product_id, '') AS uuid), NULLIF(:department, ''), NULLIF(:branch, ''),
              CAST(:parent_chunk_id AS uuid), :section_path, :is_section_parent, :status,
-             NOW())
+             :embed_model, NOW())
         ON CONFLICT (repo, file_path, chunk_index)
         DO UPDATE SET
             content         = EXCLUDED.content,
@@ -1960,7 +1969,12 @@ def _bulk_upsert(repo_name: str, chunks: list[dict], embeddings: list[list[float
             parent_chunk_id   = EXCLUDED.parent_chunk_id,
             section_path      = EXCLUDED.section_path,
             is_section_parent = EXCLUDED.is_section_parent,
-            status            = EXCLUDED.status
+            status            = EXCLUDED.status,
+            -- Re-embedding a chunk replaces its vector, so the provenance tag
+            -- must move with it. Without this an UPSERT would keep the old
+            -- model's tag against a new model's vector, which is worse than
+            -- NULL: it would assert provenance that is wrong.
+            embed_model       = EXCLUDED.embed_model
     """)
 
     from sqlalchemy.exc import IntegrityError as _IntegrityError

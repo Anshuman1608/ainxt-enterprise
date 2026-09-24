@@ -236,6 +236,76 @@ def list_capabilities(admin: dict = Depends(require_admin)):
     }
 
 
+@router.get("/retrieval", summary="Which models retrieval is using (read-only)")
+def get_retrieval_models(
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(_get_db),
+):
+    """The embedding and reranking models in use, and why neither is a dropdown.
+
+    llm_models.model_kind lets an admin REGISTER embedding and rerank models,
+    but neither is assignable at runtime, for two different reasons that the
+    response spells out per model (see core/embedding_model.py). Serving them
+    read-only is deliberate: an operator needs to know what their vectors were
+    built with — that is the thing they must check before ever changing it —
+    and offering a control that would corrupt the index would be worse than
+    offering none.
+
+    `stored_vectors` reports what is actually in the index, grouped by the
+    model that produced it. More than one entry, or any NULL-provenance rows,
+    means a reindex is incomplete or predates provenance tracking — which is
+    what a cutover has to resolve before search results can be trusted.
+    """
+    from core.embedding_model import active_embedding_model, describe_retrieval_models
+
+    out = describe_retrieval_models()
+    active = active_embedding_model()
+
+    # Registered candidates, so the screen can show what an operator COULD
+    # move to (via env + a reindex), not just what is running.
+    try:
+        from core.llm_provider_registry import get_models_by_kind
+        out["registered_candidates"] = {
+            kind: [
+                {"model_id": m["model_id"], "display_name": m["display_name"],
+                 "provider_name": m["provider_name"], "family": m["family"]}
+                for m in get_models_by_kind(kind)
+            ]
+            for kind in ("embedding", "rerank")
+        }
+    except Exception as exc:
+        logger.warning(f"[feature-model-config] retrieval candidates unavailable: {exc}")
+        out["registered_candidates"] = {"embedding": [], "rerank": []}
+
+    # What the index actually holds. Counted per table because they have
+    # different lifecycles: the answer cache is disposable, the other two are not.
+    from sqlalchemy import text as _text
+
+    stored: dict = {}
+    for table in ("document_embeddings", "semantic_memory", "semantic_answer_cache"):
+        try:
+            rows = db.execute(_text(
+                f"SELECT COALESCE(embed_model, '(unknown)') AS tag, count(*) AS n "
+                f"FROM {table} GROUP BY 1 ORDER BY 2 DESC"
+            )).fetchall()
+            stored[table] = {r[0]: int(r[1]) for r in rows}
+        except Exception as exc:
+            # Table or column absent (migrate.py not run), or it lives on the
+            # pgvector engine rather than this session's.
+            stored[table] = {"(unavailable)": 0}
+            logger.debug(f"[feature-model-config] {table} provenance unavailable: {exc}")
+
+    out["stored_vectors"] = stored
+    out["active_tag"] = active
+    # True when every stored vector was produced by the model now configured.
+    out["consistent"] = all(
+        set(tags) <= {active} or sum(tags.values()) == 0
+        for tags in stored.values()
+        if "(unavailable)" not in tags
+    )
+    return out
+
+
 @router.post("/sync", summary="Re-seed feature_registry from the code declarations")
 def sync_registry(
     admin: dict = Depends(require_admin),

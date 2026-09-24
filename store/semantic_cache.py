@@ -26,6 +26,7 @@ from sqlalchemy import text as _text
 
 from db.database import vector_engine
 from core.logger import logger
+from core.embedding_model import active_embedding_model as _active_embed_model
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -293,9 +294,11 @@ def store_semantic_cached_answer(
         with vector_engine.connect() as conn:
             conn.execute(_text("""
                 INSERT INTO ainxt.semantic_answer_cache
-                    (question, answer, embedding, repo_filter, user_id, confidence, rag_mode)
+                    (question, answer, embedding, repo_filter, user_id, confidence,
+                     rag_mode, embed_model)
                 VALUES
-                    (:q, :a, CAST(:vec AS vector), :repo, :uid, :conf, :rag_mode)
+                    (:q, :a, CAST(:vec AS vector), :repo, :uid, :conf,
+                     :rag_mode, :embed_model)
                 ON CONFLICT DO NOTHING
             """), {
                 "q":        question[:2000],
@@ -305,6 +308,12 @@ def store_semantic_cached_answer(
                 "uid":      user_id,
                 "conf":     confidence,
                 "rag_mode": rag_mode,
+                # Which model produced `vec`. This cache is keyed by vector
+                # similarity, so a row embedded by a different model would
+                # match against the wrong questions — recording the tag is what
+                # lets a model change invalidate the cache instead of silently
+                # returning nonsense from it. See core/embedding_model.py.
+                "embed_model": _active_embed_model(),
             })
             conn.commit()
         logger.info(f"[SemanticCache] L2 STORED  user={user_id}  rag_mode={rag_mode}  q_len={len(question)}")
@@ -556,12 +565,12 @@ def store_semantic_memory(
                 INSERT INTO ainxt.semantic_memory
                     (type, summary, content, embedding, source, confidence,
                      user_id, scope_type, scope_id, summary_hash,
-                     rag_mode, source_repo)
+                     rag_mode, source_repo, embed_model)
                 VALUES
                     (:mtype, :summary, CAST(:content AS jsonb),
                      CAST(:vec AS vector), :source, :conf,
                      :uid, :scope_type, :scope_id, :summary_hash,
-                     :rag_mode, :source_repo)
+                     :rag_mode, :source_repo, :embed_model)
                 ON CONFLICT (summary_hash) WHERE summary_hash IS NOT NULL DO UPDATE SET
                     hit_count  = ainxt.semantic_memory.hit_count + 1,
                     last_used  = NOW(),
@@ -570,6 +579,10 @@ def store_semantic_memory(
                         ainxt.semantic_memory.confidence + 0.02
                     )
             """), {
+                # The ON CONFLICT above bumps hit_count without replacing the
+                # vector, so embed_model is deliberately NOT in its SET list:
+                # the stored vector is unchanged, so its provenance is too.
+                "embed_model":  _active_embed_model(),
                 "mtype":        memory_type,
                 "summary":      summary[:1000],
                 "content":      json.dumps(content),

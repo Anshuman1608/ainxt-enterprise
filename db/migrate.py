@@ -1358,6 +1358,9 @@ CREATE INDEX IF NOT EXISTS idx_sec_scan_scanned_at ON security_scan_results(scan
     # ── Part AD4: 2026-09-24 — llm_models.model_kind (generation/embedding/rerank)
     _part_ad4_llm_models_model_kind_2026_09_24()
 
+    # ── Part AD5: 2026-09-24 — embed_model provenance on the vector tables ────
+    _part_ad5_embedding_provenance_2026_09_24()
+
     # ── OSS schema-drift fixes ───────────────────────────────────────────────
     # (_part_oss3 runs at the top of this function — the catalogue seeds need it.)
     _part_oss4_model_permissions_web_search()
@@ -8531,6 +8534,45 @@ def _part_ad4_llm_models_model_kind_2026_09_24():
     print("  ok Part AD4: llm_models.model_kind added (default 'generation')")
 
 
+def _part_ad5_embedding_provenance_2026_09_24():
+    """
+    2026-09-24 — record which model produced each stored vector.
+
+    document_embeddings has 31 columns and not one of them said which embedding
+    model produced the vector; neither did semantic_memory or
+    semantic_answer_cache. That is the actual blocker for ever changing the
+    embedding model: a reindex cannot target what it cannot identify, and a
+    half-finished one leaves two models' vectors in a single column with no way
+    to tell them apart — which yields silently wrong search results rather than
+    an error.
+
+    Nullable with no backfill DEFAULT on purpose. Rows written before this
+    column existed have genuinely unknown provenance, and guessing the current
+    configuration for them would assert something untrue — precisely the claim
+    a future cutover must not rely on. NULL means "unknown", which a reindex
+    can treat as "must re-embed".
+
+    Value shape is "<provider>:<model>" (see core/embedding_model.py): the same
+    model name served by Ollama and by an OpenAI-compatible endpoint does not
+    necessarily produce the same vectors.
+    """
+    for _table in ("document_embeddings", "semantic_memory", "semantic_answer_cache"):
+        _run_ddl(
+            f"ALTER TABLE {_table} ADD COLUMN IF NOT EXISTS "
+            f"embed_model VARCHAR(128)",
+            f"{_table}.embed_model",
+        )
+        # Partial index: a reindex job's query is "which rows were NOT produced
+        # by the active model", so only the distinct tags matter and the common
+        # case (all rows current) stays cheap.
+        _run_ddl(
+            f"CREATE INDEX IF NOT EXISTS idx_{_table}_embed_model "
+            f"ON {_table}(embed_model)",
+            f"{_table}.idx_embed_model",
+        )
+    print("  ok Part AD5: embed_model provenance added to the three vector tables")
+
+
 # ── Post-migration verification ─────────────────────────────────────────────
 # Objects that the application queries unconditionally on a default install. If
 # any is missing the platform will 500 at runtime, so a migration that leaves one
@@ -8552,6 +8594,7 @@ _REQUIRED_SCHEMA = [
     ("model_usages", "feature_key"),
     ("llm_spend_daily", "token_type"),
     ("llm_models", "model_kind"),
+    ("document_embeddings", "embed_model"),
 ]
 
 
