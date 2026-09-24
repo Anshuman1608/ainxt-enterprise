@@ -277,6 +277,13 @@ _cv_agent_id:       ContextVar[str] = ContextVar("ainxt_log_agent_id",       def
 _cv_pipeline_stage: ContextVar[str] = ContextVar("ainxt_log_pipeline_stage", default="")
 _cv_task_id:        ContextVar[str] = ContextVar("ainxt_log_task_id",        default="")
 _cv_correlation_id: ContextVar[str] = ContextVar("ainxt_log_correlation_id", default="")
+# Which platform feature (feature_registry.feature_key) this turn belongs to.
+# Set by core.feature_model_resolver.resolve_feature_model, which is called at
+# exactly the point where the feature is known, and read by the llm_cost
+# producers so model_usages.feature_key is populated. Deliberately NOT added to
+# the emitted log record — that would change the JSON shape every downstream
+# Loki/promtail query depends on.
+_cv_feature_key:    ContextVar[str] = ContextVar("ainxt_feature_key",          default="")
 
 
 def set_request_id(request_id: str) -> None:
@@ -345,6 +352,31 @@ def get_correlation_id() -> str:
     return _cv_correlation_id.get()
 
 
+def set_feature_key(feature_key: str = "") -> None:
+    """Record which platform feature the current turn belongs to.
+
+    Called by core.feature_model_resolver.resolve_feature_model, so every call
+    site migrated to the feature resolver gets this for free — there is no
+    second thing to remember at ~66 call sites.
+
+    Unconditional set/clear, for the same reason as set_correlation_id above:
+    contextvars make cross-request leaks impossible under FastAPI (each request
+    runs in its own Task with a fresh Context), but a worker reusing a Python
+    thread across jobs would otherwise keep the previous job's value visible.
+    Passing "" clears it, and a worker that resolves a feature per job
+    overwrites it per job.
+    """
+    _cv_feature_key.set(feature_key or "")
+
+
+def get_feature_key() -> str:
+    """The current turn's feature_key, or "" when the caller is not a
+    feature — the CLI and managed-endpoint lanes are driven by an external
+    caller, not by a platform feature, and must report NULL rather than
+    inherit whatever ran last on the thread."""
+    return _cv_feature_key.get()
+
+
 def bind_context(
     agent_id: str = "",
     pipeline_stage: str = "",
@@ -385,6 +417,7 @@ def clear_bound_context():
     _cv_task_id.set("")
     _cv_correlation_id.set("")
     _cv_job_kind.set("")
+    _cv_feature_key.set("")
 
 
 class sdlc_log_context:

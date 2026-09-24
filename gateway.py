@@ -1267,6 +1267,7 @@ from routers.cached_ask_router import router as cached_ask_router
 from routers.endpoint_mgmt_router import router as endpoint_mgmt_router
 from routers.endpoint_proxy_router import proxy_router as endpoint_proxy_router
 from core.feature_model_resolver import resolve_feature_model
+from core.logger import get_feature_key as _get_feature_key
 from routers.llm_provider_admin_router import router as llm_provider_admin_router
 from routers.feature_model_config_router import router as feature_model_config_router
 # P10: Prompt version management
@@ -5574,6 +5575,37 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
     if _local_model and _model_hint is None:
         _model_hint = "local"
 
+    # ── Feature default for the main answer path ─────────────────────────────
+    # Only consulted when the user has NOT picked a model: an explicit choice
+    # in the Chat picker (or an explicit local_model) always wins over a
+    # platform default. That ordering is the whole reason this sits here rather
+    # than replacing the line above.
+    #
+    # chat.respond is declared with default_capability=None, so on a deployment
+    # that has assigned nothing the resolver returns None and this is a no-op —
+    # the request auto-routes by complexity exactly as before. An admin
+    # assignment is therefore opt-in, and also the thing that finally lets the
+    # highest-volume lane in the platform be pointed at a chosen model.
+    #
+    # Placed BEFORE the governance block below on purpose: a hint that reaches
+    # the router should be access-checked the same way whether a user or an
+    # admin chose it. Assigning a model a department may not use is a
+    # misconfiguration the admin should be told about, not one to route around.
+    # Attribute the turn to chat.respond either way. Which MODEL serves it and
+    # which FEATURE it belongs to are different questions: a user overriding the
+    # model does not stop this being the chat feature, and if the key were only
+    # set on the auto-routed branch then "what is chat costing me" would silently
+    # exclude every turn where someone picked a model from the picker.
+    try:
+        from core.logger import set_feature_key as _set_fk
+        _set_fk("chat.respond")
+    except Exception:  # noqa: BLE001 — telemetry must not affect routing
+        pass
+    if _model_hint is None:
+        _model_hint = resolve_feature_model("chat.respond", default=None)
+        if _model_hint:
+            logger.info(f"[ask] chat.respond feature default → model_hint={_model_hint!r}")
+
     # ── MODEL GOVERNANCE ENFORCEMENT ─────────────────────────────────────────
     # Block the request early if the user's department (or a user-level
     # override) disallows the requested model.  Only fires when an explicit
@@ -8868,6 +8900,10 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 )
                 _kafka_produce("ainxt.metrics", {
                     "event":          "llm_cost",
+                    # Which platform feature spent this. Set on the request context by
+                    # core.feature_model_resolver; "" for a turn that is not a feature,
+                    # which must be stored as NULL rather than mis-attributed.
+                    "feature_key":          _get_feature_key() or None,
                     "request_id":     request_id,
                     "user_id":        _user_id,
                     "agent_id":       "orchestrator",
@@ -9814,6 +9850,10 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 from core.time_utils import now_ist_iso as _now_ist_iso_cli
                 _kafka_produce("ainxt.metrics", {
                     "event":         "llm_cost",
+                    # Which platform feature spent this. Set on the request context by
+                    # core.feature_model_resolver; "" for a turn that is not a feature,
+                    # which must be stored as NULL rather than mis-attributed.
+                    "feature_key":         _get_feature_key() or None,
                     "request_id":    request_id,
                     "user_id":       _user_id,
                     "agent_id":      "cli",
@@ -10126,6 +10166,10 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 from core.time_utils import now_ist_iso as _now_ist_iso_ask
                 _kafka_produce("ainxt.metrics", {
                     "event":         "llm_cost",
+                    # Which platform feature spent this. Set on the request context by
+                    # core.feature_model_resolver; "" for a turn that is not a feature,
+                    # which must be stored as NULL rather than mis-attributed.
+                    "feature_key":         _get_feature_key() or None,
                     "request_id":    request_id,
                     "user_id":       _user_id,
                     "agent_id":      "orchestrator",
@@ -10322,6 +10366,10 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 _ask_channel_b = locals().get("_ask_channel", "WEB-CHAT")
                 _kafka_produce("ainxt.metrics", {
                     "event":         "llm_cost",
+                    # Which platform feature spent this. Set on the request context by
+                    # core.feature_model_resolver; "" for a turn that is not a feature,
+                    # which must be stored as NULL rather than mis-attributed.
+                    "feature_key":         _get_feature_key() or None,
                     "request_id":    request_id,
                     "user_id":       _user_id,
                     "source_channel": _ask_channel_b,
@@ -11353,6 +11401,10 @@ def openai_chat_completions(
                 }.get(_cs_ide, "IDE")
                 _kafka_produce("ainxt.metrics", {
                     "event":         "llm_cost",
+                    # Which platform feature spent this. Set on the request context by
+                    # core.feature_model_resolver; "" for a turn that is not a feature,
+                    # which must be stored as NULL rather than mis-attributed.
+                    "feature_key":         _get_feature_key() or None,
                     "request_id":    request_id,
                     "user_id":       _user_id,
                     "agent_id":      "ide_direct",

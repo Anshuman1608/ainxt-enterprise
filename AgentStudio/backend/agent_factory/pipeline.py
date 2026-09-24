@@ -89,6 +89,7 @@ from app.core.factory_utils import (
     semantic_catalog_match,
     MATCH_THRESHOLD,
 )
+from core.logger import get_feature_key as _get_feature_key
 
 # Default guardrails attached to every assembled agent. `max_turns` and
 # `max_tool_rounds` are code-enforced in AgentRunner. The remaining keys are
@@ -3671,6 +3672,10 @@ class AgentRunner:
                 from core.time_utils import now_ist_iso as _now_ist_iso_as
                 _sent_to_kafka = produce(TOPIC_METRICS, {
                     "event":          "llm_cost",
+                    # Which platform feature spent this. Set on the request context by
+                    # core.feature_model_resolver; "" for a turn that is not a feature,
+                    # which must be stored as NULL rather than mis-attributed.
+                    "feature_key":          _get_feature_key() or None,
                     "request_id":     request_id or None,
                     "user_id":        user_id or None,
                     "agent_id":       agent_id or None,

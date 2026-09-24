@@ -189,6 +189,15 @@ def resolve_feature_model(
     Never raises.
     """
     try:
+        # Record the feature on the request/job context so the llm_cost
+        # producers can attribute spend to it without every one of the ~66
+        # migrated call sites having to pass it a second time. See
+        # core.logger.set_feature_key.
+        try:
+            from core.logger import set_feature_key
+            set_feature_key(feature_key)
+        except Exception:  # noqa: BLE001 — telemetry must not affect routing
+            pass
         return _resolve(feature_key, default, org_id, data_classification)
     except Exception as exc:  # noqa: BLE001 — routing must never break a turn
         logger.warning(

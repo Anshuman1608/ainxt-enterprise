@@ -61,6 +61,7 @@ from core.kv_cache_hoist import (
     MEMORY_INSTRUCTION as _MEMORY_INSTRUCTION,
     build_local_system_message as _build_local_system_message,
 )
+from core.logger import get_feature_key as _get_feature_key
 
 router = APIRouter(tags=["knowledge_base_ask"])
 
@@ -1093,6 +1094,10 @@ async def kb_ask_ai(
             )
             _kafka_produce("ainxt.metrics", {
                 "event":          "llm_cost",
+                # Which platform feature spent this. Set on the request context by
+                # core.feature_model_resolver; "" for a turn that is not a feature,
+                # which must be stored as NULL rather than mis-attributed.
+                "feature_key":          _get_feature_key() or None,
                 "request_id":     request_id,
                 "user_id":        _user_id,
                 "agent_id":       "orchestrator",

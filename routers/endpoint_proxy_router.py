@@ -745,6 +745,11 @@ def _finalize_billing(
                 from core.time_utils import now_ist_iso as _now_ist_iso_ep
                 _sent_to_kafka = produce(TOPIC_METRICS, {
                     "event":          "llm_cost",
+                    # No feature_key on purpose. This lane is driven by an EXTERNAL
+                    # caller choosing its own model (a managed OpenAI-compatible endpoint), not by a platform
+                    # feature, so the row must store NULL rather than inherit whatever
+                    # feature last ran on this thread. The Kafka consumer reads
+                    # rec.get("feature_key"), so omitting the key yields NULL.
                     "request_id":     request_id,
                     "user_id":        ep.get("system_user_id"),
                     "model":          model,

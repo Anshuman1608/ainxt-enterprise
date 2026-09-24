@@ -80,13 +80,6 @@ def _f(*args, **kwargs) -> FeatureSpec:
 # NOT YET ASSIGNABLE, and therefore deliberately absent — a row an admin can
 # set that has no effect is worse than no row:
 #
-#   chat.respond   The main conversational answer path routes with NO hint at
-#                  all (route() picks a tier by complexity), and the Chat UI's
-#                  own model picker supplies the hint when a user chooses one.
-#                  Threading a feature default through without overriding the
-#                  user's explicit choice is a design question, not a
-#                  one-argument substitution — it needs gateway.py's inline
-#                  `if tier ==` branches collapsed onto the router first.
 #   sdlc.patch     Its two model_hint values are PARAMETER DEFAULTS, so a
 #                  resolver call there would be evaluated once at import time
 #                  and freeze the assignment. The real callers pass
@@ -123,6 +116,13 @@ FEATURES: tuple[FeatureSpec, ...] = (
                    "short prompts."),
 
     # ── Chat ─────────────────────────────────────────────────────────────────
+    _f("chat.respond", "Chat — answer generation", "Chat",
+       "gateway",
+       description="The main conversational answer path (/ask). A user's own "
+                   "pick in the Chat model picker always wins over anything "
+                   "assigned here; this is the default for turns where they "
+                   "chose Auto.",
+       requires_tools=True, requires_streaming=True, min_context_tokens=128000),
     _f("chat.summarize", "Chat — history summarisation", "Chat",
        "memory.chat_summarizer", default_capability="local-only",
        description="Condenses older turns to keep a conversation inside the "

@@ -2443,6 +2443,11 @@ def _persist_model_usage_async(
                 _resolved_model = CLAUDE_PRIMARY_MODEL
             _sent_to_kafka = produce(TOPIC_METRICS, {
                 "event":              "llm_cost",
+                # No feature_key on purpose. This lane is driven by an EXTERNAL
+                # caller choosing its own model (the CLI / Buddy /v1/messages client), not by a platform
+                # feature, so the row must store NULL rather than inherit whatever
+                # feature last ran on this thread. The Kafka consumer reads
+                # rec.get("feature_key"), so omitting the key yields NULL.
                 "request_id":         request_id or None,
                 "user_id":            user_id or None,
                 "agent_id":           (source_channel or "CLI").lower(),
