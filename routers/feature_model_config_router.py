@@ -32,7 +32,9 @@ from sqlalchemy.orm import Session
 
 from auth.dependencies import require_admin
 from core.feature_model_resolver import env_var_for, explain, invalidate_cache
-from core.feature_registry import CAPABILITIES, FEATURES, categories, get_feature
+from core.feature_registry import (
+    CAPABILITIES, DATA_CLASSIFICATIONS, FEATURES, categories, get_feature,
+)
 from core.logger import logger
 from db.database import SessionLocal
 from db.models import FeatureModelConfig, FeatureRegistry
@@ -88,6 +90,23 @@ class AssignmentUpsert(BaseModel):
     def validate_org(cls, v: str) -> str:
         v = (v or "default").strip()
         return v or "default"
+
+
+class ClassificationUpdate(BaseModel):
+    """The highest data sensitivity a feature is permitted to process."""
+
+    max_data_classification: str
+
+    @field_validator("max_data_classification")
+    @classmethod
+    def validate_classification(cls, v: str) -> str:
+        v = (v or "").strip().upper()
+        if v not in DATA_CLASSIFICATIONS:
+            raise ValueError(
+                f"max_data_classification must be one of "
+                f"{list(DATA_CLASSIFICATIONS)}, got {v!r}."
+            )
+        return v
 
 
 # ── Serialisation ────────────────────────────────────────────────────────────
@@ -273,6 +292,76 @@ def sync_registry(
     )
     return {"added": added, "updated": updated, "orphaned": orphaned,
             "total_declared": len(declared)}
+
+
+@router.put("/{feature_key}/classification",
+            summary="Set the highest data sensitivity a feature may process")
+def set_classification(
+    feature_key: str,
+    body: ClassificationUpdate,
+    admin: dict = Depends(require_admin),
+    db: Session = Depends(_get_db),
+):
+    """Raise or lower a feature's max_data_classification.
+
+    This is the one feature_registry column an operator owns rather than the
+    code: requires_vision/requires_tools/min_context_tokens describe what the
+    CODE needs, but which data a feature is permitted to see is a policy
+    decision specific to a deployment. migrate.py Part AD1 therefore seeds it
+    once and COALESCEs on re-seed, so a value set here survives every
+    subsequent migration.
+
+    Raising it to CONFIDENTIAL or above makes the feature on-premise-only: the
+    router's privacy floor pins those turns to a local model at runtime, and
+    this endpoint refuses to leave a cloud model assigned to it — otherwise the
+    assignment would look effective while being silently overridden.
+    """
+    row = db.query(FeatureRegistry).filter_by(feature_key=feature_key).first()
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Feature '{feature_key}' is not registered.")
+
+    previous = row.max_data_classification
+    row.max_data_classification = body.max_data_classification
+
+    # If this makes the feature local-only, any cloud model already assigned to
+    # it would now be silently overridden at runtime. Surface that instead of
+    # leaving a misleading assignment in place.
+    stranded: list[str] = []
+    if body.max_data_classification in _LOCAL_ONLY_CLASSIFICATIONS:
+        from core.llm_provider_registry import get_model_by_uuid
+        for cfg in db.query(FeatureModelConfig).filter_by(feature_key=feature_key).all():
+            for pk in [cfg.model_id] + list(cfg.fallback_model_ids or []):
+                model = get_model_by_uuid(pk) if pk else None
+                if model and model["family"] != "ollama":
+                    stranded.append(f"{cfg.org_id}:{model['model_id']}")
+    if stranded:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"'{feature_key}' has cloud model(s) assigned: {stranded}. "
+                f"Setting it to {body.max_data_classification} would pin the "
+                f"feature on-premise and silently override them. Clear or "
+                f"re-point those assignments first."
+            ),
+        )
+
+    db.commit()
+    db.refresh(row)
+    invalidate_cache()
+
+    logger.info(
+        f"[feature-model-config] {feature_key} classification "
+        f"{previous} → {row.max_data_classification} by {admin.get('email', 'unknown')}"
+    )
+    return {
+        "feature": _feature_out(row),
+        "resolved": explain(
+            feature_key, default=None,
+            data_classification=row.max_data_classification,
+        ),
+    }
 
 
 @router.get("", summary="Every feature, its assignment, and what it resolves to")

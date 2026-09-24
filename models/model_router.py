@@ -834,7 +834,25 @@ _HINT_MAP = {
 # _HINT_MAP.  "anything".startswith("") is always True, so the FIRST entry
 # whose key is "" would match every model ID and route everything to that tier.
 # Strip them out now, then hard-fail so the operator knows which env var to fix.
-_HINT_MAP = {k: v for k, v in _HINT_MAP.items() if k}
+# Drop keys that cannot be a real hint. Two kinds:
+#
+#   * falsy ("") — a blank model env var, routine on a deployment configured
+#     purely through the "LLM Providers" admin screen. "anything".startswith("")
+#     is True for every string, so a blank key used to make the FIRST such entry
+#     match every model id.
+#   * keys with no alphanumeric character at all (":", "-", "/") — a stray
+#     separator left in a model env var. Found live: a deployment with
+#     `CLAUDE_HAIKU=:` in its .env put ":" in here, which both added a junk key
+#     and meant cli_model_for_tier("haiku") returned ":" as a model id to call.
+#     Such a key can only ever mis-match, never resolve correctly, so dropping
+#     it turns a silent misconfiguration into a normal unconfigured tier.
+#
+# Dropping is right rather than raising: a partially-configured deployment is a
+# normal state, and the tiers whose constants are set must keep working.
+_HINT_MAP = {
+    k: v for k, v in _HINT_MAP.items()
+    if k and any(_c.isalnum() for _c in k)
+}
 
 # The hard-fail that used to follow ("raise ValueError if any key is empty")
 # was unreachable — the comprehension above has already dropped every falsy
@@ -1269,6 +1287,21 @@ def _resolve_tier_model(env_value: str, family: str, tag: str) -> str:
     db/migrate.py's Part AC1 backfill uses), then any enabled model of that
     family, else "" (unchanged from today's blank-constant behavior).
     """
+    # A value with no alphanumeric character is not a model id — it is a stray
+    # separator left in the env var (found live: `CLAUDE_HAIKU=:` in a .env,
+    # which made every haiku/fast turn call the provider with model=":" and
+    # recorded ":" as the model in model_usages, corrupting spend attribution).
+    # Treating it as UNSET lets the registry lookup below supply a real model,
+    # which is what a blank value already did — so a typo degrades to the
+    # admin-configured default instead of being sent upstream verbatim.
+    if env_value and not any(_c.isalnum() for _c in env_value):
+        logger.warning(
+            "%s: ignoring unusable model id %r for family=%s tag=%s — no "
+            "alphanumeric character. Check the corresponding *_MODEL / "
+            "CLAUDE_HAIKU env var for a stray separator.",
+            __name__, env_value, family, tag,
+        )
+        env_value = ""
     if env_value:
         return env_value
     try:
@@ -1673,9 +1706,12 @@ class ModelRouter:
         gw, family = self._resolve_registry_gateway(provider_model)
         if gw is None:
             return self._registry_fallback(prompt, provider_model, "no gateway available", **kwargs)
+        # No separate `if breaker.is_open` pre-check: breaker.call() already
+        # fast-fails with RuntimeError before invoking fn when the circuit is
+        # OPEN, and — unlike the is_open property — it honours the
+        # CIRCUIT_BREAKER_DISABLED kill-switch. Checking is_open here as well
+        # meant an operator who set that env var still got short-circuited.
         breaker = self._registry_breaker(provider_model)
-        if breaker.is_open:
-            return self._registry_fallback(prompt, provider_model, "circuit breaker open", **kwargs)
         self._tl._last_registry_gw = gw   # thread-local — read by _propagate_tokens; avoids cross-request bleed (see class-level _tl doc)
         call_kwargs = self._filter_kwargs_for(gw.generate, kwargs)
         try:
@@ -1704,13 +1740,13 @@ class ModelRouter:
     def _try_registry_stream(self, prompt: str, provider_model: Optional[str] = None, **kwargs):
         gw, family = self._resolve_registry_gateway(provider_model)
         breaker = self._registry_breaker(provider_model)
-        if gw is None or breaker.is_open:
-            why = "no gateway available" if gw is None else "circuit breaker open"
+        if gw is None:
             logger.warning(
-                "ModelRouter: registry stream for %r unavailable (%s) → falling back",
-                provider_model, why,
+                "ModelRouter: registry stream for %r unavailable (no gateway "
+                "available) → falling back", provider_model,
             )
-            result, _ = self._registry_fallback(prompt, provider_model, why, **kwargs)
+            result, _ = self._registry_fallback(
+                prompt, provider_model, "no gateway available", **kwargs)
             yield result
             return
         self._tl._last_registry_gw = gw   # thread-local — read by _propagate_tokens; avoids cross-request bleed (see class-level _tl doc)
@@ -1720,8 +1756,14 @@ class ModelRouter:
         # cannot be retried against another model without replaying output the
         # user has already seen.
         try:
-            stream = gw.generate(prompt, model=provider_model, **call_kwargs)
-            first = next(iter(stream), None)
+            # Opening the stream and pulling the first token run through the
+            # breaker: that is where an unreachable model actually fails, and
+            # it is what makes an OPEN circuit fast-fail on this path too.
+            def _open_stream():
+                s = gw.generate(prompt, model=provider_model, **call_kwargs)
+                return s, next(iter(s), None)
+
+            stream, first = breaker.call(_open_stream)
         except Exception as e:
             logger.warning(f"ModelRouter: registry stream dispatch failed for {provider_model!r} ({family}) → {e}")
             breaker.record_failure(e)

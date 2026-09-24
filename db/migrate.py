@@ -8346,7 +8346,23 @@ def _part_ad1_feature_model_config_2026_09_24():
                             requires_tools          = EXCLUDED.requires_tools,
                             requires_streaming      = EXCLUDED.requires_streaming,
                             min_context_tokens      = EXCLUDED.min_context_tokens,
-                            max_data_classification = EXCLUDED.max_data_classification,
+                            -- NOT overwritten from code, unlike every column
+                            -- above it. The requires_*/min_context_tokens
+                            -- columns describe what the CODE needs and so must
+                            -- track the declaration; max_data_classification is
+                            -- a POLICY decision about what data a feature is
+                            -- permitted to see, which only the operator running
+                            -- the deployment can make. Re-seeding used to
+                            -- clobber it, so an operator who raised a feature
+                            -- to CONFIDENTIAL silently lost that on the next
+                            -- migrate.py run — and with it the on-premise
+                            -- pinning it was there to enforce. COALESCE keeps
+                            -- the stored value and lets the code declaration
+                            -- act only as the initial default.
+                            max_data_classification = COALESCE(
+                                feature_registry.max_data_classification,
+                                EXCLUDED.max_data_classification
+                            ),
                             updated_at              = NOW()
                     """), {
                         "feature_key":             spec.feature_key,

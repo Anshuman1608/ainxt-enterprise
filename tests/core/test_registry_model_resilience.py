@@ -66,9 +66,19 @@ class _ErrorStringGateway:
 
 @pytest.fixture
 def router(monkeypatch: pytest.MonkeyPatch) -> ModelRouter:
-    """A router with the breaker disabled and no real providers behind it."""
-    # CIRCUIT_BREAKER_DISABLED makes breaker.call() a passthrough, so these
-    # cases test the FALLBACK logic without needing Redis for breaker state.
+    """A router with the breaker disabled and no real providers behind it.
+
+    CIRCUIT_BREAKER_DISABLED makes breaker.call() a passthrough, so these cases
+    exercise the FALLBACK logic and not breaker accounting.
+
+    It also has to be set, not merely convenient: breaker state lives in REDIS,
+    keyed by breaker name, so it outlives the test process. Without this, the
+    failures these tests deliberately provoke tripped the shared
+    `registry:<model>` breaker and later tests found it already OPEN — which is
+    exactly how this suite started failing the moment it ran on a machine with
+    Redis up, having passed everywhere Redis was unavailable (is_open
+    fails open).
+    """
     monkeypatch.setenv("CIRCUIT_BREAKER_DISABLED", "1")
     r = ModelRouter()
     # No built-in providers, so the last-resort cascade has nothing to offer
@@ -227,9 +237,18 @@ def test_an_open_breaker_short_circuits_to_the_fallback(
     monkeypatch.setattr(router, "_resolve_registry_gateway",
                         lambda m: (gw, "openai_compatible"))
 
+    # A stub rather than a real OPEN breaker, so the case does not depend on
+    # Redis state shared with every other test in this file. call() is what
+    # fast-fails in production (the router no longer pre-checks is_open, so
+    # that CIRCUIT_BREAKER_DISABLED is honoured), so that is what is stubbed.
     class _OpenBreaker:
         name = "registry:x"
-        is_open = True
+
+        def call(self, fn, *a, **kw):
+            raise RuntimeError("CircuitBreaker[registry:x] is OPEN — fast-failing")
+
+        def record_failure(self, exc=None):
+            pass
 
     monkeypatch.setattr(router, "_registry_breaker", staticmethod(lambda m: _OpenBreaker()))
     monkeypatch.setattr(router, "_try_openai_coding",

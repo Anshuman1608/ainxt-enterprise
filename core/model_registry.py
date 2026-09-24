@@ -488,6 +488,21 @@ def _role_model(env_value: str, family: str, tag: str) -> str:
     No-op when env_value is already set — zero behavior change for any
     deployment that has its role env vars configured.
     """
+    # A value with no alphanumeric character is not a model id — it is a stray
+    # separator left in the env var (found live: `CLAUDE_HAIKU=:` in a .env,
+    # which made every haiku/fast turn call the provider with model=":" and
+    # recorded ":" as the model in model_usages, corrupting spend attribution).
+    # Treating it as UNSET lets the registry lookup below supply a real model,
+    # which is what a blank value already did — so a typo degrades to the
+    # admin-configured default instead of being sent upstream verbatim.
+    if env_value and not any(_c.isalnum() for _c in env_value):
+        logger.warning(
+            "%s: ignoring unusable model id %r for family=%s tag=%s — no "
+            "alphanumeric character. Check the corresponding *_MODEL / "
+            "CLAUDE_HAIKU env var for a stray separator.",
+            __name__, env_value, family, tag,
+        )
+        env_value = ""
     if env_value:
         return env_value
     try:

@@ -100,12 +100,48 @@ def test_no_legacy_hint_was_dropped() -> None:
     assert not missing, f"capability work removed live hint keys: {missing}"
 
 
+# _HINT_MAP also contains keys built from the role-model env constants, so that
+# an env-configured model id routes to the right tier. Their VALUES depend on
+# the deployment's .env, so they cannot be snapshotted — they are excluded by
+# identity here rather than by assuming they are blank. (They were blank in the
+# environment this suite was first written in, which made the earlier version of
+# the test below pass for the wrong reason and then fail the moment it ran
+# against a configured deployment.)
+_ENV_MODEL_CONSTANTS = (
+    "OPENAI_SIMPLE_MODEL", "OPENAI_CODING_MODEL", "OPENAI_LATEST_MODEL",
+    "CLAUDE_PRIMARY_MODEL", "CLAUDE_HAIKU", "GEMINI_VISION_MODEL",
+    "GEMINI_TEXT_MODEL", "GEMINI_CODING_LITE_MODEL", "GEMINI_IMAGE_MODEL",
+    "CLAUDE_OPUS_MODEL", "CLAUDE_OPUS_48_MODEL", "CLAUDE_OPUS_5_MODEL",
+    "CLAUDE_SONNET_5_MODEL", "OPENAI_TERA_MODEL", "OPENAI_LUNA_MODEL",
+    "OPENAI_OSS_MODEL",
+)
+
+
+def _env_derived_keys() -> set[str]:
+    return {v for v in (getattr(mr, n, "") for n in _ENV_MODEL_CONSTANTS) if v}
+
+
 def test_the_only_new_keys_are_the_capability_names() -> None:
-    # Guards against an unrelated hint sneaking in under this banner. Env-var
-    # keys are blank (and so stripped) in a bare test env, hence the filter.
-    static_keys = {k for k in mr._HINT_MAP if k}
+    # Guards against an unrelated hint sneaking in under this banner.
+    static_keys = {k for k in mr._HINT_MAP if k} - _env_derived_keys()
     unexpected = static_keys - set(_LEGACY_HINT_TIERS) - set(_CAPABILITY_TIERS)
     assert not unexpected, f"unexpected new _HINT_MAP keys: {sorted(unexpected)}"
+
+
+def test_no_hint_key_is_unusable_as_a_model_id() -> None:
+    """A key with no alphanumeric character can only ever mis-match.
+
+    Found live: a deployment with `CLAUDE_HAIKU=:` in its .env put the key ":"
+    into _HINT_MAP, and would have dispatched every haiku/fast turn to Anthropic
+    with model=":". The falsy-key guard strips "" but not ":" or "-", so
+    model_router now drops any key that contains no alphanumeric character —
+    see the guard next to _HINT_MAP.
+    """
+    junk = sorted(k for k in mr._HINT_MAP if not any(c.isalnum() for c in k))
+    assert not junk, (
+        f"_HINT_MAP contains key(s) that cannot be a model id or tier: {junk}. "
+        f"Check the *_MODEL / CLAUDE_HAIKU env vars for a stray separator."
+    )
 
 
 # ── the new vocabulary ───────────────────────────────────────────────────────
@@ -246,3 +282,45 @@ def test_fast_and_balanced_keep_their_shadowed_tiers_env_override(
     assert offline_registry.cli_model_for_tier("haiku") == "my-own-cheap-model"
     assert offline_registry.cli_model_for_tier("balanced") == "my-own-workhorse"
     assert offline_registry.cli_model_for_tier("complex") == "my-own-workhorse"
+
+# ── unusable env values must never reach a provider ──────────────────────────
+
+@pytest.mark.parametrize("junk", [":", "-", "/", "::", " : ", ".", "_"])
+def test_an_unusable_model_env_value_is_treated_as_unset(
+    junk: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stray separator in a *_MODEL env var must not be sent as a model id.
+
+    Found on a live deployment: `CLAUDE_HAIKU=:` in .env. The blank-value
+    fallback in these resolvers only triggers on "", so ":" was returned
+    verbatim as a model id — every haiku/fast turn called the provider with
+    model=":" and model_usages recorded ":" as the model, corrupting spend
+    attribution. Both resolvers now treat such a value as unset, so it
+    degrades to the admin-configured registry model exactly as "" already did.
+
+    Both are patched because core/model_registry.py cannot import
+    models/model_router.py (that import is circular), so the same resolution
+    chain is deliberately duplicated in the two modules.
+    """
+    import core.llm_provider_registry as reg
+    import core.model_registry as cmr
+    import models.model_router as mr
+
+    rows = [{"model_id": "real-model", "family": "anthropic", "capabilities": {}}]
+    monkeypatch.setattr(reg, "get_enabled_models", lambda *a, **k: rows)
+
+    assert cmr._role_model(junk, "anthropic", "haiku") == "real-model"
+    assert mr._resolve_tier_model(junk, "anthropic", "haiku") == "real-model"
+
+
+def test_a_real_model_id_is_still_returned_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The guard must not touch a configured deployment: any value with an
+    # alphanumeric character is a model id and is passed through untouched.
+    import core.model_registry as cmr
+    import models.model_router as mr
+
+    for good in ("claude-haiku-4-5", "gpt-5-mini", "o3", "accounts/f/models/llama-3"):
+        assert cmr._role_model(good, "anthropic", "haiku") == good
+        assert mr._resolve_tier_model(good, "anthropic", "haiku") == good
