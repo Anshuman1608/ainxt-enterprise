@@ -1587,32 +1587,154 @@ class ModelRouter:
             return kwargs
         return {k: v for k, v in kwargs.items() if k in params}
 
+    @staticmethod
+    def _registry_breaker(provider_model: Optional[str]):
+        """Circuit breaker for ONE admin-registered model.
+
+        Keyed per model, not per family, because an admin-added model is its own
+        failure domain: one dead OpenRouter deployment must not open the breaker
+        for every other openai_compatible model, and a flapping in-house
+        endpoint must not affect the built-in "openai"/"claude" breakers.
+
+        core.circuit_breaker.get_breaker() already accepts an arbitrary name and
+        falls back to (10, 30) for anything not in _BREAKER_DEFAULTS, so this
+        needs no change there — the gap was only that this path never called it.
+        Thresholds match the built-in cloud providers (5 failures / 60s).
+        """
+        return get_breaker(f"registry:{provider_model}", failure_threshold=5, recovery_timeout=60)
+
+    def _registry_fallback(self, prompt: str, provider_model: Optional[str], why: str,
+                           **kwargs) -> tuple[str, bool]:
+        """Cross-vendor fallback for a failed admin-registered model.
+
+        Until this existed, TIER_REGISTRY was the ONE tier with no fallback and
+        no breaker: an admin-added model that failed simply returned an error
+        string to the user, while every built-in tier cascaded across vendors.
+        That made each per-feature assignment onto an admin-added model a new
+        single point of failure — the exact risk that made assignment unsafe to
+        ship widely.
+
+        Two stages, both marked as fallbacks so the UI shows "[fallback]" and
+        the turn is attributed honestly:
+
+          1. The admin's own global default model from the LLM Providers
+             screen, when it is a different model from the one that just
+             failed. This respects the operator's stated preference before any
+             built-in assumption.
+          2. TIER_MEDIUM, whose own chain is openai -> claude -> local. It is
+             the most resilient built-in cascade, so it is the right last
+             resort regardless of which families are configured.
+
+        NOTE this is the RUNTIME failure path. A feature's declared
+        fallback_model_ids are walked earlier, at resolution time, by
+        core/feature_model_resolver — that covers "the assigned model was
+        deleted or its provider disabled", which is a different failure.
+        """
+        try:
+            from core.llm_provider_registry import get_default_model_id
+            default_model = get_default_model_id()
+        except Exception:
+            default_model = None
+
+        if default_model and default_model != provider_model:
+            logger.warning(
+                "ModelRouter: registry model %r failed (%s) → falling back to the "
+                "configured default model %r", provider_model, why, default_model,
+            )
+            gw, _fam = self._resolve_registry_gateway(default_model)
+            if gw is not None:
+                try:
+                    call_kwargs = self._filter_kwargs_for(gw.generate, kwargs)
+                    _fb_breaker = self._registry_breaker(default_model)
+                    result = _fb_breaker.call(
+                        lambda: self._collect(
+                            gw.generate(prompt, model=default_model, **call_kwargs)
+                        )
+                    )
+                    if not result.startswith("Error"):
+                        self.last_model_label = f"{default_model} [fallback]"
+                        self._last_actual_tier = TIER_REGISTRY
+                        return result, True
+                except Exception as exc:
+                    logger.warning(
+                        "ModelRouter: default-model fallback %r also failed → %s",
+                        default_model, exc,
+                    )
+
+        logger.warning(
+            "ModelRouter: registry model %r unavailable (%s) → falling back to the "
+            "built-in medium tier cascade (openai → claude → local)",
+            provider_model, why,
+        )
+        result, _ = self._try_openai_coding(prompt, **kwargs)
+        return result, True
+
     def _try_registry(self, prompt: str, provider_model: Optional[str] = None, **kwargs) -> tuple[str, bool]:
         gw, family = self._resolve_registry_gateway(provider_model)
         if gw is None:
-            return f"Error: no gateway available for registry model {provider_model!r}", False
+            return self._registry_fallback(prompt, provider_model, "no gateway available", **kwargs)
+        breaker = self._registry_breaker(provider_model)
+        if breaker.is_open:
+            return self._registry_fallback(prompt, provider_model, "circuit breaker open", **kwargs)
         self._tl._last_registry_gw = gw   # thread-local — read by _propagate_tokens; avoids cross-request bleed (see class-level _tl doc)
         call_kwargs = self._filter_kwargs_for(gw.generate, kwargs)
         try:
-            result = self._collect(gw.generate(prompt, model=provider_model, **call_kwargs))
+            # The COLLECTION runs inside breaker.call, not just the generate()
+            # call. Every gateway's generate() returns a lazy generator, so
+            # breaker.call(gw.generate, ...) alone would record a success the
+            # instant the generator object was constructed and never see the
+            # failure that happens while it is consumed.
+            result = breaker.call(
+                lambda: self._collect(gw.generate(prompt, model=provider_model, **call_kwargs))
+            )
+            if result.startswith("Error"):
+                # Gateways signal failure by RETURNING an error string rather
+                # than raising (see the interface-drift row in the architecture
+                # audit §3.8), so the breaker cannot see it. Record it
+                # explicitly, or a persistently broken model never trips.
+                breaker.record_failure(RuntimeError(result[:200]))
+                return self._registry_fallback(prompt, provider_model, result[:120], **kwargs)
             self.last_model_label = f"{provider_model}"
             self._last_actual_tier = TIER_REGISTRY
             return result, False
         except Exception as e:
             logger.warning(f"ModelRouter: registry dispatch failed for {provider_model!r} ({family}) → {e}")
-            return f"Error: {provider_model} call failed ({e})", False
+            return self._registry_fallback(prompt, provider_model, str(e), **kwargs)
 
     def _try_registry_stream(self, prompt: str, provider_model: Optional[str] = None, **kwargs):
         gw, family = self._resolve_registry_gateway(provider_model)
-        if gw is None:
-            yield f"Error: no gateway available for registry model {provider_model!r}"
+        breaker = self._registry_breaker(provider_model)
+        if gw is None or breaker.is_open:
+            why = "no gateway available" if gw is None else "circuit breaker open"
+            logger.warning(
+                "ModelRouter: registry stream for %r unavailable (%s) → falling back",
+                provider_model, why,
+            )
+            result, _ = self._registry_fallback(prompt, provider_model, why, **kwargs)
+            yield result
             return
         self._tl._last_registry_gw = gw   # thread-local — read by _propagate_tokens; avoids cross-request bleed (see class-level _tl doc)
         call_kwargs = self._filter_kwargs_for(gw.generate, kwargs)
+        # Only the FIRST token is produced under the breaker's accounting: once
+        # tokens are flowing the turn is committed, and a mid-stream failure
+        # cannot be retried against another model without replaying output the
+        # user has already seen.
         try:
-            yield from gw.generate(prompt, model=provider_model, **call_kwargs)
+            stream = gw.generate(prompt, model=provider_model, **call_kwargs)
+            first = next(iter(stream), None)
         except Exception as e:
             logger.warning(f"ModelRouter: registry stream dispatch failed for {provider_model!r} ({family}) → {e}")
+            breaker.record_failure(e)
+            result, _ = self._registry_fallback(prompt, provider_model, str(e), **kwargs)
+            yield result
+            return
+        if first is not None:
+            yield first
+        try:
+            yield from stream
+        except Exception as e:
+            # Mid-stream: report, but do not restart on another model.
+            logger.warning(f"ModelRouter: registry stream broke mid-turn for {provider_model!r} → {e}")
             yield f"Error: {provider_model} call failed ({e})"
 
     # --------------------------------------------------------
