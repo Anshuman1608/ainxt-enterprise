@@ -37,57 +37,29 @@ _ENDPOINT_PROXY_RE = re.compile(
     r"^/[a-z0-9][a-z0-9\-]{2,49}/v1/(chat/completions|models)$"
 )
 
-# Empty/auto/default values are treated as cloud-routing (safe conservative
-# default) — the router may resolve any of them to a paid model.
-_AUTO_HINTS = frozenset({"", "auto", "default"})
-
-
 def _is_inhouse_model(hint: str) -> bool:
     """
     Return True only if 'hint' is a known in-house model, which is exempt from
     budget enforcement because it carries no external API cost.
 
-    This used to be a seven-entry cloud-prefix deny-list
-    ("gpt-", "claude-", "gemini-", "openai/", "anthropic/", "google/",
-    "azure/") with the rule "not one of these ⇒ in-house ⇒ free". That inverts
-    the safe default: every model an admin registers through the
-    openai_compatible family whose id starts with none of those prefixes was
-    declared free and skipped budget enforcement entirely — including genuinely
-    paid models like "mistralai/mixtral-8x7b-instruct",
-    "meta-llama/llama-3.1-70b-instruct", "deepseek-chat", "o3-mini", any
-    Bedrock "us.anthropic.*" id, any Vertex "...@20240620" id, and every
-    OpenRouter "vendor/model" id outside that list. Tier hints the router
-    accepts ("complex", "haiku", "medium", ...) were exempted too.
-
-    services.endpoint_model_catalog.classify_model is allowlist-based and
-    fails closed — it returns "unknown" for anything it cannot place, and
-    "unknown" != "local", so an unrecognised model is now budget-CHECKED
-    rather than waved through.
-
-    The import is deliberately lazy: this middleware runs on every request
-    before auth, and endpoint_model_catalog pulls in gateway_local_llm plus the
-    provider registry (Redis/Postgres). Same reason store.budget_store is
-    imported lazily in dispatch() below.
+    Delegates to services.endpoint_model_catalog.is_budget_exempt — the single
+    implementation shared with gateway.py, workers/chat_worker.py and
+    routers/ide_router.py, which all carried their own byte-identical (and
+    identically wrong) copy of a cloud-prefix deny-list. See that function for
+    what was wrong with it and why classify_model fails closed instead.
     """
-    h = (hint or "").strip()
-    if not h or h.lower() in _AUTO_HINTS:
-        return False   # empty/auto might route to a cloud model — check budget
     try:
-        from services.endpoint_model_catalog import classify_model
-        # Pass the id with its original case. Both halves of classify_model
-        # match exactly against a catalogue (the cloud registry, and the live
-        # LiteLLM list), and real in-house ids carry capitals — "gemma-4-31B-it",
-        # "qwen-3.6-35B-A3B". Lower-casing first made those miss the local
-        # catalogue and fall through to "unknown", which would newly enforce a
-        # budget on a genuinely free in-house model.
-        return classify_model(h) == "local"
+        from services.endpoint_model_catalog import is_budget_exempt
+        return is_budget_exempt(hint)
     except Exception as exc:  # noqa: BLE001 — never break a request over this
-        # Both the import and the call are guarded: the catalog reaches Redis
-        # and Postgres, so an outage must not decide billing policy. Returning
-        # False means "not in-house", i.e. enforce the budget — the safe side.
+        # The import itself is guarded too: this middleware runs on every
+        # request before auth, and endpoint_model_catalog pulls in
+        # gateway_local_llm plus the provider registry (Redis/Postgres). An
+        # outage must not decide billing policy, so False here means "not
+        # in-house", i.e. enforce the budget — the safe side.
         logger.warning(
-            "BudgetMiddleware: model classification failed for %r (%s) — enforcing budget",
-            h, exc,
+            "BudgetMiddleware: model classification unavailable for %r (%s) — enforcing budget",
+            hint, exc,
         )
         return False
 

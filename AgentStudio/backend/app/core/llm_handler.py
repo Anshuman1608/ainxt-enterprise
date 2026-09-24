@@ -651,8 +651,14 @@ class OpenAIClient(BaseLLMClient):
         # the kwarg is opaquely passed through here.
         if response_format:
             kwargs["response_format"] = response_format
-        if not any(marker in (self._model or "").lower() for marker in ("local", "llama", "ollama")):
-            kwargs["stream_options"] = {"include_usage": True}
+        # A "don't send stream_options to local gateways" guard used to sit here,
+        # keyed on "local"/"llama"/"ollama" appearing in the model name. It was
+        # dead code: the kwargs dict above already sets stream_options
+        # unconditionally, so this could only re-set a value that was always
+        # present — local models received it either way. The dict's own comment
+        # explains why that is fine (LiteLLM either honours the kwarg or ignores
+        # it silently). Removed rather than made to work, because the name-based
+        # test was also wrong for every admin-registered model.
 
         # ── Observability: what are we sending to the LLM? ──
         # One compact line so operators can trace the request in agent.log:

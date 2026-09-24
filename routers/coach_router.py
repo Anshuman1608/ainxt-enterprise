@@ -64,12 +64,29 @@ def _iso(ts) -> Optional[str]:
 
 
 def _is_local_model(name: Optional[str]) -> bool:
+    """True for in-house models, which are cost-exempt (see _out_cost below).
+
+    Delegates to services.endpoint_model_catalog, which asks the live LiteLLM
+    catalogue and the provider registry rather than looking for
+    "kimi"/"glm-"/"qwen"/"llama" in the name. That word list was one of eight
+    such lists in the codebase, no two of them agreeing: it recognised
+    "kimi-k2.6" but not "gemma-4-31B-it" or "deepseek-v4-flash", and would call
+    an admin-registered "llama-3.1-70b-instruct" served from a PAID endpoint
+    free.
+
+    The catalogue keeps the display-label forms this function has always had to
+    handle ("Local (In-house) (Kimi-k2.5)", "local:glm-5.2") working, via its
+    own "local" substring marker.
+    """
     if not name:
         return False
-    n = name.lower()
-    return (n == "local" or n.startswith("local (") or "local-llm" in n
-            or "ollama" in n or "in-house" in n or "kimi" in n
-            or "glm-" in n or "qwen" in n or "llama" in n)
+    try:
+        from services.endpoint_model_catalog import is_local_model
+        return is_local_model(name)
+    except Exception:  # noqa: BLE001 — cost reporting must not break a request
+        # Fail towards "not local", so an unpriceable model over-reports rather
+        # than silently reporting zero cost.
+        return False
 
 
 def _is_block_marker(name: Optional[str]) -> bool:

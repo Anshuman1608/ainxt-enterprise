@@ -5410,13 +5410,11 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
     # API cost and are always allowed through.
     # Auto/empty model hints may route to cloud — check budget.
     # ========================================================
-    _CLOUD_PFX = ("gpt-", "claude-", "gemini-", "openai/", "anthropic/", "google/", "azure/")
-    _req_model_hint = (q.model or "").lower().strip()
-    _req_is_inhouse = (
-            bool(_req_model_hint)
-            and _req_model_hint not in ("auto", "default")
-            and not any(_req_model_hint.startswith(p) for p in _CLOUD_PFX)
-    )
+    # See services.endpoint_model_catalog.is_budget_exempt: this was a local
+    # copy of a cloud-prefix deny-list that declared every paid
+    # admin-registered model outside those prefixes free and exempt.
+    from services.endpoint_model_catalog import is_budget_exempt as _req_exempt
+    _req_is_inhouse = _req_exempt(q.model)
     if not _req_is_inhouse:
         try:
             from store.budget_store import check_budget as _chk_budget
@@ -10940,15 +10938,12 @@ def openai_chat_completions(
     set_span_id(_span_tag)
 
     # ── Budget gate — cloud API models only; in-house models always pass through ──
-    # In-house = any explicitly named model that doesn't start with a known cloud prefix.
-    # Auto/empty model hints are treated as potentially cloud-bound — check budget.
-    _CLOUD_IDE_PFX = ("gpt-", "claude-", "gemini-", "openai/", "anthropic/", "google/", "azure/")
-    _ide_model_hint = (req.model or "").lower().strip()
-    _ide_is_inhouse = (
-        bool(_ide_model_hint)
-        and _ide_model_hint not in ("auto", "default")
-        and not any(_ide_model_hint.startswith(p) for p in _CLOUD_IDE_PFX)
-    )
+    # See services.endpoint_model_catalog.is_budget_exempt: this was a local
+    # copy of a cloud-prefix deny-list that declared every paid
+    # admin-registered model outside those prefixes free and exempt. Auto/empty
+    # hints may still route to cloud, so they are never exempt.
+    from services.endpoint_model_catalog import is_budget_exempt as _ide_exempt
+    _ide_is_inhouse = _ide_exempt(req.model)
     # Raw last user message for Coach (used if the request is blocked before
     # the cleaned last_user is computed below).
     _ide_raw_last_user = ""

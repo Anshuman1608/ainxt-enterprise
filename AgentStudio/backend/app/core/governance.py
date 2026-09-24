@@ -193,6 +193,20 @@ def _is_local_model(model_name: str) -> bool:
     if bare in catalogue:
         logger.debug(f"[AGENT] _is_local_model: model={model_name!r} found in local catalogue → True")
         return True
+    # The platform-wide catalogue, which also covers models an admin registered
+    # under the ``ollama`` family through the "LLM Providers" screen. Those
+    # carry neither a ``local:`` prefix nor any of the substrings below, so
+    # without this they fell through to the heuristic and were billed as cloud.
+    try:
+        from services.endpoint_model_catalog import is_local_model as _shared_is_local
+        if _shared_is_local(model_name):
+            logger.debug(
+                f"[AGENT] _is_local_model: model={model_name!r} local per the "
+                f"shared provider registry → True"
+            )
+            return True
+    except Exception as _exc:
+        logger.debug(f"[AGENT] _is_local_model: shared catalogue unavailable ({_exc})")
     # Fallback name heuristic for common local families.
     heuristic = (
         "local" in bare

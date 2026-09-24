@@ -4,7 +4,13 @@
 #
 # "Approved for tracking" = union of:
 #   (1) every model id present in core.model_registry env defaults
-#   (2) every model id observed in ainxt.model_usages in the trailing N days
+#   (2) every model id an admin registered in llm_models ("LLM Providers")
+#   (3) every model id observed in ainxt.model_usages in the trailing N days
+#
+# (2) was added because (1) and (3) between them leave an admin-registered
+# model unattributed ('other') until it has organically accumulated 90 days of
+# usage — exactly the window in which a new per-feature assignment needs cost
+# data.
 #
 # Anything outside this union is bucketed as 'other' when persisting
 # llm_spend_daily rows. This deliberately does NOT consult
@@ -286,13 +292,57 @@ _cache_value: "ApprovedModels | None" = None
 _cache_expires_at: float = 0.0
 
 
+def _from_provider_registry() -> ApprovedModels:
+    """Models an admin registered through the "LLM Providers" screen.
+
+    Without this, the allowlist was the union of (1) env-resolved constants in
+    core.model_registry and (2) ids observed in model_usages over a trailing
+    90 days. An admin-registered model is in neither on the day it is
+    assigned, so its spend was bucketed as 'other' in llm_spend_daily until it
+    had organically accumulated usage — the first weeks on a newly assigned
+    model were unattributed, which is precisely the period a per-feature
+    assignment most needs cost data for.
+
+    llm_models is the authoritative catalogue and is what the admin screen
+    writes, so it belongs in the union as a first-class source.
+    """
+    approved = ApprovedModels()
+    try:
+        from core.llm_provider_registry import get_enabled_models
+        rows = get_enabled_models()
+    except Exception as e:
+        logger.warning(f"[llm_spend.approved_models] provider registry read failed: {e}")
+        return approved
+
+    # family -> bucket. ollama is in-house and carries no external spend, so it
+    # is not tracked here at all. openai_compatible speaks the OpenAI contract
+    # and is billed through whatever endpoint the provider row names, so it is
+    # bucketed with openai rather than dropped — otherwise every OpenRouter /
+    # Together / vLLM model would land in 'other'.
+    _BUCKETS = {
+        "anthropic": "anthropic",
+        "openai": "openai",
+        "openai_compatible": "openai",
+        "gemini": "gemini",
+    }
+    for row in rows:
+        bucket = _BUCKETS.get((row.get("family") or "").strip().lower())
+        if not bucket:
+            continue
+        canon = _normalise(row.get("model_id") or "")
+        if canon:
+            getattr(approved, bucket).add(canon)
+    return approved
+
+
 def _build_approved_models() -> ApprovedModels:
     reg = _from_registry()
+    prov = _from_provider_registry()
     obs = _from_usage_table()
     return ApprovedModels(
-        openai    = reg.openai    | obs.openai,
-        anthropic = reg.anthropic | obs.anthropic,
-        gemini    = reg.gemini    | obs.gemini,
+        openai    = reg.openai    | prov.openai    | obs.openai,
+        anthropic = reg.anthropic | prov.anthropic | obs.anthropic,
+        gemini    = reg.gemini    | prov.gemini    | obs.gemini,
     )
 
 

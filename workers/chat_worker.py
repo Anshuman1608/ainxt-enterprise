@@ -1437,13 +1437,13 @@ def _run_pipeline(payload: dict, stream_key: str) -> None:
     # Gateway already checked this, but workers run async and could race
     # with rapid requests.  In-house models (on-prem GPU, routed via
     # LiteLLM) carry no external API cost and are always exempt.
-    _CLOUD_W_PFX = ("gpt-", "claude-", "gemini-", "openai/", "anthropic/", "google/", "azure/")
-    _w_hint = (model_hint or "").lower().strip()
-    _w_is_inhouse = (
-            bool(_w_hint)
-            and _w_hint not in ("auto", "default")
-            and not any(_w_hint.startswith(p) for p in _CLOUD_W_PFX)
-    )
+    # Was a local copy of a seven-entry cloud-prefix deny-list, so any paid
+    # admin-registered model outside those prefixes was declared in-house and
+    # skipped this gate entirely. Now delegates to the registry-backed,
+    # fail-closed helper shared with BudgetMiddleware, gateway.py and
+    # routers/ide_router.py.
+    from services.endpoint_model_catalog import is_budget_exempt as _w_exempt
+    _w_is_inhouse = _w_exempt(model_hint)
     if not _w_is_inhouse and user_id and user_id != "default":
         try:
             from store.budget_store import check_budget as _w_chk_budget

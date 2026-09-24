@@ -2247,15 +2247,28 @@ class KeyTypeMapping(Base):
 # read from llm_spend_daily. Digest jobs verify freshness via
 # llm_spend_fetch_runs before sending.
 #
-# Schema migration: db/sql/prod_catchup_2026_06_17_llm_spend.sql
+# Schema: db/migrate.py Part AD2. This block previously pointed at
+# db/sql/prod_catchup_2026_06_17_llm_spend.sql, which is not in this repo — so
+# the table had NO reproducible DDL and a fresh install got whatever
+# create_all() inferred from the class below. That mattered, because the class
+# and the live writer disagreed: `token_type` is in
+# services/llm_spend/fetchers/_common._UPSERT_SQL and in its five-column
+# ON CONFLICT target, but was absent here, so create_all() produced a
+# FOUR-column uq_llm_spend_daily and every upsert failed with "no unique or
+# exclusion constraint matching the ON CONFLICT specification".
 # ============================================================
 
 class LLMSpendDaily(Base):
-    """One row per (usage_date, provider, model, source).
+    """One row per (usage_date, provider, model, source, token_type).
 
     `source` distinguishes future fanout (e.g. Vertex vs AI Studio for
     Gemini) so the UPSERT key stays stable; report queries SUM across
     sources naturally via GROUP BY (provider, model).
+
+    `token_type` splits a day's spend by how the tokens were billed — uncached
+    input, cache read, 5-minute and 1-hour cache writes, output, and non-token
+    cost (see services/llm_spend/fetchers/_common.py's TOKEN_TYPE_* constants).
+    'blended' is the pre-itemisation value for historical rows.
     """
 
     __tablename__ = "llm_spend_daily"
@@ -2264,6 +2277,9 @@ class LLMSpendDaily(Base):
     usage_date    = Column(DateTime,   nullable=False, index=True)   # PG DATE; SQLAlchemy DateTime is fine
     provider      = Column(String(20), nullable=False)               # 'openai' | 'anthropic' | 'gemini'
     model         = Column(String(120), nullable=False)              # canonical model id or 'other'
+    # Part of the UPSERT key, so it must never be NULL — 'blended' is the
+    # default for a row whose source cannot itemise by token type.
+    token_type    = Column(String(20), nullable=False, default="blended")
     cost_usd      = Column(Numeric(14, 6), nullable=False, default=0)
     input_tokens  = Column(BigInteger, nullable=False, default=0)
     output_tokens = Column(BigInteger, nullable=False, default=0)
@@ -2272,8 +2288,9 @@ class LLMSpendDaily(Base):
     fetched_at    = Column(DateTime,   nullable=False, default=_now)
 
     __table_args__ = (
+        # Five columns, matching _UPSERT_SQL's ON CONFLICT target exactly.
         UniqueConstraint(
-            "usage_date", "provider", "model", "source",
+            "usage_date", "provider", "model", "source", "token_type",
             name="uq_llm_spend_daily",
         ),
         Index("idx_llm_spend_daily_provider_model", "provider", "model", "usage_date"),

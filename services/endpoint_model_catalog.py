@@ -185,6 +185,61 @@ def provider_of(model: str) -> str:
     return "unknown"
 
 
+# Hints that carry no model choice yet. They may still resolve to a paid cloud
+# model, so they are never budget-exempt.
+_AUTO_HINTS = frozenset({"", "auto", "default"})
+
+
+def is_budget_exempt(hint: str) -> bool:
+    """True only when `hint` names a known in-house model, which costs nothing.
+
+    THE one predicate for "skip the budget check". Five call paths each had
+    their own copy of this, all byte-identical and all wrong the same way:
+
+        _CLOUD_PREFIXES = ("gpt-", "claude-", "gemini-", "openai/",
+                           "anthropic/", "google/", "azure/")
+        in_house = hint and hint not in ("auto","default") \\
+                   and not any(hint.startswith(p) for p in _CLOUD_PREFIXES)
+
+    (middleware/budget_middleware.py, workers/chat_worker.py, gateway.py twice,
+    routers/ide_router.py — plus a sixth, DIVERGENT variant in
+    routers/messages_compat_router.py that is a normalisation allowlist, not a
+    billing gate, and is deliberately left alone.)
+
+    "Not one of seven known cloud prefixes therefore free" inverts the safe
+    default. Every model an admin registers through the openai_compatible
+    family whose id starts with none of those prefixes was declared free and
+    skipped budget enforcement entirely — including paid models like
+    mistralai/mixtral-8x7b-instruct, meta-llama/llama-3.1-70b-instruct,
+    deepseek-chat, o3-mini, any Bedrock us.anthropic.* id, any Vertex
+    ...@20240620 id, and every OpenRouter vendor/model id outside the list.
+    Router tier hints ("complex", "haiku", "medium") were exempted too.
+
+    classify_model() is allowlist-based and fails closed: anything it cannot
+    place is "unknown", and "unknown" != "local", so an unrecognised model is
+    budget-CHECKED rather than waved through.
+
+    Case is preserved on purpose. Both halves of classify_model match exactly
+    against a catalogue, and real in-house ids carry capitals
+    ("gemma-4-31B-it", "qwen-3.6-35B-A3B"); lower-casing first made those miss
+    the local catalogue and fall through to "unknown", which would newly bill a
+    genuinely free in-house model.
+
+    Never raises: on any failure it returns False, i.e. enforce the budget.
+    """
+    h = (hint or "").strip()
+    if not h or h.lower() in _AUTO_HINTS:
+        return False
+    try:
+        return classify_model(h) == "local"
+    except Exception as exc:  # noqa: BLE001 — an outage must not decide billing
+        logger.warning(
+            "endpoint_catalog: budget classification failed for %r (%s) — enforcing budget",
+            h, exc,
+        )
+        return False
+
+
 def family_of(model: str) -> str:
     """
     'anthropic' | 'openai' | 'gemini' | 'openai_compatible' | 'local' | 'unknown'

@@ -311,13 +311,11 @@ async def ide_chat(body: IDEChat, request: Request, _u: dict = Depends(_require_
     # budget-exempt here as well as in BudgetMiddleware.
     # _budget_uid: prefer sub (UUID) → email. Both JWT and API key payloads put
     # the user UUID in "sub". "id" does not exist in either payload shape.
-    _CLOUD_IDE_ROUTER_PFX = ("gpt-", "claude-", "gemini-", "openai/", "anthropic/", "google/", "azure/")
-    _ide_router_model = (body.model or "").lower().strip()
-    _ide_router_is_inhouse = (
-        bool(_ide_router_model)
-        and _ide_router_model not in ("auto", "default")
-        and not any(_ide_router_model.startswith(p) for p in _CLOUD_IDE_ROUTER_PFX)
-    )
+    # See services.endpoint_model_catalog.is_budget_exempt: this was a local
+    # copy of a cloud-prefix deny-list that declared every paid
+    # admin-registered model outside those prefixes free and exempt.
+    from services.endpoint_model_catalog import is_budget_exempt as _ide_exempt
+    _ide_router_is_inhouse = _ide_exempt(body.model)
     _budget_uid = _u.get("sub") or _u.get("email") or ""
     if _budget_uid and not _ide_router_is_inhouse:
         try:

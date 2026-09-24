@@ -29,19 +29,25 @@ from typing import Any, Dict, List, Optional
 from core.logger import logger
 from core.config import REDIS_HOST as _REDIS_HOST, REDIS_PORT as _REDIS_PORT
 from agents.compliance_engine import compliance_engine
-from core.model_registry import MODEL_COST_PER_1M as _MODEL_COST_PER_1M
 from core.feature_model_resolver import resolve_feature_model
 
 
 # ── Cost estimator (mirrors gateway.py _estimate_cost) ───────────────────────
 
 def _estimate_usage_cost(model: str, in_tok: int, out_tok: int) -> float:
-    """Cost in USD using MODEL_COST_PER_1M (per-1M rates)."""
-    _m = (model or "").lower()
-    if "local" in _m or "ollama" in _m or "llama" in _m:
-        return 0.0
-    in_rate, out_rate = _MODEL_COST_PER_1M.get(model, (2.00, 8.00))
-    return round((in_tok * in_rate + out_tok * out_rate) / 1_000_000, 8)
+    """Cost in USD, delegated to the shared registry-backed estimator.
+
+    Was an "is 'local'/'ollama'/'llama' a substring of the name" free-model
+    test, one of eight such heuristics in the codebase, each with a different
+    word list and therefore a different answer for the same model. This one
+    priced "gemma-4-31B-it" and "kimi-k2.6" — both genuinely in-house and free
+    — at the conservative unknown-cloud rate, and would price an
+    admin-registered "llama-3.1-70b-instruct" served from a PAID endpoint at
+    zero. endpoint_model_catalog asks the live local catalogue and the provider
+    registry instead of parsing the name.
+    """
+    from services.endpoint_model_catalog import estimate_cost_usd
+    return round(float(estimate_cost_usd(model, in_tok, out_tok)), 8)
 
 
 # ============================================================

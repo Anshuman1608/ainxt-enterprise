@@ -1349,6 +1349,9 @@ CREATE INDEX IF NOT EXISTS idx_sec_scan_scanned_at ON security_scan_results(scan
     # ── Part AD1: 2026-09-24 — feature → model assignment + feature_key telemetry
     _part_ad1_feature_model_config_2026_09_24()
 
+    # ── Part AD2: 2026-09-24 — llm_spend_daily reproducible DDL + token_type ──
+    _part_ad2_llm_spend_daily_schema_2026_09_24()
+
     # ── OSS schema-drift fixes ───────────────────────────────────────────────
     # (_part_oss3 runs at the top of this function — the catalogue seeds need it.)
     _part_oss4_model_permissions_web_search()
@@ -8367,6 +8370,79 @@ def _part_ad1_feature_model_config_2026_09_24():
     # then falls through), so there is nothing to backfill or repair here.
 
 
+def _part_ad2_llm_spend_daily_schema_2026_09_24():
+    """
+    2026-09-24 — llm_spend_daily: reproducible DDL + the token_type key column.
+
+    This table had NO DDL anywhere in this file. db/models.py pointed at
+    db/sql/prod_catchup_2026_06_17_llm_spend.sql, which is not in the repo, so
+    a fresh install got whatever create_all() inferred from the ORM class —
+    and the class disagreed with the live writer:
+    services/llm_spend/fetchers/_common._UPSERT_SQL targets
+    ON CONFLICT (usage_date, provider, model, source, token_type), a FIVE-column
+    key, while the class declared a four-column uq_llm_spend_daily and no
+    token_type column at all. Every nightly spend upsert therefore failed on a
+    migrate.py-provisioned database with "no unique or exclusion constraint
+    matching the ON CONFLICT specification".
+
+    Idempotent, and safe on a production database that already has the
+    four-column constraint: the column is added with a backfill default of
+    'blended' (the documented pre-itemisation value), then the old constraint
+    is dropped and the five-column one created.
+    """
+    _run_ddl(
+        """
+        CREATE TABLE IF NOT EXISTS llm_spend_daily (
+            id            BIGSERIAL PRIMARY KEY,
+            usage_date    DATE NOT NULL,
+            provider      VARCHAR(20) NOT NULL,
+            model         VARCHAR(120) NOT NULL,
+            token_type    VARCHAR(20) NOT NULL DEFAULT 'blended',
+            cost_usd      NUMERIC(14,6) NOT NULL DEFAULT 0,
+            input_tokens  BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            request_count BIGINT NOT NULL DEFAULT 0,
+            source        VARCHAR(30) NOT NULL,
+            fetched_at    TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+        """,
+        "llm_spend_daily",
+    )
+    # Pre-existing deployment: add the column before touching the constraint.
+    _run_ddl(
+        "ALTER TABLE llm_spend_daily ADD COLUMN IF NOT EXISTS "
+        "token_type VARCHAR(20) NOT NULL DEFAULT 'blended'",
+        "llm_spend_daily.token_type",
+    )
+    # Replace the four-column key with the five-column one the writer targets.
+    # Dropping by name is safe whether it was created as a CONSTRAINT (ORM
+    # create_all) or as a bare UNIQUE INDEX (hand-applied SQL), so try both.
+    _run_ddl(
+        "ALTER TABLE llm_spend_daily DROP CONSTRAINT IF EXISTS uq_llm_spend_daily",
+        "llm_spend_daily.drop old uq (constraint form)",
+    )
+    _run_ddl(
+        "DROP INDEX IF EXISTS uq_llm_spend_daily",
+        "llm_spend_daily.drop old uq (index form)",
+    )
+    _run_ddl(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_spend_daily "
+        "ON llm_spend_daily(usage_date, provider, model, source, token_type)",
+        "llm_spend_daily.uq (5-column)",
+    )
+    _run_ddl(
+        "CREATE INDEX IF NOT EXISTS idx_llm_spend_daily_provider_model "
+        "ON llm_spend_daily(provider, model, usage_date)",
+        "llm_spend_daily.idx_provider_model",
+    )
+    _run_ddl(
+        "CREATE INDEX IF NOT EXISTS idx_llm_spend_daily_usage_date "
+        "ON llm_spend_daily(usage_date)",
+        "llm_spend_daily.idx_usage_date",
+    )
+    print("  ✓ Part AD2: llm_spend_daily schema reconciled with the upsert writer")
+
+
 # ── Post-migration verification ─────────────────────────────────────────────
 # Objects that the application queries unconditionally on a default install. If
 # any is missing the platform will 500 at runtime, so a migration that leaves one
@@ -8386,6 +8462,7 @@ _REQUIRED_SCHEMA = [
     ("feature_registry", None),
     ("feature_model_config", None),
     ("model_usages", "feature_key"),
+    ("llm_spend_daily", "token_type"),
 ]
 
 

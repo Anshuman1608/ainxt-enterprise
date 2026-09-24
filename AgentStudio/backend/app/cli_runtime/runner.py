@@ -217,11 +217,21 @@ _KNOWN_LOCAL_MODEL_IDS = (
     else _SHIPPED_LOCAL_MODEL_IDS | _CONFIGURED_LOCAL_MODEL_IDS
 )
 
-# Bare-id prefixes that always resolve to local families on this platform
-# (matches ``core.governance._is_local_model``'s heuristic). Kept in sync
-# by construction — the governance function is the source of truth for what
-# counts as "local", and this static mirror stays a short lookup table so
-# the CLI dispatch never blocks on a gateway probe.
+# Bare-id prefixes that always resolve to local families on this platform.
+#
+# This is a STATIC MIRROR of core.governance._is_local_model's heuristic, and
+# it is deliberately not kept in sync with the authoritative
+# services.endpoint_model_catalog: _normalize_cli_model runs on every CLI
+# dispatch and is documented as fully synchronous, and the catalogue reaches
+# Redis/Postgres and the LiteLLM gateway.
+#
+# It has already drifted, which is worth knowing before trusting it: this list
+# adds "gemma", "deepseek" and "gpt-oss" that governance's heuristic lacks, and
+# omits the "local" and "ollama" substrings that governance matches. An
+# admin-registered Ollama model will not be recognised here at all. The
+# consequence is bounded — an unrecognised bare id is passed through unchanged
+# (see the docstring below), so the CLI reports "unknown model id" rather than
+# mis-routing — but it is a mirror, not a source of truth.
 _LOCAL_MODEL_PREFIXES = ("kimi-", "glm-", "qwen", "mistral", "mixtral", "gemma", "deepseek", "gpt-oss", "llama")
 
 

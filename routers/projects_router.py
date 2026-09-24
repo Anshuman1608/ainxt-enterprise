@@ -13,10 +13,7 @@ from pydantic import BaseModel
 
 from core.logger import logger, set_request_id, set_chat_context, bind_context, set_span_id
 from auth.dependencies import get_current_user
-from core.model_registry import (
-    OPENAI_CODING_MODEL as _OPENAI_CODING,
-    MODEL_COST_PER_1M as _MODEL_COST_PER_1M,
-)
+from core.model_registry import OPENAI_CODING_MODEL as _OPENAI_CODING
 from core.security_validation import (
     validate_security,
     validate_description,
@@ -383,13 +380,14 @@ def ask_project(
                 in_tok  = int(len(question.split()) * 1.3)
                 out_tok = int(len(full.split()) * 1.3)
 
-            # Local/Ollama models are free — check before applying paid rates
-            _ml = (model or "").lower()
-            if "ollama" in _ml or "local" in _ml or "llama" in _ml:
-                cost = 0.0
-            else:
-                rates = _MODEL_COST_PER_1M.get(model, (2.00, 8.00))
-                cost  = round((in_tok * rates[0] + out_tok * rates[1]) / 1_000_000, 6)
+            # Delegated to the shared registry-backed estimator rather than a
+            # local "is 'ollama'/'local'/'llama' in the name" free-model test —
+            # see services.endpoint_model_catalog.estimate_cost_usd. The old
+            # test priced real in-house models (gemma-, kimi-, glm-) at the
+            # unknown-cloud rate and would price a PAID admin-registered
+            # llama-3.1 endpoint at zero.
+            from services.endpoint_model_catalog import estimate_cost_usd as _est_cost
+            cost = round(float(_est_cost(model, in_tok, out_tok)), 6)
 
             meta = {
                 "chat_id":  chat_id,
