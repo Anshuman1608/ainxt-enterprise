@@ -65,6 +65,7 @@ const PATH_TO_VIEW = {
   "/broadcast":        "broadcast",
   "/endpoint-manager": "endpoint-manager",
   "/llm-provider-config": "llm-provider-config",
+  "/feature-models":   "feature-models",
   "/dept-metrics":     "dept-metrics",
   "/memory":           "memory",
   "/connectors":       "connectors",
@@ -605,11 +606,9 @@ export default function App() {
             </ErrorBoundary>
           } />
           <Route path="/feature-models" element={
-            <AdminRoute user={user}>
-              <ErrorBoundary key={`feature-models-${refreshKey}`}>
-                <FeatureModelConfig />
-              </ErrorBoundary>
-            </AdminRoute>
+            <ErrorBoundary key={`feature-models-${refreshKey}`}>
+              <FeatureModelConfig />
+            </ErrorBoundary>
           } />
           <Route path="/dept-metrics" element={
             <ErrorBoundary key={`dept-metrics-${refreshKey}`}>
