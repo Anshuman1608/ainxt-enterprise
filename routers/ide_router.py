@@ -431,6 +431,13 @@ async def ide_chat(body: IDEChat, request: Request, _u: dict = Depends(_require_
             "gemini-3.1-flash-lite":  "gemini-3.1-flash-lite",
             "gemini-3.1-flash-image": "gemini-3.1-flash-image",
         }
+        # Observability only — does NOT change the resolved hint. Records that
+        # an IDE client sent a provider/SKU-shaped alias, giving the Phase 1
+        # compatibility shim a removal gate (core/tiers.py::note_legacy_alias).
+        if raw_hint in _hint_map:
+            from core.tiers import note_legacy_alias
+            note_legacy_alias(raw_hint, surface="ide")
+
         model_hint = _hint_map.get(raw_hint, "simple")
 
     logger.info(

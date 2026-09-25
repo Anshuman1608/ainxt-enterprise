@@ -445,6 +445,51 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
   conns="$(run_sql "SELECT count(*) FROM ainxt.connector_definitions" | tr -d ' \r')"
   if [[ -n "$conns" && "$conns" -gt 0 ]]; then pass "connectors seeded" "$conns definitions"
   else warno "connectors seeded" "none" "seeding runs inside db/migrate.py; connectors will be unavailable"; fi
+
+  # ── LLM provider/model registry completeness ───────────────────────────────
+  # The registry is becoming the single source of truth for which model serves
+  # which capability tier (LLM tier governance migration, plan.html §H). The
+  # Phase 3 resolver FILTERS on these capability fields, and a missing field
+  # does not fail loudly — it silently makes a model ineligible for a tier, or
+  # leaves a tier with nothing to route to. Surface the gaps here instead.
+  llm_models_n="$(run_sql "SELECT count(*) FROM ainxt.llm_models WHERE enabled = TRUE" | tr -d ' \r')"
+  if [[ -z "$llm_models_n" || "$llm_models_n" -eq 0 ]]; then
+    warno "llm registry populated" "no enabled models" \
+          "add a provider in the admin 'LLM Providers' screen, or run db/bootstrap_llm_providers.py"
+  else
+    pass "llm registry populated" "$llm_models_n enabled model(s)"
+
+    # privacy_class gates the no-cloud-egress routing constraint. Absent is
+    # treated as 'external' (fail-safe), so a genuinely on-prem model that is
+    # missing the field will be wrongly refused for confidential traffic.
+    no_privacy="$(run_sql "SELECT count(*) FROM ainxt.llm_models WHERE enabled = TRUE AND capabilities->>'privacy_class' IS NULL" | tr -d ' \r')"
+    if [[ -n "$no_privacy" && "$no_privacy" -gt 0 ]]; then
+      warno "llm models classified" "$no_privacy model(s) missing privacy_class" \
+            "re-run 'Sync models' for the provider; absent is treated as 'external' (fail-safe)"
+    else
+      pass "llm models classified" "all have privacy_class"
+    fi
+
+    # modality decides eligibility for the image/video tiers.
+    no_modality="$(run_sql "SELECT count(*) FROM ainxt.llm_models WHERE enabled = TRUE AND capabilities->>'modality' IS NULL" | tr -d ' \r')"
+    if [[ -n "$no_modality" && "$no_modality" -gt 0 ]]; then
+      warno "llm models have modality" "$no_modality model(s) missing modality" \
+            "re-run 'Sync models'; without it a model cannot be assigned to the image/video tiers"
+    else
+      pass "llm models have modality" "all have modality"
+    fi
+
+    # Pre-flight for the api-channel fix (R18): once API-key requests are
+    # correctly tagged 'api', any model whose channels list omits 'api' stops
+    # being reachable by SDK clients that could previously use it.
+    chan_n="$(run_sql "SELECT count(*) FROM ainxt.llm_models WHERE enabled = TRUE AND capabilities ? 'channels' AND jsonb_array_length(capabilities->'channels') > 0" | tr -d ' \r')"
+    if [[ -n "$chan_n" && "$chan_n" -gt 0 ]]; then
+      warno "llm channel restrictions" "$chan_n model(s) restrict channels" \
+            "verify each still lists every channel it must serve — API clients are now tagged 'api'"
+    else
+      pass "llm channel restrictions" "none — no model is channel-restricted"
+    fi
+  fi
 fi
 
 # ── 5. API ───────────────────────────────────────────────────────────────────

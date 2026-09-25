@@ -194,9 +194,28 @@ jobs:
         id: pytest
         continue-on-error: true      # the comparator below decides pass/fail
         run: |
-          PATHS="${{ github.event.inputs.pytest_paths || vars.CI_PYTEST_PATHS || 'tests/auth tests/config tests/core tests/agents tests/store tests/cil' }}"
+          # tests/models, tests/router_policy and tests/pipeline were added to the
+          # default on 2026-09-25: they hold the model-router, privacy-floor and
+          # routing-wiring suites (test_privacy_floor_live.py,
+          # test_context_size_routing.py, test_routing_wiring.py,
+          # test_model_router_async_stream.py). Those are the tests the LLM tier
+          # governance migration must keep green, and they were running nowhere —
+          # "full suite green" was a vacuous claim for exactly the code being
+          # changed. Pre-existing failures in the three new directories were
+          # baselined into known_failures.txt in the same change.
+          PATHS="${{ github.event.inputs.pytest_paths || vars.CI_PYTEST_PATHS || 'tests/auth tests/config tests/core tests/agents tests/store tests/cil tests/models tests/router_policy tests/pipeline' }}"
           echo "pytest paths: $PATHS"
-          pytest $PATHS -q --disable-warnings -rf 2>&1 | tee /tmp/pytest.out | tail -30
+          # -rfE (was -rf): a COLLECTION error prints under "=== ERRORS ===" with
+          # a leading-underscore banner that compare_test_failures.py's
+          # ^(FAILED|ERROR)\s+ regex cannot match. Without -rE such an error is
+          # invisible to the comparator, so a whole test file silently stops
+          # running and the build still goes green. -rE puts it in the short
+          # summary as "ERROR <path> - <reason>", which the comparator parses and
+          # can baseline like any other entry.
+          # --continue-on-collection-errors: one bad import currently ABORTS the
+          # entire run ("Interrupted: 1 error during collection"), which would
+          # take the whole job down rather than surfacing one known-bad file.
+          pytest $PATHS -q --disable-warnings -rfE --continue-on-collection-errors 2>&1 | tee /tmp/pytest.out | tail -30
 
       - name: Fail only on NEW test failures
         # 30 tests already failed before CI existed (production code moved without

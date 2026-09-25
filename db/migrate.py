@@ -1346,6 +1346,9 @@ CREATE INDEX IF NOT EXISTS idx_sec_scan_scanned_at ON security_scan_results(scan
     # ── Part AC3: 2026-09-01 — remove bogus seeded "local-llm" model rows ──────
     _part_ac3_remove_bogus_local_llm_seed_2026_09_01()
 
+    # ── Part AC4: 2026-09-25 — backfill privacy_class/modality capabilities ────
+    _part_ac4_capability_backfill_2026_09_25()
+
     # ── OSS schema-drift fixes ───────────────────────────────────────────────
     # (_part_oss3 runs at the top of this function — the catalogue seeds need it.)
     _part_oss4_model_permissions_web_search()
@@ -8004,6 +8007,39 @@ def _part_ac1_llm_provider_seed_2026_09_01():
     except Exception:
         _ctx_windows, _ctx_reserved = {}, {}
 
+    def _safe_getattr_dict(mod, name: str) -> dict:
+        """A module-level constant table that may not exist on older builds."""
+        try:
+            value = getattr(mod, name, None)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    def _modality_for(model_id: str) -> list:
+        """Best-effort input/output modality list for a seeded model.
+
+        A LIST, not a scalar: real models are multimodal, and the Phase 3
+        resolver filters the three modality tiers on membership. Seeding is a
+        heuristic over the model id because that is the only signal available
+        at migration time — an administrator can correct any row afterwards,
+        which is why the admin API accepts `modality` explicitly.
+
+        Deliberately conservative: everything is assumed text-capable, and a
+        modality is only ADDED on a positive signal. Over-claiming would let
+        the resolver pick a model that cannot do the job.
+        """
+        low = model_id.lower()
+        out = ["text"]
+        if "veo" in low or "video" in low:
+            out.append("video-out")
+        if "image" in low or "imagen" in low or "dall-e" in low:
+            out.append("image-out")
+        # Frontier chat models are multimodal on input. Keyed on family rather
+        # than an exhaustive id list so a newer version inherits it.
+        if any(k in low for k in ("claude", "gpt-4", "gpt-5", "gemini")):
+            out.append("image-in")
+        return out
+
     def _capabilities_for(model_id: str) -> dict:
         low = model_id.lower()
         ctx, reserved = None, None
@@ -8020,6 +8056,43 @@ def _part_ac1_llm_provider_seed_2026_09_01():
             cap["reserved_output"] = reserved
         if cost is not None:
             cap["cost_per_1m_input"], cap["cost_per_1m_output"] = cost
+
+        # ── Phase 2 of the LLM tier governance migration ─────────────────────
+        # The Phase 3 resolver filters a tier's eligible models by capability
+        # (modality, context window, privacy class, whether the model even
+        # accepts a `temperature` param). Those facts live today in constant
+        # tables and prefix heuristics scattered across the codebase. Lift them
+        # onto the model row here so the registry — not a code constant — is
+        # what the resolver reads.
+        #
+        # Flat keys (cost_per_1m_input/_output) rather than a nested object:
+        # that is the shape this function already wrote and that readers
+        # already expect. A nested cost object would need a data migration for
+        # no benefit.
+        per_second = _safe_getattr_dict(_mr, "MODEL_COST_PER_SECOND").get(model_id)
+        if per_second is not None:
+            cap["cost_per_second"] = per_second
+
+        max_out = _safe_getattr_dict(_mr, "MODEL_MAX_OUTPUT_TOKENS").get(model_id)
+        if max_out is not None:
+            cap["max_output_tokens"] = max_out
+
+        # Anthropic's newer generations 400 outright on `temperature` rather
+        # than clamping it. Only record the negative case: absent means "no
+        # known restriction", which is the safe default for an unknown model.
+        try:
+            no_temp = tuple(_mr.models_without_temperature())
+        except Exception:
+            no_temp = ()
+        if no_temp and low.startswith(no_temp):
+            cap["supports_temperature"] = False
+
+        # Deep-research models reject a call that omits `tools` entirely.
+        # Replaces the hardcoded id set in gateway.py::_DEEP_RESEARCH_MODELS.
+        if "deep-research" in low:
+            cap["requires_tools"] = True
+
+        cap["modality"] = _modality_for(model_id)
         return cap
 
     # This whole part is best-effort convenience (pre-populating the admin
@@ -8088,6 +8161,16 @@ def _part_ac1_llm_provider_seed_2026_09_01():
                     caps = _capabilities_for(model_id)
                     caps["tier_tags"] = tags
                     caps["billing_tier"] = billing_tier
+                    # Derived from the provider, not the model — fails safe to
+                    # "external" so an unclassified row can never satisfy a
+                    # no-cloud-egress constraint. Admin-editable afterwards.
+                    try:
+                        from core.llm_provider_registry import derive_privacy_class
+                        caps["privacy_class"] = derive_privacy_class(
+                            spec["family"], getattr(provider, "base_url", None)
+                        )
+                    except Exception:
+                        caps["privacy_class"] = "external"
                     db.add(LLMModel(
                         provider_id=provider.id, model_id=model_id,
                         display_name=model_id, capabilities=caps,
@@ -8209,6 +8292,89 @@ def _part_ac3_remove_bogus_local_llm_seed_2026_09_01():
     except Exception as exc:
         db.rollback()
         print(f"  (skipped) Part AC3: could not clean up bogus local-llm rows — {exc}")
+    finally:
+        db.close()
+
+
+def _part_ac4_capability_backfill_2026_09_25():
+    """
+    2026-09-25 — Backfill `privacy_class` and `modality` onto EXISTING llm_models.
+
+    Part AC1 only sets capability fields on rows it seeds itself; it `continue`s
+    past any model that already exists. So on a deployment whose registry was
+    populated before this change — the normal case — every row keeps an empty
+    `capabilities` and the Phase 3 tier resolver has nothing to filter on.
+
+    Both fields drive resolver eligibility (plan.html §M.1, §L.3a):
+      * privacy_class gates the no-cloud-egress constraint. Derived from the
+        PROVIDER (family + base_url), never from the model id.
+      * modality gates the three image/video tiers.
+
+    Two invariants:
+      * IDEMPOTENT — only fills a key that is absent. Re-running changes nothing.
+      * NEVER OVERWRITES an admin edit. `openai_compatible` classification is a
+        guess from the base_url; the operator is the only one who really knows
+        whether an endpoint is on-prem, so a stored value always wins.
+    """
+    from db.database import SessionLocal
+    from db.models import LLMModel, LLMProvider
+
+    try:
+        from core.llm_provider_registry import derive_privacy_class
+    except Exception as exc:
+        print(f"  (skipped) Part AC4: llm_provider_registry import failed — {exc}")
+        return
+
+    def _modality_for(model_id: str) -> list:
+        """Heuristic seed value; admin-correctable afterwards.
+
+        Conservative on purpose: everything is assumed text-capable and a
+        modality is only ADDED on a positive signal, because over-claiming
+        would let the resolver pick a model that cannot do the job.
+        """
+        low = (model_id or "").lower()
+        out = ["text"]
+        if "veo" in low or "video" in low:
+            out.append("video-out")
+        if "image" in low or "imagen" in low or "dall-e" in low:
+            out.append("image-out")
+        if any(k in low for k in ("claude", "gpt-4", "gpt-5", "gemini")):
+            out.append("image-in")
+        return out
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(LLMModel, LLMProvider)
+            .join(LLMProvider, LLMModel.provider_id == LLMProvider.id)
+            .all()
+        )
+        touched = 0
+        for model, provider in rows:
+            caps = dict(model.capabilities or {})
+            before = dict(caps)
+
+            if "privacy_class" not in caps:
+                caps["privacy_class"] = derive_privacy_class(
+                    provider.family, provider.base_url
+                )
+            if "modality" not in caps:
+                caps["modality"] = _modality_for(model.model_id)
+
+            if caps != before:
+                # Reassign rather than mutate in place: SQLAlchemy does not
+                # track in-place edits to a JSONB dict without flag_modified.
+                model.capabilities = caps
+                touched += 1
+
+        if touched:
+            db.commit()
+            print(f"  + Part AC4: backfilled capabilities on {touched} llm_models row(s)")
+        else:
+            print("  ✓ Part AC4: llm_models capabilities already complete")
+    except Exception as exc:
+        db.rollback()
+        print(f"  (skipped) Part AC4: capability backfill failed — {exc}")
     finally:
         db.close()
 

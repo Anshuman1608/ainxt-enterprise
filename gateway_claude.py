@@ -20,6 +20,20 @@ from agents.compliance_engine import compliance_engine
 
 from core.model_registry import CLAUDE_PRIMARY_MODEL
 
+
+def _resolve_provider_base_url(family: str, env_var: str):
+    """Admin-configured provider endpoint, else the env default, else None.
+
+    Thin wrapper so an unreachable registry can never stop this gateway from
+    constructing — the import is deferred and every failure degrades to the
+    historical env-var behaviour.
+    """
+    try:
+        from core.llm_provider_registry import provider_base_url_or_env
+        return provider_base_url_or_env(family, env_var)
+    except Exception:
+        return (os.getenv(env_var) or "").strip() or None
+
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -133,6 +147,12 @@ class ClaudeGateway:
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY not set")
 
+        # Admin-configured endpoint wins over the SDK default (F3). Previously
+        # llm_providers.base_url was honoured only on the registry dispatch
+        # path, so an administrator pointing this provider at a regional
+        # gateway, proxy, or compliance egress was silently ignored here.
+        _base_url = _resolve_provider_base_url("anthropic", env_var="ANTHROPIC_BASE_URL")
+
         # No proxy needed — this gateway runs on the LLM proxy server which has direct
         # outbound access to api.anthropic.com via firewall allowlist.
         _t = float(os.getenv("LLM_TIMEOUT_SEC", "300"))
@@ -143,6 +163,9 @@ class ClaudeGateway:
             api_key=api_key,
             timeout=None if _t <= 0 else _t,
             http_client=_build_cached_sync_client(),
+            # Omitted entirely when unset so the SDK keeps its own default —
+            # passing base_url=None is not equivalent for every SDK version.
+            **({"base_url": _base_url} if _base_url else {}),
         )
 
         # Real token counts from the last API call — read by model_router

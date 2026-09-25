@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Optional
 
 from core.logger import logger
@@ -26,6 +27,73 @@ from core.logger import logger
 _KV_DB = 0
 _CACHE_KEY = "llm_registry:enabled_models"
 _CACHE_TTL_SECONDS = 300   # safety net only — invalidate_cache() clears this immediately on writes
+
+
+# ── Privacy classification (Phase 2 of the LLM tier governance migration) ────
+#
+# `capabilities.privacy_class` answers one question the Phase 3 resolver needs:
+# may a request carrying CONFIDENTIAL+ data be served by this model? That is
+# expressed as a routing CONSTRAINT (no_cloud_egress) rather than a tier, so a
+# task's capability requirement stays orthogonal to its data classification
+# (plan.html §M.1).
+#
+# Derived at SYNC TIME, never per request, and never by naming a vendor — the
+# signal is the provider's family and base_url, both of which the admin owns.
+PRIVACY_DEPLOYMENT_LOCAL = "deployment_local"
+PRIVACY_EXTERNAL = "external"
+
+# Hosts that cannot leave the deployment's own network.
+_LOCAL_HOST_MARKERS = (
+    "localhost", "127.0.0.1", "0.0.0.0", "::1",
+    ".local", ".internal", ".svc", ".cluster.local",
+)
+
+
+def _is_local_host(base_url: Optional[str]) -> bool:
+    """True when `base_url` clearly points inside the deployment's network."""
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(base_url).hostname or "").strip().lower()
+        if not host:
+            return False
+        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+            return True
+        if any(host.endswith(sfx) for sfx in (".local", ".internal", ".svc", ".cluster.local")):
+            return True
+        # RFC1918 / link-local / loopback ranges.
+        import ipaddress
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            # Not an IP. A bare hostname with no dots is a container/service
+            # name on an internal network (e.g. "ollama", "litellm").
+            return "." not in host
+    except Exception:
+        return False
+
+
+def derive_privacy_class(family: str, base_url: Optional[str]) -> str:
+    """Classify a provider as deployment-local or external.
+
+    FAILS SAFE TO ``external``. An unclassified model must never satisfy a
+    no-cloud-egress constraint: under-permitting fails a request visibly,
+    while over-permitting leaks data silently.
+
+    ``openai_compatible`` is the genuinely ambiguous family — the same wire
+    protocol serves both an on-prem vLLM box and a hosted aggregator — so it
+    is decided on the base_url and the result must remain admin-editable.
+    Only the operator actually knows.
+    """
+    fam = (family or "").strip().lower()
+    if fam == "ollama":
+        return PRIVACY_DEPLOYMENT_LOCAL
+    if fam == "openai_compatible":
+        return PRIVACY_DEPLOYMENT_LOCAL if _is_local_host(base_url) else PRIVACY_EXTERNAL
+    # anthropic / openai / gemini, and anything unrecognised.
+    return PRIVACY_EXTERNAL
 
 
 def credential_name_for_slug(slug: str) -> str:
@@ -161,6 +229,62 @@ def resolve_credential(provider: dict) -> Optional[str]:
     or None for providers that need no key (e.g. ollama)."""
     from store.credential_vault import get_credential_value
     return get_credential_value(credential_name_for_slug(provider["slug"]))
+
+
+def resolve_base_url_for_family(family: str) -> Optional[str]:
+    """Admin-configured base_url for the first enabled provider of `family`.
+
+    Returns None when no enabled provider of that family sets one, so the
+    caller keeps its existing env-var default.
+
+    WHY THIS EXISTS. `llm_providers.base_url` used to be read on exactly one
+    path — ``get_client_for()``, i.e. the registry dispatch used by
+    openai_compatible models. The anthropic/openai/gemini gateways each built
+    their client from ``os.getenv(...)`` and consulted the registry only for a
+    CREDENTIAL. The consequence was that an administrator who pointed one of
+    those three providers at a custom endpoint (a regional gateway, a proxy, a
+    compliance egress) had that setting silently ignored — the same class of
+    defect as the model-id constants outranking the registry.
+
+    Same "first enabled provider wins" convention as
+    ``resolve_credential_for_family`` (lowest sort_order, then created_at).
+    """
+    for m in get_enabled_models():
+        if m["family"] == family:
+            return (m.get("base_url") or "").strip() or None
+    return None
+
+
+def provider_base_url_or_env(family: str, env_var: str) -> Optional[str]:
+    """Resolve the endpoint for `family`: admin configuration wins over env.
+
+    Precedence is deliberately the reverse of the historical model-constant
+    behaviour. `llm_providers.base_url` is something an administrator set
+    explicitly in the UI for this specific provider; the env var is a
+    deployment-wide default. When both are present and DISAGREE, that is worth
+    saying out loud once — a silently-ignored admin setting is exactly the bug
+    this replaces — so it is logged at INFO.
+
+    Returns None when neither is set, meaning "let the SDK use its own
+    default". Never raises: an unreachable registry must not stop a gateway
+    from constructing.
+    """
+    env_value = (os.getenv(env_var) or "").strip() or None
+    try:
+        configured = resolve_base_url_for_family(family)
+    except Exception as exc:
+        logger.warning(
+            f"[llm_provider_registry] base_url lookup failed for family={family!r} "
+            f"({exc}); falling back to {env_var}"
+        )
+        return env_value
+
+    if configured and env_value and configured != env_value:
+        logger.info(
+            f"[llm_provider_registry] {family}: using admin-configured base_url "
+            f"{configured!r} in preference to {env_var}={env_value!r}"
+        )
+    return configured or env_value
 
 
 def resolve_credential_for_family(family: str) -> Optional[str]:

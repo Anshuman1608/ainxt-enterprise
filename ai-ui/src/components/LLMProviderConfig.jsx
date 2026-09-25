@@ -279,11 +279,38 @@ function ModelRow({ model, onToggle, onDelete, onSetDefault }) {
   );
 }
 
+// Capability vocabulary — must match core/tiers.py and the server-side
+// validation in routers/llm_provider_admin_router.py::_validate_capabilities.
+// These are the fields the tier resolver FILTERS on, which is why they are
+// worth collecting at add-model time rather than leaving for a later edit:
+// a model with no modality cannot be assigned to the image/video tiers, and
+// one with no privacy_class is treated as external (fail-safe) so it will be
+// refused for confidential traffic.
+const MODALITY_OPTIONS = [
+  { value: "text",       label: "Text" },
+  { value: "image-in",   label: "Image input (vision)" },
+  { value: "image-out",  label: "Image output (generation)" },
+  { value: "video-out",  label: "Video output" },
+];
+
 function AddModelForm({ providerId, onAdded, onCancel, toast }) {
   const [modelId, setModelId] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [contextWindow, setContextWindow] = useState("");
+  // Default to text-only: the conservative choice, since over-claiming a
+  // modality lets the resolver pick a model that cannot do the job.
+  const [modality, setModality] = useState(["text"]);
+  // Blank means "let the server derive it from the provider" — for every
+  // family except openai_compatible that derivation is unambiguous.
+  const [privacyClass, setPrivacyClass] = useState("");
+  const [costIn, setCostIn] = useState("");
+  const [costOut, setCostOut] = useState("");
   const [saving, setSaving] = useState(false);
+
+  const toggleModality = (value) =>
+    setModality((cur) =>
+      cur.includes(value) ? cur.filter((v) => v !== value) : [...cur, value]
+    );
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -292,6 +319,11 @@ function AddModelForm({ providerId, onAdded, onCancel, toast }) {
     try {
       const capabilities = {};
       if (contextWindow) capabilities.context_window = parseInt(contextWindow, 10);
+      if (modality.length) capabilities.modality = modality;
+      // Omitted when blank so the server's provider-based derivation applies.
+      if (privacyClass) capabilities.privacy_class = privacyClass;
+      if (costIn !== "") capabilities.cost_per_1m_input = parseFloat(costIn);
+      if (costOut !== "") capabilities.cost_per_1m_output = parseFloat(costOut);
       const resp = await authFetch(`${API_BASE}/llm-providers/${providerId}/models`, {
         method: "POST",
         headers: JSON_HEADERS,
@@ -302,6 +334,7 @@ function AddModelForm({ providerId, onAdded, onCancel, toast }) {
         throw new Error(data.detail || `HTTP ${resp.status}`);
       }
       setModelId(""); setDisplayName(""); setContextWindow("");
+      setModality(["text"]); setPrivacyClass(""); setCostIn(""); setCostOut("");
       onAdded();
     } catch (err) {
       toast.error("Failed to add model: " + err.message);
@@ -311,28 +344,75 @@ function AddModelForm({ providerId, onAdded, onCancel, toast }) {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex items-center gap-2 px-3 py-2 bg-gray-50 border-t border-gray-200">
-      <input
-        type="text" value={modelId} onChange={(e) => setModelId(e.target.value)}
-        placeholder="model id (e.g. claude-sonnet-4-6)"
-        className="flex-1 px-2 py-1.5 border border-gray-200 rounded text-xs font-mono"
-      />
-      <input
-        type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)}
-        placeholder="display name"
-        className="flex-1 px-2 py-1.5 border border-gray-200 rounded text-xs"
-      />
-      <input
-        type="number" value={contextWindow} onChange={(e) => setContextWindow(e.target.value)}
-        placeholder="context window"
-        className="w-32 px-2 py-1.5 border border-gray-200 rounded text-xs"
-      />
+    <form onSubmit={handleSubmit} className="px-3 py-2 bg-gray-50 border-t border-gray-200 space-y-2">
+      <div className="flex items-center gap-2">
+        <input
+          type="text" value={modelId} onChange={(e) => setModelId(e.target.value)}
+          placeholder="model id (e.g. claude-sonnet-4-6)"
+          className="flex-1 px-2 py-1.5 border border-gray-200 rounded text-xs font-mono"
+        />
+        <input
+          type="text" value={displayName} onChange={(e) => setDisplayName(e.target.value)}
+          placeholder="display name"
+          className="flex-1 px-2 py-1.5 border border-gray-200 rounded text-xs"
+        />
+        <input
+          type="number" value={contextWindow} onChange={(e) => setContextWindow(e.target.value)}
+          placeholder="context window"
+          className="w-32 px-2 py-1.5 border border-gray-200 rounded text-xs"
+        />
+      </div>
+
+      {/* Capability fields the tier resolver filters on. Optional: a blank
+          privacy class is derived server-side from the provider, and the
+          costs fall back to the platform's conservative default rather than
+          to zero — an unpriced model must never bill as free. */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] text-gray-500 font-medium">Modality</span>
+          {MODALITY_OPTIONS.map((opt) => (
+            <label key={opt.value} className="flex items-center gap-1 text-[11px] text-gray-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={modality.includes(opt.value)}
+                onChange={() => toggleModality(opt.value)}
+                className="w-3 h-3"
+              />
+              {opt.label}
+            </label>
+          ))}
+        </div>
+
+        <select
+          value={privacyClass} onChange={(e) => setPrivacyClass(e.target.value)}
+          className="px-2 py-1 border border-gray-200 rounded text-[11px] bg-white"
+          title="Blank = derive from the provider. Only override when the derivation is wrong — typically a self-hosted OpenAI-compatible endpoint."
+        >
+          <option value="">privacy: auto-derive</option>
+          <option value="deployment_local">deployment-local (no egress)</option>
+          <option value="external">external</option>
+        </select>
+
+        <input
+          type="number" step="0.01" min="0" value={costIn} onChange={(e) => setCostIn(e.target.value)}
+          placeholder="$/1M in"
+          className="w-24 px-2 py-1 border border-gray-200 rounded text-[11px]"
+        />
+        <input
+          type="number" step="0.01" min="0" value={costOut} onChange={(e) => setCostOut(e.target.value)}
+          placeholder="$/1M out"
+          className="w-24 px-2 py-1 border border-gray-200 rounded text-[11px]"
+        />
+      </div>
+
+      <div className="flex items-center gap-2 justify-end">
       <button type="submit" disabled={saving} className="p-1.5 rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50">
         <Check size={14} />
       </button>
       <button type="button" onClick={onCancel} className="p-1.5 rounded text-gray-400 hover:text-gray-600">
         <X size={14} />
       </button>
+      </div>
     </form>
   );
 }

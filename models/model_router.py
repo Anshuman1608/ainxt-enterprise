@@ -47,6 +47,8 @@ from typing import List, Optional, Union
 
 from core.logger import logger
 from core.proxy_tool_use import llm_proxy_headers as _llm_proxy_headers
+# core.tiers is a leaf module (stdlib only) — safe to import at module scope.
+from core.tiers import Tier
 from core.model_registry import (
     OPENAI_SIMPLE_MODEL,
     OPENAI_CODING_MODEL,
@@ -1251,6 +1253,42 @@ def _resolve_tier_model(env_value: str, family: str, tag: str) -> str:
 
 
 # ============================================================
+# TIER VOCABULARY BRIDGE  (Phase 1 — additive, nothing uses it yet)
+# ============================================================
+#
+# Maps the eight approved application tiers (core.tiers.Tier) onto the legacy
+# internal hint strings this router already understands, so Phase 1 can
+# introduce the new vocabulary with PROVABLY zero behaviour change: a `tier=`
+# call is rewritten to the equivalent `model_hint=` call before any routing
+# logic runs, and every existing `model_hint=` call is untouched.
+#
+# ⚠ Tier.SIMPLE maps to "haiku", NOT to "simple".
+#   The legacy string "simple" means LOCAL. The new Tier.SIMPLE means "cheap,
+#   short-output". They are different requests and must stay different until
+#   each call site is migrated individually in Phase 6 (plan.html §D.2).
+#   This asymmetry is the most important thing in this block; it is locked
+#   down by tests/models/test_tiers.py::test_simple_collision_guarded.
+#
+# This map lives here rather than in core/tiers.py on purpose: core.tiers is a
+# leaf module and must not know the router's internal tier constants.
+_TIER_TO_LEGACY_HINT: dict = {
+    Tier.MINI:                  "mini",
+    Tier.SIMPLE:                "haiku",
+    Tier.MEDIUM:                "medium",
+    Tier.COMPLEX:               "complex",
+    Tier.INTENT_CLASSIFICATION: "haiku",
+    Tier.IMAGE_INPUT:           "vision",
+    # PHASE-1 STUBS. Image generation and Veo bypass this router entirely
+    # today (routers/chat_router.py calls the gateways directly), so there is
+    # no distinct dispatch to point at yet. Both are unreachable in Phase 1
+    # because no production code passes tier= at all. Real dispatch arrives in
+    # Phase 5 — until then these exist only so the map is total over Tier.
+    Tier.IMAGE_OUTPUT:          "vision",
+    Tier.VIDEO_GENERATION:      "vision",
+}
+
+
+# ============================================================
 # MODEL ROUTER
 # ============================================================
 
@@ -1268,6 +1306,34 @@ class ModelRouter:
         self._claude  = None
         self._gemini  = None
         logger.info("ModelRouter initialised")
+
+    # ── Tier → legacy hint coercion (Phase 1) ─────────────────
+    @staticmethod
+    def _coerce_tier(model_hint: Optional[str], tier: Optional[Tier]) -> Optional[str]:
+        """Collapse the `tier=` and `model_hint=` parameters into one hint string.
+
+        Called as the FIRST statement of every public entry point, so that the
+        rest of the router keeps seeing exactly the legacy hint it always has.
+        `tier=None` (the overwhelmingly common case during Phases 1-5) returns
+        `model_hint` untouched — zero behaviour change by construction.
+
+        Raises ValueError when both are supplied. Note that generate() and
+        friends document "never raises": that contract is about RUNTIME LLM
+        failures, which they still convert to an error string. Passing both
+        parameters is a programming error — statically determinable, caught by
+        tests/models/test_tiers.py, and impossible to reach at runtime in a
+        correct call site — so failing loudly is the right behaviour.
+        """
+        if tier is None:
+            return model_hint
+        if model_hint is not None:
+            raise ValueError(
+                "ModelRouter: pass either tier= or model_hint=, not both "
+                f"(got tier={tier!r}, model_hint={model_hint!r})"
+            )
+        # Tier(tier) rejects a bare string that is not one of the eight, so a
+        # legacy alias like "solution" or "local" can never sneak in this way.
+        return _TIER_TO_LEGACY_HINT[Tier(tier)]
 
     # ── Thread-local per-request state ────────────────────────
     # These are properties backed by threading.local() so concurrent
@@ -1595,9 +1661,14 @@ class ModelRouter:
 
     def route(self, prompt, model_hint: Optional[str] = None,
               data_classification: Optional[str] = None,
-              context_tokens: int = 0) -> RoutingDecision:
+              context_tokens: int = 0,
+              *, tier: Optional[Tier] = None) -> RoutingDecision:
         """Return the RoutingDecision for this prompt.
         prompt: str OR list[dict] (multi-turn messages array).
+        tier: OPTIONAL approved application tier (core.tiers.Tier). Keyword-only
+            and enum-typed so it can never collide with the legacy `model_hint`
+            string vocabulary — see _coerce_tier. Mutually exclusive with
+            model_hint. Nothing in production passes this during Phase 1.
         data_classification: optional sensitivity tag (PUBLIC/INTERNAL/
             CONFIDENTIAL/RESTRICTED/PCI_SENSITIVE, per core/rag_acl.py). When it
             is at/above CONFIDENTIAL the PRIVACY FLOOR forces the local model.
@@ -1606,6 +1677,7 @@ class ModelRouter:
             headroom), CONTEXT-SIZE ROUTING promotes to a larger-window model.
             Never overrides the privacy floor or an explicit model_hint.
         """
+        model_hint = self._coerce_tier(model_hint, tier)
         prompt_str = _as_str(prompt)  # routing signals always derived from text
 
         # 0. PRIVACY FLOOR (hard enterprise invariant) — runs FIRST so nothing
@@ -2906,9 +2978,18 @@ class ModelRouter:
     # PUBLIC API
     # --------------------------------------------------------
 
-    def generate_structured(self, blocks: list, model_hint: str = "solution") -> str:
+    def generate_structured(self, blocks: list, model_hint: Optional[str] = None,
+                            *, tier: Optional[Tier] = None) -> str:
         """
         Claude-only call with structured content_blocks for block-level prompt caching.
+
+        tier: OPTIONAL approved application tier — see generate().
+
+        model_hint's default moved from the literal "solution" to None so that
+        `tier=` is usable at all: _coerce_tier treats a non-None model_hint as
+        a conflict, and a hard-coded default would have made every tier= call
+        raise. "solution" is still substituted below whenever neither argument
+        is supplied, so every existing caller behaves exactly as before.
 
         In production (LLM_PROXY_URL set), routes via _ProxyGateway which forwards
         the structured payload to services/llm_proxy/main.py on the LLM proxy server.
@@ -2919,6 +3000,10 @@ class ModelRouter:
         Returns the model's text output (same shape as generate()).
         Never raises — falls back to flat generate() on any error.
         """
+        model_hint = self._coerce_tier(model_hint, tier)
+        if model_hint is None:
+            # Preserves the historical default for callers that pass neither.
+            model_hint = "solution"
         claude = self._get_claude()
 
         # Dev mode or Claude unavailable: flatten to flat-string generate()
@@ -2984,9 +3069,16 @@ class ModelRouter:
 
     def generate(self, prompt, model_hint: Optional[str] = None, return_meta=False,
                  precleared: bool = False, precleared_findings: Optional[list] = None,
-                 data_classification: Optional[str] = None):
+                 data_classification: Optional[str] = None,
+                 *, tier: Optional[Tier] = None):
         """Route prompt to the correct gateway. Never raises — returns error str on failure.
         prompt: str OR list[dict] (multi-turn messages array).
+
+        tier:
+            OPTIONAL approved application tier (core.tiers.Tier), mutually
+            exclusive with model_hint. Keyword-only and enum-typed. Supplying
+            both raises ValueError — a programming error, distinct from the
+            runtime failures this method converts to an error string.
 
         precleared / precleared_findings:
             When True, downstream OpenAI/Gemini gateways skip their second-pass
@@ -2999,6 +3091,7 @@ class ModelRouter:
             FLOOR pins routing to the local model AND disables cloud fallback in
             _dispatch — restricted data must never egress, even if local is down.
         """
+        model_hint = self._coerce_tier(model_hint, tier)
         if not prompt:
             return ""
         decision = self.route(prompt, model_hint=model_hint,
@@ -3073,9 +3166,12 @@ class ModelRouter:
             local_model: Optional[str] = None,
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
+            *,
+            tier: Optional[Tier] = None,
     ):
         """Route prompt and yield tokens directly (true token streaming).
         prompt: str OR list[dict] (multi-turn messages array).
+        tier: OPTIONAL approved application tier — see generate().
 
         precleared / precleared_findings:
             Forwarded to the OpenAI / Gemini / proxy gateways so that callers
@@ -3118,6 +3214,7 @@ class ModelRouter:
         Older callers that don't check for it will harmlessly ignore the
         dict (assuming they typecheck or no-op on non-string tokens).
         """
+        model_hint = self._coerce_tier(model_hint, tier)
         if not prompt:
             return
         decision = self.route(prompt, model_hint=model_hint)
@@ -3159,11 +3256,14 @@ class ModelRouter:
         except Exception as _meta_err:
             logger.debug(f"stream() meta sentinel skipped: {_meta_err}")
 
-    async def async_generate(self, prompt, model_hint: Optional[str] = None) -> str:
+    async def async_generate(self, prompt, model_hint: Optional[str] = None,
+                             *, tier: Optional[Tier] = None) -> str:
         """Async route + generate. Uses persistent AsyncClient — no thread held during LLM I/O.
         Falls back to sync generate() when LLM_PROXY_URL is not set (local dev / direct gateway).
         prompt: str OR list[dict] (multi-turn messages array).
+        tier: OPTIONAL approved application tier — see generate().
         """
+        model_hint = self._coerce_tier(model_hint, tier)
         if not prompt:
             return ""
         proxy = _llm_proxy_url()
@@ -3250,8 +3350,12 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
             conv_id: Optional[str] = None,
+            *,
+            tier: Optional[Tier] = None,
     ):
         """Async streaming generator — yields str tokens then a sentinel dict.
+
+        tier: OPTIONAL approved application tier — see generate().
 
         Mirrors stream() but runs entirely on the event loop so FastAPI's async
         StreamingResponse can flush each token to the client the instant it
@@ -3265,6 +3369,7 @@ class ModelRouter:
         does not support async_stream() (e.g. local LLM, direct gateway without
         proxy).
         """
+        model_hint = self._coerce_tier(model_hint, tier)
         if not prompt:
             return
 

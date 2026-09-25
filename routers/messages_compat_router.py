@@ -332,6 +332,15 @@ def _normalise_model(model: str) -> str:
     )
     m = model.lower().strip()
 
+    # Observability only — does NOT change what this function returns.
+    # Records that a CLI client sent a provider/SKU-shaped alias rather than a
+    # concrete model id, so the Phase 1 compatibility shim has a removal gate
+    # (see core/tiers.py::note_legacy_alias). Concrete model ids and in-house
+    # names fall through the table and are not counted.
+    from core.tiers import LEGACY_INBOUND_ALIASES as _LEGACY_ALIASES, note_legacy_alias
+    if m in _LEGACY_ALIASES:
+        note_legacy_alias(m, surface="cli")
+
     # ── Anthropic Claude ───────────────────────────────────────────────────────
     if m in ("claude", "sonnet", "complex", "claude-sonnet-4-6"):
         return CLAUDE_PRIMARY_MODEL

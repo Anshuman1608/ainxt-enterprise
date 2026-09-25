@@ -351,10 +351,94 @@ class ProviderUpdate(BaseModel):
     api_key: Optional[str] = None   # rotate when present
 
 
+# ── Capability schema (Phase 2 of the LLM tier governance migration) ─────────
+#
+# `capabilities` stays a free-form JSONB dict — a provider may report anything
+# and we must not drop it. But the keys the Phase 3 resolver will FILTER ON are
+# validated, because a typo or a wrong type there does not fail loudly: it
+# silently makes a model ineligible for a tier, or (worse) eligible for one it
+# cannot serve. Unknown keys pass through untouched.
+_CAP_MODALITIES = {"text", "image-in", "image-out", "video-out", "audio-in"}
+_CAP_PRIVACY_CLASSES = {"deployment_local", "external"}
+_CAP_BILLING_TIERS = {"paid", "free"}
+_CAP_INT_KEYS = ("context_window", "reserved_output", "max_output_tokens")
+_CAP_NUMERIC_KEYS = ("cost_per_1m_input", "cost_per_1m_output", "cost_per_second")
+_CAP_BOOL_KEYS = (
+    "supports_temperature", "supports_tools",
+    "supports_streaming", "supports_structured_output", "requires_tools",
+)
+
+
+def _validate_capabilities(caps: Optional[dict]) -> Optional[dict]:
+    """Type/enum-check the governed capability keys. Unknown keys pass through.
+
+    Raises ValueError (surfaced by pydantic as a 422) rather than coercing:
+    an admin who types "deployment-local" instead of "deployment_local" must
+    be told, not silently given a model that fails every no-cloud-egress
+    request.
+    """
+    if caps is None:
+        return None
+    if not isinstance(caps, dict):
+        raise ValueError("capabilities must be an object")
+
+    for key in _CAP_INT_KEYS:
+        if key in caps and caps[key] is not None:
+            if not isinstance(caps[key], int) or isinstance(caps[key], bool) or caps[key] <= 0:
+                raise ValueError(f"capabilities.{key} must be a positive integer")
+
+    for key in _CAP_NUMERIC_KEYS:
+        if key in caps and caps[key] is not None:
+            if isinstance(caps[key], bool) or not isinstance(caps[key], (int, float)) or caps[key] < 0:
+                raise ValueError(f"capabilities.{key} must be a non-negative number")
+
+    for key in _CAP_BOOL_KEYS:
+        if key in caps and caps[key] is not None and not isinstance(caps[key], bool):
+            raise ValueError(f"capabilities.{key} must be true or false")
+
+    modality = caps.get("modality")
+    if modality is not None:
+        # Accept a bare string for backward compatibility: rows seeded before
+        # this change stored e.g. "video", and Chat.jsx still reads that shape.
+        values = [modality] if isinstance(modality, str) else modality
+        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+            raise ValueError("capabilities.modality must be a string or list of strings")
+        unknown = sorted(set(values) - _CAP_MODALITIES - {"video", "image"})
+        if unknown:
+            raise ValueError(
+                f"capabilities.modality has unknown value(s) {unknown}; "
+                f"allowed: {sorted(_CAP_MODALITIES)}"
+            )
+
+    privacy = caps.get("privacy_class")
+    if privacy is not None and privacy not in _CAP_PRIVACY_CLASSES:
+        raise ValueError(
+            f"capabilities.privacy_class must be one of {sorted(_CAP_PRIVACY_CLASSES)}"
+        )
+
+    billing = caps.get("billing_tier")
+    if billing is not None and billing not in _CAP_BILLING_TIERS:
+        raise ValueError(
+            f"capabilities.billing_tier must be one of {sorted(_CAP_BILLING_TIERS)}"
+        )
+
+    channels = caps.get("channels")
+    if channels is not None:
+        if not isinstance(channels, list) or not all(isinstance(c, str) for c in channels):
+            raise ValueError("capabilities.channels must be a list of strings")
+
+    return caps
+
+
 class ModelCreate(BaseModel):
     model_id: str
     display_name: str
     capabilities: Optional[dict] = None
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, v: Optional[dict]) -> Optional[dict]:
+        return _validate_capabilities(v)
 
     @field_validator("model_id")
     @classmethod
@@ -379,6 +463,11 @@ class ModelUpdate(BaseModel):
     enabled: Optional[bool] = None
     is_default: Optional[bool] = None
     sort_order: Optional[int] = None
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, v: Optional[dict]) -> Optional[dict]:
+        return _validate_capabilities(v)
 
 
 class PullModelRequest(BaseModel):
@@ -695,6 +784,18 @@ def _upsert_discovered_models(provider: LLMProvider, discovered: List[dict], db:
     does for providers seeded from .env."""
     existing = {m.model_id: m for m in db.query(LLMModel).filter_by(provider_id=provider.id).all()}
 
+    # privacy_class is a property of the PROVIDER (family + base_url), so it is
+    # derived once here rather than per model. It is applied only when absent:
+    # the merge below lets discovery win over stored values, and this field is
+    # explicitly admin-overridable — an `openai_compatible` endpoint can be
+    # either on-prem or a hosted aggregator and only the operator knows which.
+    # Fails safe to "external" (see core.llm_provider_registry).
+    try:
+        from core.llm_provider_registry import derive_privacy_class
+        _derived_privacy = derive_privacy_class(provider.family, provider.base_url)
+    except Exception:
+        _derived_privacy = "external"
+
     added, updated, unchanged = [], [], []
     for d in discovered:
         mid = d["model_id"]
@@ -703,15 +804,19 @@ def _upsert_discovered_models(provider: LLMProvider, discovered: List[dict], db:
             # Merge rather than overwrite — never clobber capability fields an
             # admin already hand-edited that discovery doesn't report.
             merged = {**(m.capabilities or {}), **{k: v for k, v in d["capabilities"].items() if v is not None}}
+            # Backfill only. An admin-set value already in `merged` is kept.
+            merged.setdefault("privacy_class", _derived_privacy)
             if merged != (m.capabilities or {}):
                 m.capabilities = merged
                 updated.append(mid)
             else:
                 unchanged.append(mid)
         else:
+            _caps = dict(d["capabilities"] or {})
+            _caps.setdefault("privacy_class", _derived_privacy)
             db.add(LLMModel(
                 provider_id=provider.id, model_id=mid, display_name=d["display_name"],
-                capabilities=d["capabilities"], enabled=True, source="discovered",
+                capabilities=_caps, enabled=True, source="discovered",
                 created_by=created_by,
             ))
             added.append(mid)

@@ -65,6 +65,15 @@ _prom_model_tokens          = Counter(f'{_MP}_model_tokens_total',     'Tokens c
 _prom_model_cost_usd        = Counter(f'{_MP}_model_cost_usd_total',   'Cost in USD per model', ['model'])
 _prom_tool_failures         = Counter(f'{_MP}_tool_failures_total',    'Agent tool failures',   ['tool'])
 _prom_cache_type_hits       = Counter(f'{_MP}_cache_type_hits_total',  'Cache hits by type',    ['cache_type'])
+# Legacy model-alias translations at an inbound client boundary (CLI, IDE).
+# This is the REMOVAL GATE for the compatibility shim introduced in Phase 1 of
+# the LLM tier governance migration: the shim may only be deleted (Phase 10)
+# once this counter has read zero for a full release, proving no client still
+# sends a provider/SKU-shaped hint. `alias` is bounded by the fixed
+# core.tiers.LEGACY_INBOUND_ALIASES table, so label cardinality is capped.
+_prom_legacy_alias          = Counter(f'{_MP}_legacy_model_alias_total',
+                                      'Legacy model-alias translations at a client boundary',
+                                      ['alias', 'surface'])
 
 # ── Operational metrics (Engine gap P1) ──────────────────────────────────────
 _prom_tool_latency          = Histogram(f'{_MP}_tool_latency_seconds',
@@ -501,6 +510,18 @@ class _TelemetryMetrics:
     def record_cache_hit(self, cache_type: str):
         self.inc("cache_hits")
         _prom_cache_type_hits.labels(cache_type=cache_type).inc()
+
+    def record_legacy_alias(self, alias: str, surface: str):
+        """Count one legacy model-alias translation at a client boundary.
+
+        `surface` is the inbound client ("cli" | "ide"). Never raises — this is
+        pure observability on a request path, so a metrics problem must not
+        break a user's request.
+        """
+        try:
+            _prom_legacy_alias.labels(alias=alias, surface=surface).inc()
+        except Exception:   # noqa: BLE001 — telemetry must never break routing
+            pass
 
     def to_prometheus(self) -> str:
         return generate_latest().decode("utf-8")

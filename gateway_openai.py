@@ -16,6 +16,19 @@ from agents.compliance_engine import compliance_engine
 
 from core.model_registry import OPENAI_PRIMARY_MODEL, OPENAI_IMAGE_MODEL
 
+
+def _resolve_provider_base_url(family: str, env_var: str):
+    """Admin-configured provider endpoint, else the env default, else None.
+
+    Deferred import + total failure containment so an unreachable registry can
+    never stop this gateway from constructing.
+    """
+    try:
+        from core.llm_provider_registry import provider_base_url_or_env
+        return provider_base_url_or_env(family, env_var)
+    except Exception:
+        return (os.getenv(env_var) or "").strip() or None
+
 MODEL = OPENAI_PRIMARY_MODEL
 
 # Gap #2 (7/7): stream reasoning deltas live when the model actually exposes
@@ -136,10 +149,21 @@ class OpenAIGateway:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY not set")
 
+        # Admin-configured endpoint wins over OPENAI_BASE_URL (F3). Previously
+        # llm_providers.base_url was honoured only on the registry dispatch
+        # path, so an administrator pointing this provider at a regional
+        # gateway, proxy, or compliance egress was silently ignored here.
+        _base_url = _resolve_provider_base_url("openai", env_var="OPENAI_BASE_URL")
+
         # No proxy needed — this gateway runs on the LLM proxy server which has direct
         # outbound access to api.openai.com via firewall allowlist.
         _t = float(os.getenv("LLM_TIMEOUT_SEC", "300"))
-        self.client = OpenAI(api_key=api_key, timeout=None if _t <= 0 else _t)
+        self.client = OpenAI(
+            api_key=api_key,
+            timeout=None if _t <= 0 else _t,
+            # Omitted when unset so the SDK keeps its own default.
+            **({"base_url": _base_url} if _base_url else {}),
+        )
 
         # Real token counts from the last API call — read by model_router
         self._last_input_tokens  = 0

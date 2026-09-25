@@ -14,6 +14,19 @@ from agents.compliance_engine import compliance_engine
 from core.model_registry import GEMINI_VISION_MODEL, GEMINI_IMAGE_MODEL, veo_model as _veo_model
 
 
+def _resolve_provider_base_url(family: str, env_var: str):
+    """Admin-configured provider endpoint, else the env default, else None.
+
+    Deferred import + total failure containment so an unreachable registry can
+    never stop this gateway from constructing.
+    """
+    try:
+        from core.llm_provider_registry import provider_base_url_or_env
+        return provider_base_url_or_env(family, env_var)
+    except Exception:
+        return (os.getenv(env_var) or "").strip() or None
+
+
 # Default model for generate() when caller passes no `model`.
 # GEMINI_VISION_MODEL now defaults to GEMINI_TEXT_MODEL (gemini-3.5-flash) —
 # a multimodal model that can analyse images and return text. Previously
@@ -81,9 +94,33 @@ class GeminiGateway:
         if not api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
 
+        # Admin-configured endpoint wins over GEMINI_BASE_URL (F3). Previously
+        # llm_providers.base_url was honoured only on the registry dispatch
+        # path, so an administrator pointing this provider at a regional
+        # gateway, proxy, or compliance egress was silently ignored here.
+        _base_url = _resolve_provider_base_url("gemini", env_var="GEMINI_BASE_URL")
+
         # No proxy needed — this gateway runs on the LLM proxy server which has direct
         # outbound access to generativelanguage.googleapis.com via firewall allowlist.
-        self.client = genai.Client(api_key=api_key)
+        if _base_url:
+            # google-genai takes a custom endpoint via http_options, not a
+            # top-level base_url kwarg. Guarded so an SDK version without
+            # HttpOptions degrades to the default endpoint rather than failing
+            # to construct the gateway at all.
+            try:
+                from google.genai import types as _genai_types
+                self.client = genai.Client(
+                    api_key=api_key,
+                    http_options=_genai_types.HttpOptions(base_url=_base_url),
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Gemini Gateway: custom base_url {_base_url!r} could not be "
+                    f"applied ({exc}) — falling back to the SDK default endpoint"
+                )
+                self.client = genai.Client(api_key=api_key)
+        else:
+            self.client = genai.Client(api_key=api_key)
 
         # Real token counts from the last API call — read by model_router
         self._last_input_tokens  = 0

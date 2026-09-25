@@ -37,3 +37,27 @@ tests/core/ckms/test_bootstrap.py::test_wrong_key_tag_mismatch_aborts
 tests/core/test_coach_events.py::test_channel_from_client_source[ide-ide]
 tests/core/test_coach_events.py::test_channel_from_client_source[ide-vscode-ide]
 tests/core/test_coach_events.py::test_channel_from_client_source[vscode-ide]
+
+# ── Added 2026-09-25 with tests/models, tests/router_policy and tests/pipeline ──
+# Those three directories were never in the CI path list, so the suites covering
+# the model router, privacy floor and routing wiring ran nowhere. Adding them
+# surfaced two PRE-EXISTING failures, neither related to the tier-governance
+# change that prompted the audit. Both are env-shape problems: the CI job sets no
+# model env vars, so the constants these tests read resolve to "".
+#
+# 1. test_followup_condenser.py fails at COLLECTION (not at test time):
+#    KB_FOLLOWUP_CONDENSE_MODEL_CHAIN is unset, so the chain is shorter than the
+#    module-level `_CONDENSE_MODEL_CHAIN[1]` subscript at line 226. Verified
+#    pre-existing: models/followup_condenser.py is untouched by this change, and
+#    the whole file collects fine once the env var is populated.
+# 2. test_async_stream_reports_actual_claude_fallback_when_openai_unavailable
+#    asserts the streamed model_id equals CLAUDE_PRIMARY_MODEL, which is "" in
+#    CI, while the router reports "unknown". Verified pre-existing: the test
+#    passes unchanged with CLAUDE_PRIMARY_MODEL=claude-sonnet-4-6 set.
+#
+# Both should be fixed by making the tests env-independent rather than by
+# setting model env vars in CI — that would contradict the migration's goal of
+# removing model identity from the environment. Not done here: fixing unrelated
+# pre-existing failures inside a governance migration is out of scope.
+tests/models/test_followup_condenser.py
+tests/models/test_model_router_async_stream.py::test_async_stream_reports_actual_claude_fallback_when_openai_unavailable

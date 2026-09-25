@@ -48,6 +48,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -78,6 +79,15 @@ CLIENT_DESKTOP       = "desktop"
 # Buddy/Office sidebar entry is desktopOnly, so there is no web-based Buddy
 # client. Downstream code tags every such request DESKTOP-BUDDY.
 CLIENT_BUDDY         = "buddy"
+
+# Kill-switch for the API-key → "api" classification at step 6 of _detect().
+# Default ON: without it capabilities.channels silently does not apply to SDK
+# clients. Kept switchable because this sits on an auth-adjacent hot path and a
+# deployment that discovers an unexpected channel denial needs a way back
+# without a rollback. Scheduled for removal once the behaviour has soaked.
+_API_KEY_DETECTION = os.getenv("CLIENT_SOURCE_API_DETECTION", "true").strip().lower() not in (
+    "false", "0", "no",
+)
 
 # Header sent by ainxt-cli and IDE plugins
 _HEADER = "x-ainxt-client"
@@ -144,7 +154,38 @@ def _detect(request: Request) -> str:
         if pattern.search(ua):
             return source
 
-    # 6. Default — browser / platform
+    # 6. Bearer token is an API key → direct API caller.
+    #    Reached ONLY when the request carries no client header, is not on the
+    #    IDE path, and has an unrecognised User-Agent — i.e. exactly an SDK
+    #    client (openai-python, anthropic-sdk, node-fetch, ...) whose UA
+    #    matches none of the patterns above and which therefore fell through
+    #    to "platform".
+    #
+    #    Why this matters: capabilities.channels is the mechanism replacing the
+    #    per-SKU channel feature flags (ENABLE_CHAT_OPUS, ENABLE_CLI_OPUS_48,
+    #    ENABLE_CLI_OPUS_5). Without this branch those restrictions silently do
+    #    not apply to API callers, so retiring working flags onto a
+    #    silently-bypassed mechanism would be a governance regression.
+    #
+    #    CLI and IDE clients authenticate with API keys too, which is why this
+    #    sits at position 6 rather than higher: both always send
+    #    X-AiNxt-Client and are already classified at step 2. This branch
+    #    therefore only ever NARROWS the platform default and cannot
+    #    reclassify a request that was previously correct.
+    #
+    #    is_api_key() is a pure string-shape check (no DB, no I/O), so it is
+    #    safe on the middleware hot path, which runs before auth resolution.
+    if _API_KEY_DETECTION:
+        try:
+            auth = request.headers.get("authorization", "")
+            if auth[:7].lower() == "bearer ":
+                from auth.api_key_auth import is_api_key
+                if is_api_key(auth[7:].strip()):
+                    return CLIENT_API
+        except Exception:   # noqa: BLE001 — classification must never 500 a request
+            pass
+
+    # 7. Default — browser / platform
     return CLIENT_PLATFORM
 
 
