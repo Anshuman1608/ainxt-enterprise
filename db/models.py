@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, Float, ForeignKey,
-    Index, Integer, Numeric, SmallInteger, String, Text, UniqueConstraint, func, text
+    Index, Integer, Numeric, PrimaryKeyConstraint, SmallInteger, String, Text,
+    UniqueConstraint, func, text
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
@@ -502,6 +503,13 @@ class ModelUsage(Base):
     # SQL INSERT already does.
     cache_read_tokens  = Column(BigInteger, nullable=False, default=0)
     cache_write_tokens = Column(BigInteger, nullable=False, default=0)
+    # ── Tier governance audit (plan.html §L.5) ───────────────────────────────
+    # "Why did this request use this model?" — unanswerable today, because a
+    # row records only the concrete model that ran. Both stay NULL until the
+    # Phase 5 resolver switchover populates them; historical rows are never
+    # backfilled, because the answer for them is genuinely unknown.
+    selection_mode = Column(String(16), nullable=True)   # tier | explicit | fallback
+    requested_tier = Column(String(32), nullable=True)   # the core.tiers.Tier asked for
     # IST (not UTC, unlike every other table's created_at — see _now_ist()
     # docstring) per chargeback/audit-facing requirement: users reading their
     # model_usages rows expect wall-clock IST timestamps, not UTC.
@@ -2844,3 +2852,53 @@ class LLMModel(Base):
     created_by   = Column(String(255), nullable=True)
     created_at   = Column(DateTime, nullable=False, default=_now)
     updated_at   = Column(DateTime, nullable=False, default=_now, onupdate=_now)
+
+
+class LLMTierModel(Base):
+    """Which models an administrator considers eligible for a capability tier.
+
+    The join that the eight provider-neutral tiers in core/tiers.py were
+    missing. A tier has many candidate models in priority order; a model may
+    serve several tiers, or none — a model with no tier is still directly
+    user-selectable, because tiers govern only what the PLATFORM picks when it
+    chooses on the user's behalf (Chat Auto, agents, SDLC stages, document
+    generation, classification).
+
+    `tier` is VARCHAR + CHECK rather than a native ENUM: this schema has no
+    native enums, every other constrained vocabulary here (source_type,
+    rag_mode, status, source) is CHECK-enforced, and a CHECK can be replaced
+    inside a transaction whereas Postgres cannot RENAME or DROP an enum value.
+    The constraint is added by db/migrate.py Part AD1, which builds its value
+    list from core.tiers.ALL_TIERS so the two cannot drift.
+
+    `model_id` references llm_models.id — the row UUID, NOT llm_models.model_id,
+    which is the string sent to the provider's API. ON DELETE CASCADE so
+    deleting a model in the admin screen drops its tier memberships instead of
+    leaving a dangling reference; the tier survives with its remaining
+    candidates, and if none remain it becomes unassigned and the features that
+    request it report unavailable rather than silently substituting a model
+    that cannot do the job.
+    """
+    __tablename__ = "llm_tier_models"
+    __table_args__ = (
+        PrimaryKeyConstraint("tier", "model_id", "org_id",
+                             name="pk_llm_tier_models"),
+        # DEFERRABLE because PUT /tiers/{tier}/models replaces a whole ordered
+        # list in one transaction: a straight delete-then-insert of a reordered
+        # list transiently duplicates a priority mid-transaction.
+        UniqueConstraint("tier", "priority", "org_id", name="uq_tier_priority",
+                         deferrable=True, initially="DEFERRED"),
+        Index("ix_tier_models_lookup", "tier", "org_id", "enabled", "priority"),
+    )
+
+    tier       = Column(String(32), nullable=False)   # CHECKed to core.tiers.ALL_TIERS
+    model_id   = Column(UUID(as_uuid=False),
+                        ForeignKey("llm_models.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    priority   = Column(Integer, nullable=False, default=100)   # lower = preferred
+    role       = Column(String(32), nullable=True)   # NULL = general candidate; 'review' = §M.3
+    enabled    = Column(Boolean, nullable=False, default=True)
+    org_id     = Column(String(255), nullable=False, default="default", index=True)
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_now)
+    updated_at = Column(DateTime, nullable=False, default=_now, onupdate=_now)

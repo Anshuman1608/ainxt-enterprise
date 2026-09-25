@@ -14,7 +14,9 @@
 #   CI_NODE_VERSION       default "20"
 #   CI_RUN_TIER2          default "true"   — set "false" to skip the test job
 #   CI_PYTEST_PATHS       default "tests/auth tests/config tests/core
-#                                    tests/agents tests/store tests/cil"
+#                                    tests/agents tests/store tests/cil
+#                                    tests/models tests/router_policy
+#                                    tests/pipeline tests/routers"
 #                                          — set "tests" for the full suite
 #   CI_WARN_ONLY          default "false"  — "true" reports without failing,
 #                                            useful while adopting CI
@@ -203,7 +205,15 @@ jobs:
           # "full suite green" was a vacuous claim for exactly the code being
           # changed. Pre-existing failures in the three new directories were
           # baselined into known_failures.txt in the same change.
-          PATHS="${{ github.event.inputs.pytest_paths || vars.CI_PYTEST_PATHS || 'tests/auth tests/config tests/core tests/agents tests/store tests/cil tests/models tests/router_policy tests/pipeline' }}"
+          #
+          # tests/routers added 2026-09-25 (Phase 3): the tier-governance admin
+          # API. A new directory, so it carries no pre-existing failures and
+          # needed no re-baselining. Its route-shadowing test is the reason it
+          # must run in CI — model_governance_router declares GET /{dept} under
+          # the same prefix, so a change to router include order in gateway.py
+          # would silently turn GET /model-governance/tiers into a department
+          # lookup with no other signal.
+          PATHS="${{ github.event.inputs.pytest_paths || vars.CI_PYTEST_PATHS || 'tests/auth tests/config tests/core tests/agents tests/store tests/cil tests/models tests/router_policy tests/pipeline tests/routers' }}"
           echo "pytest paths: $PATHS"
           # -rfE (was -rf): a COLLECTION error prints under "=== ERRORS ===" with
           # a leading-underscore banner that compare_test_failures.py's

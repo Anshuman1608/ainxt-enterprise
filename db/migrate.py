@@ -1349,6 +1349,11 @@ CREATE INDEX IF NOT EXISTS idx_sec_scan_scanned_at ON security_scan_results(scan
     # ── Part AC4: 2026-09-25 — backfill privacy_class/modality capabilities ────
     _part_ac4_capability_backfill_2026_09_25()
 
+    # ── Part AD1: 2026-09-25 — tier-assignment table constraint + seed ────────
+    # Must follow AC4: the seed filters candidates on capabilities.modality,
+    # which AC4 is what puts on pre-existing rows.
+    _part_ad1_tier_models_2026_09_25()
+
     # ── OSS schema-drift fixes ───────────────────────────────────────────────
     # (_part_oss3 runs at the top of this function — the catalogue seeds need it.)
     _part_oss4_model_permissions_web_search()
@@ -8375,6 +8380,224 @@ def _part_ac4_capability_backfill_2026_09_25():
     except Exception as exc:
         db.rollback()
         print(f"  (skipped) Part AC4: capability backfill failed — {exc}")
+    finally:
+        db.close()
+
+
+def _part_ad1_tier_models_2026_09_25():
+    """
+    2026-09-25 — Phase 3: constrain `llm_tier_models.tier`, add the §L.5 audit
+    columns, and seed each tier from today's EFFECTIVE resolution.
+
+    The table itself is created by create_all() from db/models.py::LLMTierModel.
+    This part adds what the ORM cannot express portably and then seeds.
+
+    Seeding from *today's effective resolution* is the whole point: after this
+    migration `resolve_tier(t)` must return the same model the platform would
+    have chosen anyway, so that when Phase 5 flips the router over, upgrading
+    changes nothing. Where that cannot be determined the tier is left
+    UNASSIGNED, never guessed at — an unassigned tier reports the feature
+    unavailable, which is the honest answer and the one plan.html §J.2
+    specifies.
+
+    Three invariants:
+      * IDEMPOTENT — a tier that already has any row is skipped entirely.
+      * NEVER OVERWRITES an operator's assignment, for the same reason.
+      * NEVER writes a row the admin API would reject: the same blocked-model
+        and modality checks run here, so the seed cannot create state that
+        PUT /model-governance/tiers/{tier}/models would 422 on.
+    """
+    from sqlalchemy import text as _sa_text
+
+    try:
+        from core.tiers import ALL_TIERS, MODALITY_REQUIREMENT, MODALITY_TEXT, Tier
+    except Exception as exc:
+        print(f"  (skipped) Part AD1: core.tiers import failed — {exc}")
+        return
+
+    # ── 1. CHECK constraint, built FROM core.tiers so the two cannot drift ───
+    # VARCHAR + CHECK rather than a native ENUM: this schema has no native
+    # enums, every other constrained vocabulary here is CHECK-enforced, and a
+    # CHECK can be swapped inside a transaction whereas Postgres cannot RENAME
+    # or DROP an enum value. The invariant is identical — no INSERT path can
+    # invent a ninth tier.
+    _tier_list = ", ".join(f"'{t.value}'" for t in ALL_TIERS)
+    _run_ddl(f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'ck_llm_tier_models_tier'
+                  AND conrelid = '{DB_SCHEMA}.llm_tier_models'::regclass
+            ) THEN
+                ALTER TABLE {DB_SCHEMA}.llm_tier_models
+                    ADD CONSTRAINT ck_llm_tier_models_tier
+                    CHECK (tier IN ({_tier_list}));
+            END IF;
+        END $$;
+    """)
+
+    # ── 2. §L.5 audit columns — additive, nullable, no backfill ──────────────
+    # Nothing writes these until the Phase 5 switchover. Historical rows are
+    # deliberately not backfilled: for a request that predates tier governance
+    # the answer to "why this model?" is genuinely unknown, and inventing one
+    # would corrupt the audit trail this column exists to improve.
+    _run_ddl(f"""
+        ALTER TABLE {DB_SCHEMA}.model_usages
+            ADD COLUMN IF NOT EXISTS selection_mode VARCHAR(16)
+    """)
+    _run_ddl(f"""
+        ALTER TABLE {DB_SCHEMA}.model_usages
+            ADD COLUMN IF NOT EXISTS requested_tier VARCHAR(32)
+    """)
+
+    # ── 3. Seed ──────────────────────────────────────────────────────────────
+    from db.database import SessionLocal
+
+    try:
+        import core.model_registry as _reg
+        from core.llm_provider_registry import get_enabled_models
+    except Exception as exc:
+        print(f"  (skipped) Part AD1 seed: registry import failed — {exc}")
+        return
+
+    def _modality_of(caps: dict) -> list:
+        """Read `capabilities.modality` in every shape the column may hold.
+
+        A bare "video" is the pre-Phase-2 form still consumed by ai-ui
+        (Chat.jsx, KbChat.jsx branch on `modality === "video"`), so it has to
+        keep meaning what it meant. Absent means text-only, per §L.3a.
+        """
+        raw = (caps or {}).get("modality")
+        if raw is None:
+            return [MODALITY_TEXT]
+        if isinstance(raw, str):
+            return ["text", "video-out"] if raw == "video" else [raw]
+        if isinstance(raw, list):
+            return [m for m in raw if isinstance(m, str)]
+        return [MODALITY_TEXT]
+
+    def _satisfies(model: dict, tier) -> bool:
+        need = MODALITY_REQUIREMENT[tier]
+        return need in _modality_of(model.get("capabilities"))
+
+    # Each tier's resolution as the platform performs it TODAY. `_role_model`
+    # is core.model_registry's mirror of models/model_router._resolve_tier_model
+    # — same env-override → tier_tags → any-model-of-family chain — used here
+    # so the migration need not import the router (which pulls in the whole
+    # gateway stack). `tag` uses Part AC1's _AC1_MODEL_ROLE_TAGS vocabulary.
+    #
+    # IMPORTANT: this is NOT Phase 1's _TIER_TO_LEGACY_HINT. That map stubs
+    # IMAGE_OUTPUT and VIDEO_GENERATION onto "vision" because image and video
+    # generation bypass the router entirely today, which is harmless for a
+    # no-op translation but would seed the wrong model here.
+    def _legacy_pick(tier) -> str:
+        if tier == Tier.MINI:
+            return _reg._role_model(_reg.OPENAI_SIMPLE_MODEL, "openai", "simple")
+        if tier in (Tier.SIMPLE, Tier.INTENT_CLASSIFICATION):
+            return _reg._role_model(_reg.CLAUDE_HAIKU, "anthropic", "haiku")
+        if tier == Tier.MEDIUM:
+            return _reg._role_model(_reg.OPENAI_CODING_MODEL, "openai", "medium")
+        if tier == Tier.COMPLEX:
+            return _reg._role_model(_reg.CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
+        if tier == Tier.IMAGE_INPUT:
+            return _reg._role_model(_reg.GEMINI_IMAGE_MODEL, "gemini", "vision")
+        if tier == Tier.IMAGE_OUTPUT:
+            return _reg._role_model(_reg.GEMINI_IMAGE_MODEL, "gemini", "image-gen")
+        if tier == Tier.VIDEO_GENERATION:
+            try:
+                return _reg.veo_model()
+            except Exception:
+                return ""
+        return ""
+
+    db = SessionLocal()
+    try:
+        try:
+            blocked = set(_reg.BLOCKED_MODELS)
+        except Exception:
+            blocked = set()
+
+        models = [m for m in get_enabled_models() if m["model_id"] not in blocked]
+        if not models:
+            print("  ✓ Part AD1: no enabled models in the registry — all 8 tiers "
+                  "left unassigned (configure providers in the admin screen)")
+            return
+
+        # model_id (the provider API string) → row. Ambiguous when two enabled
+        # providers expose the same string, so apply get_model()'s documented
+        # convention: lowest sort_order, then earliest created_at — which is
+        # already the order get_enabled_models() returns, so first wins.
+        by_model_id: dict = {}
+        for m in models:
+            by_model_id.setdefault(m["model_id"], m)
+
+        existing = {
+            row[0] for row in db.execute(_sa_text(
+                f"SELECT DISTINCT tier FROM {DB_SCHEMA}.llm_tier_models "
+                f"WHERE org_id = 'default'"
+            ))
+        }
+
+        seeded, skipped, unassigned = [], [], []
+        for tier in ALL_TIERS:
+            if tier.value in existing:
+                skipped.append(tier.value)
+                continue
+
+            pick = by_model_id.get((_legacy_pick(tier) or "").strip())
+            if pick is not None and not _satisfies(pick, tier):
+                # The legacy chain named a model that cannot do this tier's
+                # job (e.g. a text model for image-output). Discard it rather
+                # than writing a row the resolver would have to reject anyway.
+                pick = None
+
+            if pick is None:
+                # Fall back within the tier's capability requirement, never
+                # across it. For the four text tiers this is effectively
+                # get_default_model_id(); for the three modality tiers it is a
+                # genuine capability match, and finding nothing means the
+                # deployment truly cannot serve that tier.
+                eligible = [m for m in models if _satisfies(m, tier)]
+                pick = next((m for m in eligible if m.get("is_default")),
+                            eligible[0] if eligible else None)
+
+            if pick is None:
+                unassigned.append(tier.value)
+                continue
+
+            db.execute(_sa_text(f"""
+                INSERT INTO {DB_SCHEMA}.llm_tier_models
+                    (tier, model_id, priority, role, enabled, org_id, created_by)
+                VALUES (:tier, :model_id, 100, NULL, TRUE, 'default', 'migration')
+                -- Target the PK explicitly: a bare ON CONFLICT considers every
+                -- unique constraint as an arbiter, and Postgres refuses to use
+                -- uq_tier_priority because it is DEFERRABLE.
+                ON CONFLICT (tier, model_id, org_id) DO NOTHING
+            """), {"tier": tier.value, "model_id": pick["id"]})
+            seeded.append((tier.value, pick["model_id"]))
+
+        db.commit()
+
+        for tier_name, model_name in seeded:
+            print(f"  + Part AD1: seeded {tier_name} -> {model_name}")
+        for tier_name in unassigned:
+            # NOT a "! " line: that prefix is captured by this module's print()
+            # shim as a migration FAILURE and makes migrate.py exit non-zero. An
+            # unassigned modality tier is a legitimate deployment state — a
+            # deployment with no image model simply cannot generate images —
+            # and stays legitimate until Phase 8 gates on it.
+            print(f"  ⚠ Part AD1: {tier_name} left UNASSIGNED — no enabled model "
+                  f"satisfies its modality requirement "
+                  f"({MODALITY_REQUIREMENT[Tier(tier_name)]}); "
+                  f"features using this tier will report unavailable")
+        if skipped:
+            print(f"  = Part AD1: {len(skipped)} tier(s) already assigned, left untouched")
+        if not seeded and not unassigned:
+            print("  ✓ Part AD1: llm_tier_models already seeded")
+    except Exception as exc:
+        db.rollback()
+        print(f"  (skipped) Part AD1 seed: {exc}")
     finally:
         db.close()
 

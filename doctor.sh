@@ -489,6 +489,34 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
     else
       pass "llm channel restrictions" "none — no model is channel-restricted"
     fi
+
+    # ── Tier assignment coverage (Phase 3) ──────────────────────────────────
+    # An unassigned tier is not an error: a deployment with no image model
+    # genuinely cannot generate images, and saying so is the point. But it
+    # silently disables whichever features request that tier, so it must be
+    # visible here rather than discovered when a user hits the feature.
+    tiers_n="$(run_sql "SELECT count(DISTINCT tier) FROM ainxt.llm_tier_models WHERE enabled = TRUE AND org_id = 'default'" | tr -d ' \r')"
+    if [[ -z "$tiers_n" ]]; then
+      warno "llm tier assignments" "llm_tier_models not queryable" \
+            "run: python db/migrate.py   (Part AD1 creates and seeds it)"
+    elif [[ "$tiers_n" -eq 8 ]]; then
+      pass "llm tier assignments" "all 8 tiers have at least one eligible model"
+    else
+      unassigned="$(run_sql "SELECT string_agg(t, ', ' ORDER BY t) FROM unnest(ARRAY['mini','simple','medium','complex','image-input','image-output','video-generation','intent-classification']) AS t WHERE t NOT IN (SELECT tier FROM ainxt.llm_tier_models WHERE enabled = TRUE AND org_id = 'default')" | tr -d '\r' | sed 's/^ *//;s/ *$//')"
+      warno "llm tier assignments" "$tiers_n/8 assigned — unassigned: ${unassigned:-unknown}" \
+            "features using these tiers report unavailable; assign models in Admin → Model Governance → Tiers"
+    fi
+
+    # A tier row whose model has since been disabled still occupies a priority
+    # slot but can never be selected — the admin screen shows it, the resolver
+    # skips it, and nothing else would ever say so.
+    stale_n="$(run_sql "SELECT count(*) FROM ainxt.llm_tier_models t JOIN ainxt.llm_models m ON m.id = t.model_id JOIN ainxt.llm_providers p ON p.id = m.provider_id WHERE t.enabled = TRUE AND (m.enabled = FALSE OR p.enabled = FALSE)" | tr -d ' \r')"
+    if [[ -n "$stale_n" && "$stale_n" -gt 0 ]]; then
+      warno "llm tier candidates live" "$stale_n assignment(s) point at a disabled model or provider" \
+            "they occupy a priority slot but can never be selected — re-enable or remove them"
+    else
+      pass "llm tier candidates live" "every assigned model is enabled"
+    fi
   fi
 fi
 

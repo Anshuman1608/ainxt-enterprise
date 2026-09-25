@@ -1231,6 +1231,7 @@ from routers.cowork_conversations_router import router as cowork_conversations_r
 from routers.code_conversations_router import router as code_conversations_router
 from routers.scim_router import router as scim_router
 from routers.agents_router import router as agents_catalog_router
+from routers.tier_governance_router import router as tier_governance_router
 from routers.model_governance_router import router as model_governance_router
 from routers.dept_metrics_router import router as dept_metrics_router
 from routers.api_keys_router import router as api_keys_router
@@ -1440,6 +1441,12 @@ app.include_router(scim_router)
 app.include_router(agents_catalog_router,   prefix="/ainxt/v1/api")
 app.include_router(prompt_mgmt_router,      prefix="/ainxt/v1/api")  # P10
 app.include_router(review_router,           prefix="/ainxt/v1/api")  # P12
+# MUST precede model_governance_router: that router declares
+# @router.get("/{dept}") under the same /model-governance prefix, and
+# FastAPI matches in registration order — so if it were included first,
+# GET /model-governance/tiers would be served as "the department named
+# 'tiers'" instead of the tier list.
+app.include_router(tier_governance_router, prefix="/ainxt/v1/api")
 app.include_router(model_governance_router, prefix="/ainxt/v1/api")
 app.include_router(dept_metrics_router,     prefix="/ainxt/v1/api")
 app.include_router(doc_download_router,     prefix="/ainxt/v1/api")

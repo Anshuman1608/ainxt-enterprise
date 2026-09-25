@@ -135,6 +135,47 @@ MODALITY_REQUIREMENT: Final[dict[Tier, str]] = {
 }
 
 
+# ── Presentation metadata ────────────────────────────────────────────────────
+# Lives here, beside the vocabulary it describes, so the admin screen cannot
+# invent a ninth tier by inventing a ninth label. Served by
+# GET /model-governance/tiers; never writable through any API.
+#
+# `used_by` is what an administrator most needs and cannot get anywhere else:
+# what actually breaks if this tier is left unassigned. Kept deliberately
+# concrete, and updated as each phase migrates its call sites.
+TIER_LABEL: Final[dict[Tier, str]] = {
+    Tier.MINI: "Mini",
+    Tier.SIMPLE: "Simple",
+    Tier.MEDIUM: "Medium",
+    Tier.COMPLEX: "Complex",
+    Tier.IMAGE_INPUT: "Image Input",
+    Tier.IMAGE_OUTPUT: "Image Output",
+    Tier.VIDEO_GENERATION: "Video Generation",
+    Tier.INTENT_CLASSIFICATION: "Intent Classification",
+}
+
+TIER_DESCRIPTION: Final[dict[Tier, str]] = {
+    Tier.MINI: "Cheapest capable \u00b7 very high volume",
+    Tier.SIMPLE: "Short bounded / structured output",
+    Tier.MEDIUM: "General reasoning / coding",
+    Tier.COMPLEX: "Deep reasoning / agentic code",
+    Tier.IMAGE_INPUT: "Image \u2192 text",
+    Tier.IMAGE_OUTPUT: "Text \u2192 image",
+    Tier.VIDEO_GENERATION: "Text \u2192 video \u00b7 billed per second",
+    Tier.INTENT_CLASSIFICATION: "Hot path \u2014 every Auto turn",
+}
+
+TIER_USED_BY: Final[dict[Tier, tuple[str, ...]]] = {
+    Tier.MINI: ("Index enrichment", "Prompt enhancement"),
+    Tier.SIMPLE: ("Titles", "Summaries", "JSON verdicts"),
+    Tier.MEDIUM: ("Chat Auto default", "IDE", "Statements"),
+    Tier.COMPLEX: ("Agents", "SDLC", "Documents", "Skills"),
+    Tier.IMAGE_INPUT: ("Image Q&A", "Document image parsing"),
+    Tier.IMAGE_OUTPUT: ("Chat image generation",),
+    Tier.VIDEO_GENERATION: ("Chat video generation",),
+    Tier.INTENT_CLASSIFICATION: ("Chat Auto routing", "Document intent"),
+}
+
 # ── Legacy inbound aliases (BOUNDARY ONLY — bounded lifetime) ────────────────
 # CLI and IDE clients send provider/SKU-shaped hints today. Confirmed in the
 # Phase 0 audit:
