@@ -65,6 +65,22 @@ from core.kv_cache_hoist import (
 router = APIRouter(tags=["knowledge_base_ask"])
 
 
+def _last_selection_audit() -> dict:
+    """§L.5 provenance for an ainxt.metrics row: why did this model run?
+
+    Imported lazily, and swallowing every failure, because it decorates an
+    audit event that is already best-effort — the producers around it log and
+    continue when Kafka is unreachable. A usage row with no provenance is a
+    gap in the tier-rollout measurement; a usage row that never got written
+    because the provenance lookup raised would be a gap in the billing trail.
+    """
+    try:
+        from models.model_router import last_selection_audit
+        return last_selection_audit()
+    except Exception:  # noqa: BLE001
+        return {"selection_mode": None, "requested_tier": None}
+
+
 # ---------------------------------------------------------------------------
 # Request model — KB-relevant fields only (subset of gateway.py's Question)
 # ---------------------------------------------------------------------------
@@ -1092,6 +1108,8 @@ async def kb_ask_ai(
                 "WEB-CHAT"
             )
             _kafka_produce("ainxt.metrics", {
+                # §L.5 — why this model: tier | explicit | fallback | NULL
+                **_last_selection_audit(),
                 "event":          "llm_cost",
                 "request_id":     request_id,
                 "user_id":        _user_id,

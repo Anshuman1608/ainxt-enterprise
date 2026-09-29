@@ -75,11 +75,48 @@ _GOOGLE_STANDARD_PREFIXES  = ("gemini-3.", "gemini-")
 _LOCAL_PREFIXES            = ("local:", "kimi-", "glm-", "deepseek-", "qwen-", "gemma-")
 
 
+# Provider family, as the registry records it, → pricing-row prefix. This is
+# the authority; the model-id prefixes below are the fallback.
+_FAMILY_TO_PRICING = {
+    "anthropic": "anthropic:web_search",
+    "gemini":    "google:web_search:standard",
+    "ollama":    None,   # in-house — web search is not billed per call
+}
+
+
+def _family_from_registry(model_id: str) -> str | bool:
+    """The provider family the ADMIN configured for this model, or False.
+
+    plan.html's Phase 0 audit calls the prefix matching below "a fifth
+    provider-abstraction leak": it decides who made a model by how its name is
+    spelled, so an Anthropic model served through a renamed endpoint, or any
+    provider that ships a model not matching a known prefix, is mispriced.
+    The registry knows the answer and is the only thing that does.
+
+    Returns False — not None — when the model is unknown, because None is a
+    meaningful family answer elsewhere in this module.
+    """
+    try:
+        from core.llm_provider_registry import get_enabled_models
+        for m in get_enabled_models():
+            if m["model_id"].lower() == model_id:
+                return m["family"]
+    except Exception as exc:  # noqa: BLE001 — pricing must never break a call
+        logger.debug("proxy_tool_use: registry family lookup failed: %s", exc)
+    return False
+
+
 def _resolve_web_search_pricing_key(model: str) -> str | None:
     """Map a model ID to its model_rate_table pricing row key.
 
     Returns None for local/in-house models (web search not applicable).
     Returns a model_rate_table model_id string for cloud models.
+
+    Registry family first, model-id prefix second. The prefix table is NOT
+    dead code and is not being phased out here: this function prices a call
+    that has already happened, and the model that ran may be retired, renamed,
+    or never have been in this deployment's registry at all. A historical id
+    must still price correctly, and only the prefixes can do that.
     """
     m = (model or "").lower().strip()
     # Strip display-name wrappers like "Claude Sonnet (claude-sonnet-4-6)"
@@ -87,6 +124,22 @@ def _resolve_web_search_pricing_key(model: str) -> str | None:
         inner = m[m.rfind("(") + 1: m.rfind(")")]
         if inner:
             m = inner
+
+    family = _family_from_registry(m)
+    if family is not False:
+        if family in _FAMILY_TO_PRICING:
+            return _FAMILY_TO_PRICING[family]
+        if family == "openai":
+            # The reasoning-vs-standard split is a PRICING distinction with no
+            # registry equivalent — OpenAI charges differently for the two and
+            # capabilities carries no field that says which a model is. Falling
+            # through to the prefixes here is not a provider-abstraction leak;
+            # it is the pricing table's own vocabulary.
+            pass
+        elif family == "openai_compatible":
+            # Genuinely unknown: the same wire format serves an on-prem server
+            # and a hosted aggregator. Fall through rather than guess.
+            pass
 
     if any(m.startswith(p) for p in _LOCAL_PREFIXES) or m in ("local", "local-llm"):
         return None

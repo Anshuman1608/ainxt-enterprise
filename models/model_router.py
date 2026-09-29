@@ -49,6 +49,12 @@ from core.logger import logger
 from core.proxy_tool_use import llm_proxy_headers as _llm_proxy_headers
 # core.tiers is a leaf module (stdlib only) — safe to import at module scope.
 from core.tiers import Tier
+
+# core.tier_resolver reaches the DB and the registry, so it is imported lazily
+# inside route(). This one constant is duplicated rather than imported to keep
+# the module-scope import surface as narrow as it was before Phase 5; a test
+# asserts the two agree (tests/models/test_tier_switchover.py).
+_ROLE_REVIEW = "review"
 from core.model_registry import (
     OPENAI_SIMPLE_MODEL,
     OPENAI_CODING_MODEL,
@@ -822,6 +828,18 @@ _PRIVACY_FLOOR_ENFORCE = os.getenv("PRIVACY_FLOOR_ENFORCE", "true").lower() == "
 # INTERNAL and PUBLIC may use cloud models; everything above stays local.
 _LOCAL_ONLY_CLASSIFICATIONS = frozenset({"CONFIDENTIAL", "RESTRICTED", "PCI_SENSITIVE"})
 
+# Returned verbatim when the privacy floor is in force and the local model is
+# down. Hoisted to a module constant so _try_local_simple can recognise it by
+# IDENTITY coming back out of the shared dispatcher — the alternative, matching
+# on the text, would break the first time someone reworded it.
+_PRIVACY_FAIL_CLOSED_TEXT = (
+    "Error: the in-house (local) model was requested but is not "
+    "available, and this request may not be sent to a cloud "
+    "provider. Check that LOCAL_LLM_BASE_URL points at a running "
+    "OpenAI-compatible server (e.g. http://localhost:11434 for "
+    "Ollama) and that it has at least one model pulled."
+)
+
 # ============================================================
 # CONTEXT-SIZE ROUTING (frontier pattern #5 — "context size = routing")
 # ============================================================
@@ -925,6 +943,60 @@ def _privacy_requires_local(data_classification: Optional[str]) -> bool:
     except Exception:  # noqa: BLE001 — safety check must never break routing
         return False
 
+# ============================================================
+# TIER GOVERNANCE  (Phase 5 — the precedence inversion)
+# ============================================================
+#
+# With TIER_GOVERNANCE_ENABLED set, a request for a CAPABILITY resolves
+# through llm_tier_models — the assignments an administrator made on the Tiers
+# screen — instead of through the .env model constants. The constants become a
+# logged fallback for the case where a tier has nothing eligible.
+#
+# Default OFF. Off means the legacy chains in _LEGACY_CHAIN run exactly as they
+# did before Phase 5; tests/models/test_dispatch_equivalence.py pins that.
+# The flag is read per call, not at import, so an operator can flip it without
+# a restart and roll back the same way.
+#
+# Read with the same vocabulary as core/config.py::_env_bool and
+# routers/tier_governance_router.py::_governance_active — the three have to
+# agree, or the admin screen would report a state the router is not in.
+def _governance_enabled() -> bool:
+    return (os.getenv("TIER_GOVERNANCE_ENABLED") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+# Sentinel tier for a decision that came from the resolver. Not one of the
+# eight: it names the PATH, not a capability, in the same way TIER_REGISTRY
+# names the user-explicit path. The tier that was actually requested travels
+# on RoutingDecision.requested_tier, which is what the §L.5 audit columns read.
+TIER_GOVERNED = "governed"
+
+# Variables we have already warned about, so a tier with no assignment logs
+# once per process rather than once per request. Unbounded growth is not a
+# concern: the key space is the fixed set of legacy tier names.
+_ENV_FALLBACK_WARNED: set = set()
+
+
+def _warn_env_fallback(legacy_tier: str, reason: object) -> None:
+    """Announce, once, that a tier fell back to its .env constant.
+
+    Once per tier per process rather than per request: a deployment that
+    upgrades with governance on but no assignments would otherwise emit this
+    on every single call, which turns a useful signal into log noise that
+    someone filters out. doctor.sh reports the same condition up front.
+    """
+    if legacy_tier in _ENV_FALLBACK_WARNED:
+        return
+    _ENV_FALLBACK_WARNED.add(legacy_tier)
+    logger.warning(
+        "ModelRouter: tier governance is ON but tier %r resolved to nothing "
+        "(%s) — falling back to the DEPRECATED .env model constants for this "
+        "tier. Assign a model to it on Model Governance > Tiers; the env "
+        "constants are removed in a later release.",
+        legacy_tier, reason,
+    )
+
+
 # Hints that resolve to a specific Gemini model ID. Covers both the well-known
 # literal (used by CLI / IDE clients) and the registry constant (used when an
 # env override changes the resolved ID) — both must reach the same target.
@@ -1010,6 +1082,13 @@ class RoutingDecision:
     # its module-level default. Provider-agnostic so future OpenAI/Claude
     # multi-model splits can reuse the same channel.
     provider_model_override: Optional[str] = None
+    # Phase 5, governed path only. `resolved` is the FULL ordered candidate
+    # list, not just the winner: §M.5's within-tier fallback ("candidate 1
+    # fails, candidate 2 is tried") is a dispatch-time question, and re-asking
+    # the resolver after a failed call would return the same model — one
+    # failure does not open a circuit breaker.
+    resolved: Optional[list] = None
+    requested_tier: Optional[object] = None   # core.tiers.Tier, for §L.5 audit
 
 
 @dataclass
@@ -1289,6 +1368,418 @@ _TIER_TO_LEGACY_HINT: dict = {
 
 
 # ============================================================
+# LEGACY TIER → GOVERNED TIER  (Phase 5)
+# ============================================================
+#
+# Which of the router's internal tiers are a CAPABILITY REQUEST, and therefore
+# the platform's decision to govern, versus a USER'S PICK, which governance
+# must not second-guess. Seven of the sixteen qualify. Per plan.html §E.
+#
+# The nine that are absent, and why each one is:
+#
+#   simple, local_mini   The §D.2 reclassification. The literal string
+#                        "simple" means LOCAL here and means "cheap, short
+#                        output" in the new vocabulary — they are different
+#                        requests (R1). Which of the ~18 call sites becomes
+#                        which tier is decided per call site in Phase 6, and
+#                        that sign-off has not happened. Auto-mapping them now
+#                        would guess.
+#   gemini, opus-4-8,    Named SKUs a user picked from a dropdown or a CLI
+#   opus-5, sonnet-5,    --model flag. §E deletes them as TIERS while keeping
+#   tera, luna           every one of them selectable. Resolving them through
+#                        a tier would substitute a different model for the one
+#                        the user asked for, which is the specific failure
+#                        this migration exists to remove — not to introduce.
+#   registry             Already the user-explicit path.
+#
+# The three modality tiers (image-output, video-generation) and
+# intent-classification have no legacy equivalent at all, so they are
+# reachable only through a `tier=` call. Phase 5 is the first release in which
+# such a call dispatches rather than resolving to a Phase 1 stub.
+# Tiers for which falling back to the .env constants is NOT a coherent answer.
+#
+# The env-constant fallback works for the seven capability tiers because each
+# has a legacy chain that does the same JOB with a different model. These two
+# do not: _TIER_TO_LEGACY_HINT maps both onto "vision" purely so the Phase 1
+# map is total over Tier, and its own comment calls them stubs. Falling back
+# would hand an image-generation request to a text/vision model and return
+# prose — a confusing wrong answer where an error is a fixable one.
+#
+# image-input is deliberately absent: "vision" genuinely performs image
+# ANALYSIS, so degrading to it is a real answer to the question asked.
+_NO_ENV_FALLBACK = frozenset({Tier.IMAGE_OUTPUT, Tier.VIDEO_GENERATION})
+
+_LEGACY_TO_GOVERNED: dict = {
+    TIER_MINI:     (Tier.MINI,        {}),
+    # §E: "core/model_registry.py already documents simple as the
+    # provider-neutral operator name for the cheap/fast tier (internally keyed
+    # haiku) — this completes a rename the codebase had already started."
+    TIER_HAIKU:    (Tier.SIMPLE,      {}),
+    TIER_MEDIUM:   (Tier.MEDIUM,      {}),
+    TIER_COMPLEX:  (Tier.COMPLEX,     {}),
+    # §M.3a — a role, not an eleventh tier. require_role is a PREFERENCE in
+    # the resolver, so a single-model deployment still runs the review stage
+    # with author and reviewer coinciding, which the admin screen shows.
+    TIER_SOLUTION: (Tier.COMPLEX,     {"require_role": _ROLE_REVIEW}),
+    # §M.2 — "deep" existed to be the context-promotion target. The window is
+    # a property of the model, so it arrives as min_context_window on the
+    # constraints instead of as a different tier.
+    TIER_DEEP:     (Tier.COMPLEX,     {}),
+    TIER_VISION:   (Tier.IMAGE_INPUT, {}),
+}
+
+
+# ============================================================
+# DISPATCH BY FAMILY  (Phase 5)
+# ============================================================
+#
+# Until Phase 5 there were fifteen hand-written `_try_<provider>_<tier>`
+# methods and fifteen streaming twins, each one an ordered list of attempts
+# ("call GPT-5.4; if that fails call Sonnet; if that fails call the local
+# model") expressed as nested if/try blocks. They all did the same five things
+# in the same order — resolve a gateway, check a breaker, call, judge the
+# result, set the label — so the only thing that actually differed between them
+# was the LIST. That list is now data, and the control flow exists once.
+#
+# Two reasons this matters beyond tidiness:
+#
+#   1. The governed path (see route()) has no fixed list. It gets its ordered
+#      candidates from tier_resolver.resolve_tier_candidates(), which is a
+#      different SOURCE for the same SHAPE. One dispatcher serves both.
+#   2. Every one of the fifteen methods had to be corrected independently
+#      whenever the fallback rules changed, and they had drifted — the blocking
+#      and streaming halves of the same tier disagree in several places (see
+#      the per-attempt flags below).
+#
+# ⚠ THE TABLE BELOW IS A TRANSCRIPTION, NOT A DESIGN. Several entries encode
+#   behaviour nobody would choose on purpose: TIER_MEDIUM's blocking primary
+#   sends no `model` at all while its streaming twin does; TIER_SOLUTION
+#   reports was_fallback=True even when every hop failed; TIER_OPUS_48 never
+#   sets _last_actual_tier. These are preserved EXACTLY, because this is the
+#   path a deployment runs with TIER_GOVERNANCE_ENABLED off, and that path must
+#   not move in the same change that introduces the one that replaces it.
+#   tests/models/test_dispatch_equivalence.py pins all of it, 544 records
+#   captured from the pre-refactor code. Fix these quirks in Phase 10, when the
+#   legacy chains are deleted rather than reorganised.
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    """One hop in a fallback chain.
+
+    `model` and `label` are callables rather than strings because both are
+    resolved at CALL time in the code this replaces — an operator who changes
+    CLAUDE_PRIMARY_MODEL, or a catalogue that re-picks a local model, must be
+    reflected on the next request without a restart. They take the request
+    context (`local_model` / `provider_model`) and, for labels, the gateway
+    that served the call.
+    """
+
+    family: str                                  # local | openai | claude | gemini
+    model: Optional[object] = None               # (ctx) -> id, or None to omit model=
+    label: Optional[object] = None               # (ctx, gw) -> str, or None to leave it
+    tier: Optional[str] = None                   # _last_actual_tier, or None to leave it
+    forward_kwargs: bool = False                 # forward the caller's compliance kwargs
+    check_error: bool = True                     # a leading-"Error" result means "try next"
+    empty_is_error: bool = False                 # "" also means "try next" (local only)
+    fallback: Optional[bool] = None              # override the returned was_fallback
+    extra: Optional[dict] = None                 # constant kwargs, e.g. tier="simple"
+    capture_thinking: bool = False               # copy the gateway's extended-thinking text
+    # Governed path only. The legacy chains name a PROVIDER FAMILY and get one
+    # of the four cached singletons; a resolved candidate names a REGISTRY ROW
+    # and may need a gateway built from that row's own base_url and key (an
+    # openai_compatible endpoint has no singleton at all). Likewise the breaker:
+    # the legacy chains share one per family, a resolved candidate gets its own
+    # provider:model key so a single bad model cannot fail-fast its siblings.
+    gateway: Optional[object] = None             # (router) -> gateway | None
+    breaker_key: Optional[str] = None            # get_breaker(key), not _breaker_for(family)
+
+
+def _breaker_for(family: str):
+    """Module globals read at CALL time — tests replace these singletons."""
+    return {"local": _CB_LOCAL, "openai": _CB_OPENAI,
+            "claude": _CB_CLAUDE, "gemini": _CB_GEMINI}[family]
+
+
+# ── Label builders ──────────────────────────────────────────────────────────
+# Written as globals-referencing lambdas so that an env override or a
+# monkeypatched display constant is picked up on the next call, exactly as the
+# inline f-strings they replace were.
+
+def _lbl_local(suffix: str = "", from_ctx: bool = True):
+    """The local label reads back the model the gateway ACTUALLY picked.
+
+    `from_ctx=False` is _try_openai_coding's last-resort local hop, which
+    ignores any local_model override because it never had one — it arrived
+    there from a cloud tier.
+    """
+    def _f(ctx, gw):
+        actual = (ctx.get("local_model") if from_ctx else None) \
+            or getattr(gw, "_last_selected_model", None)
+        return f"Local ({actual}){suffix}" if actual else f"{_tier_label(TIER_SIMPLE)}{suffix}"
+    return _f
+
+
+def _lbl(display_name: str, model_fn, suffix: str = ""):
+    return lambda ctx, gw: f"{globals()[display_name]} ({model_fn(ctx)}){suffix}"
+
+
+# ── Model resolvers ─────────────────────────────────────────────────────────
+_M_OPENAI_SIMPLE = lambda ctx: _resolve_tier_model(OPENAI_SIMPLE_MODEL, "openai", "simple")     # noqa: E731
+_M_OPENAI_CODING = lambda ctx: _resolve_tier_model(OPENAI_CODING_MODEL, "openai", "medium")     # noqa: E731
+_M_OPENAI_DEEP   = lambda ctx: _resolve_tier_model(OPENAI_LATEST_MODEL, "openai", "deep")       # noqa: E731
+_M_OPENAI_OSS    = lambda ctx: _resolve_tier_model(OPENAI_OSS_MODEL,    "openai", "oss")        # noqa: E731
+_M_OPENAI_TERA   = lambda ctx: _resolve_tier_model(OPENAI_TERA_MODEL,   "openai", "gpt56-tera") # noqa: E731
+_M_OPENAI_LUNA   = lambda ctx: _resolve_tier_model(OPENAI_LUNA_MODEL,   "openai", "gpt56-luna") # noqa: E731
+_M_CLAUDE_MAIN   = lambda ctx: _resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")# noqa: E731
+_M_CLAUDE_HAIKU  = lambda ctx: _resolve_tier_model(CLAUDE_HAIKU,        "anthropic", "haiku")   # noqa: E731
+_M_CLAUDE_OPUS48 = lambda ctx: _resolve_tier_model(CLAUDE_OPUS_48_MODEL, "anthropic", "opus-4-8")# noqa: E731
+_M_CLAUDE_OPUS5  = lambda ctx: _resolve_tier_model(CLAUDE_OPUS_5_MODEL, "anthropic", "opus-5")  # noqa: E731
+_M_CLAUDE_SON5   = lambda ctx: _resolve_tier_model(CLAUDE_SONNET_5_MODEL, "anthropic", "sonnet-5")# noqa: E731
+_M_SOLUTION      = lambda ctx: SOLUTION_MODEL                                                   # noqa: E731
+_M_CTX_LOCAL     = lambda ctx: ctx.get("local_model") or None                                   # noqa: E731
+_M_CTX_PROVIDER  = lambda ctx: ctx.get("provider_model") or None                                # noqa: E731
+
+
+# ── Reusable hops ───────────────────────────────────────────────────────────
+# The Sonnet-then-GPT pair below is _try_claude_sonnet's whole body, and five
+# other chains end by delegating to it. `fallback=` is pinned explicitly on
+# those copies because the delegating methods return the INNER call's flag
+# verbatim — so a Sonnet success reached via Opus 4.8 reports was_fallback
+# FALSE today, despite plainly being a fallback. Transcribed, not fixed.
+def _hop_claude_main(*, primary: bool, fallback=None, forward=False):
+    return _Attempt(
+        family="claude", model=_M_CLAUDE_MAIN, tier=TIER_COMPLEX,
+        label=_lbl("CLAUDE_PRIMARY_DISPLAY", _M_CLAUDE_MAIN,
+                   "" if primary else " [fallback]"),
+        check_error=primary, forward_kwargs=forward, fallback=fallback,
+    )
+
+
+def _hop_openai_coding_fallback(fallback=None):
+    return _Attempt(
+        family="openai", model=None, tier=TIER_MEDIUM, forward_kwargs=True,
+        label=_lbl("OPENAI_CODING_DISPLAY", _M_OPENAI_CODING, " [fallback]"),
+        check_error=False, fallback=fallback,
+    )
+
+
+# _try_claude_sonnet's body, reused by the three SKU tiers and by solution.
+def _chain_sonnet(*, fallback_primary=None, fallback_secondary=None):
+    return [_hop_claude_main(primary=True, fallback=fallback_primary),
+            _hop_openai_coding_fallback(fallback=fallback_secondary)]
+
+
+_A_LOCAL_PRIMARY = _Attempt(
+    family="local", model=_M_CTX_LOCAL, tier=TIER_SIMPLE,
+    label=_lbl_local(), extra={"tier": "simple"}, empty_is_error=True,
+)
+_A_OPENAI_MINI_FALLBACK = _Attempt(
+    family="openai", model=None, tier=TIER_MINI, forward_kwargs=True,
+    label=_lbl("OPENAI_SIMPLE_DISPLAY", _M_OPENAI_SIMPLE, " [fallback]"),
+)
+_A_LOCAL_LAST_RESORT = _Attempt(
+    family="local", model=None, tier=TIER_SIMPLE, extra={"tier": "simple"},
+    label=_lbl_local(" [fallback]", from_ctx=False), empty_is_error=True,
+)
+
+
+# Streaming differs from blocking in three ways that are not worth hiding:
+# the label is set BEFORE the call (there is no result to judge first), the
+# circuit breaker is only CHECKED and never wrapped around the call, and a
+# leading-"Error" token is passed through to the client rather than triggering
+# the next hop. The one exception is the local hops, which count tokens and
+# fall through when none arrived — `empty_is_error` marks those in both
+# dispatchers.
+def _hop_openai_coding_fallback_stream():
+    """Streaming sends `model` here; the blocking twin does not. Not a typo —
+    see _try_claude_sonnet vs _try_claude_sonnet_stream in git history."""
+    return _Attempt(
+        family="openai", model=_M_OPENAI_CODING, tier=TIER_MEDIUM, forward_kwargs=True,
+        label=_lbl("OPENAI_CODING_DISPLAY", _M_OPENAI_CODING, " [fallback]"),
+        check_error=False,
+    )
+
+
+def _chain_sonnet_stream():
+    return [
+        _Attempt(family="claude", model=_M_CLAUDE_MAIN, tier=TIER_COMPLEX,
+                 label=_lbl("CLAUDE_PRIMARY_DISPLAY", _M_CLAUDE_MAIN),
+                 check_error=False, capture_thinking=True),
+        _hop_openai_coding_fallback_stream(),
+    ]
+
+
+def _a_openai(model_fn, display: str, tier: str, suffix: str = "", *, forward=True):
+    return _Attempt(family="openai", model=model_fn, tier=tier, forward_kwargs=forward,
+                    label=_lbl(display, model_fn, suffix))
+
+
+def _a_claude(model_fn, display: str, tier: Optional[str], suffix: str = "", *,
+              check_error=True, fallback=None):
+    return _Attempt(family="claude", model=model_fn, tier=tier,
+                    label=_lbl(display, model_fn, suffix),
+                    check_error=check_error, fallback=fallback)
+
+
+_A_GEMINI = _Attempt(
+    # label is deliberately absent: route() has already set a model-specific
+    # Gemini label and overwriting it here would collapse every Gemini variant
+    # to one generic string.
+    family="gemini", model=_M_CTX_PROVIDER, tier=TIER_VISION, forward_kwargs=True,
+)
+_A_LOCAL_STREAM = _Attempt(
+    family="local", model=_M_CTX_LOCAL, tier=TIER_SIMPLE,
+    label=_lbl_local(), extra={"tier": "simple"}, empty_is_error=True,
+)
+_A_LOCAL_LAST_RESORT_STREAM = _Attempt(
+    family="local", model=None, tier=TIER_SIMPLE, extra={"tier": "simple"},
+    label=_lbl_local(" [fallback]", from_ctx=False), empty_is_error=True,
+)
+
+_CHAIN_SIMPLE_SYNC = [_A_LOCAL_PRIMARY, _A_OPENAI_MINI_FALLBACK,
+                      _hop_claude_main(primary=False)]
+_CHAIN_SIMPLE_STREAM = [
+    _A_LOCAL_STREAM,
+    _Attempt(family="openai", model=_M_OPENAI_SIMPLE, tier=TIER_MINI, forward_kwargs=True,
+             label=_lbl("OPENAI_SIMPLE_DISPLAY", _M_OPENAI_SIMPLE, " [fallback]"),
+             check_error=False),
+    _Attempt(family="claude", model=_M_CLAUDE_MAIN, tier=TIER_COMPLEX,
+             label=_lbl("CLAUDE_PRIMARY_DISPLAY", _M_CLAUDE_MAIN, " [fallback]"),
+             check_error=False),
+]
+
+_LEGACY_CHAIN: dict = {
+    TIER_SIMPLE: {"sync": _CHAIN_SIMPLE_SYNC, "stream": _CHAIN_SIMPLE_STREAM},
+
+    # local_mini is not its own chain: _dispatch routes it to the local gateway
+    # with OPENAI_OSS_MODEL as the pinned model. _try_openai_oss below is the
+    # in-house-OpenAI-endpoint variant and is reachable only by direct call.
+    TIER_LOCAL_MINI: {"sync": _CHAIN_SIMPLE_SYNC, "stream": _CHAIN_SIMPLE_STREAM},
+
+    TIER_MINI: {
+        "sync": [_a_openai(_M_OPENAI_SIMPLE, "OPENAI_SIMPLE_DISPLAY", TIER_MINI),
+                 _hop_claude_main(primary=False)],
+        # No claude hop: the streaming twin walks CHAT_FALLBACK_CHAIN instead,
+        # which is env-configured and may be empty. Handled by walk_chain below.
+        "stream": [_a_openai(_M_OPENAI_SIMPLE, "OPENAI_SIMPLE_DISPLAY", TIER_MINI)],
+        "walk_chain": True,
+    },
+
+    TIER_MEDIUM: {
+        # model= is genuinely absent on the blocking primary: it relies on the
+        # OpenAI gateway's own module default. The streaming twin sends it.
+        "sync": [_Attempt(family="openai", model=None, tier=TIER_MEDIUM, forward_kwargs=True,
+                          label=_lbl("OPENAI_CODING_DISPLAY", _M_OPENAI_CODING)),
+                 _hop_claude_main(primary=False),
+                 _A_LOCAL_LAST_RESORT],
+        "stream": [_a_openai(_M_OPENAI_CODING, "OPENAI_CODING_DISPLAY", TIER_MEDIUM),
+                   _Attempt(family="claude", model=_M_CLAUDE_MAIN, tier=TIER_COMPLEX,
+                            label=_lbl("CLAUDE_PRIMARY_DISPLAY", _M_CLAUDE_MAIN, " [fallback]"),
+                            check_error=False),
+                   _A_LOCAL_LAST_RESORT_STREAM],
+    },
+
+    TIER_DEEP: {
+        "sync": [_a_openai(_M_OPENAI_DEEP, "OPENAI_LATEST_DISPLAY", TIER_DEEP),
+                 _hop_claude_main(primary=False)],
+        "stream": [_a_openai(_M_OPENAI_DEEP, "OPENAI_LATEST_DISPLAY", TIER_DEEP),
+                   _Attempt(family="claude", model=_M_CLAUDE_MAIN, tier=TIER_COMPLEX,
+                            label=_lbl("CLAUDE_PRIMARY_DISPLAY", _M_CLAUDE_MAIN, " [fallback]"),
+                            check_error=False)],
+    },
+
+    TIER_TERA: {
+        "sync": [_a_openai(_M_OPENAI_TERA, "OPENAI_TERA_DISPLAY", TIER_TERA),
+                 _hop_claude_main(primary=False)],
+        "stream": [_a_openai(_M_OPENAI_TERA, "OPENAI_TERA_DISPLAY", TIER_TERA),
+                   _Attempt(family="claude", model=_M_CLAUDE_MAIN, tier=TIER_COMPLEX,
+                            label=_lbl("CLAUDE_PRIMARY_DISPLAY", _M_CLAUDE_MAIN, " [fallback]"),
+                            check_error=False)],
+    },
+
+    TIER_LUNA: {
+        "sync": [_a_openai(_M_OPENAI_LUNA, "OPENAI_LUNA_DISPLAY", TIER_LUNA),
+                 _hop_claude_main(primary=False)],
+        "stream": [_a_openai(_M_OPENAI_LUNA, "OPENAI_LUNA_DISPLAY", TIER_LUNA),
+                   _Attempt(family="claude", model=_M_CLAUDE_MAIN, tier=TIER_COMPLEX,
+                            label=_lbl("CLAUDE_PRIMARY_DISPLAY", _M_CLAUDE_MAIN, " [fallback]"),
+                            check_error=False)],
+    },
+
+    TIER_COMPLEX: {"sync": _chain_sonnet(), "stream": _chain_sonnet_stream()},
+
+    TIER_HAIKU: {
+        "sync": [_a_claude(_M_CLAUDE_HAIKU, "CLAUDE_HAIKU_DISPLAY", TIER_HAIKU),
+                 _hop_openai_coding_fallback()],
+        "stream": [_Attempt(family="claude", model=_M_CLAUDE_HAIKU, tier=TIER_HAIKU,
+                            label=_lbl("CLAUDE_HAIKU_DISPLAY", _M_CLAUDE_HAIKU),
+                            check_error=False),
+                   _hop_openai_coding_fallback_stream()],
+    },
+
+    TIER_VISION: {"sync": [_A_GEMINI, _hop_claude_main(primary=False)],
+                  "stream": [_A_GEMINI,
+                             _Attempt(family="claude", model=_M_CLAUDE_MAIN, tier=TIER_COMPLEX,
+                                      label=_lbl("CLAUDE_PRIMARY_DISPLAY", _M_CLAUDE_MAIN,
+                                                 " [fallback]"),
+                                      check_error=False)]},
+
+    TIER_SOLUTION: {
+        # was_fallback is forced True on EVERY outcome, including total
+        # failure, because the method delegates to _try_claude_sonnet and
+        # overwrites the flag unconditionally. exhausted_fallback carries the
+        # "even when nothing worked" half of that.
+        "sync": [_Attempt(family="claude", model=_M_SOLUTION, tier=TIER_SOLUTION,
+                          label=lambda ctx, gw: _tier_label(TIER_SOLUTION))]
+                + _chain_sonnet(fallback_primary=True, fallback_secondary=True),
+        "stream": [_Attempt(family="claude", model=_M_SOLUTION, tier=TIER_SOLUTION,
+                            label=lambda ctx, gw: _tier_label(TIER_SOLUTION),
+                            check_error=False)] + _chain_sonnet_stream(),
+        "exhausted_fallback": True,
+    },
+
+    # The three SKU tiers delegate to _try_claude_sonnet and return ITS flag
+    # verbatim, so a Sonnet success reached from here reports was_fallback
+    # False. Pinned with fallback= rather than corrected.
+    TIER_OPUS_48: {
+        # tier=None: _try_claude_opus48 is the one method that never sets
+        # _last_actual_tier on success. Token accounting therefore reads the
+        # PREVIOUS request's tier for this one. Transcribed as-is.
+        "sync": [_a_claude(_M_CLAUDE_OPUS48, "CLAUDE_OPUS_48_DISPLAY", None, fallback=False)]
+                + _chain_sonnet(fallback_primary=False, fallback_secondary=True),
+        "stream": [_Attempt(family="claude", model=_M_CLAUDE_OPUS48, tier=None,
+                            label=_lbl("CLAUDE_OPUS_48_DISPLAY", _M_CLAUDE_OPUS48),
+                            check_error=False)] + _chain_sonnet_stream(),
+    },
+    TIER_OPUS_5: {
+        "sync": [_a_claude(_M_CLAUDE_OPUS5, "CLAUDE_OPUS_5_DISPLAY", TIER_OPUS_5, fallback=False)]
+                + _chain_sonnet(fallback_primary=False, fallback_secondary=True),
+        "stream": [_Attempt(family="claude", model=_M_CLAUDE_OPUS5, tier=TIER_OPUS_5,
+                            label=_lbl("CLAUDE_OPUS_5_DISPLAY", _M_CLAUDE_OPUS5),
+                            check_error=False)] + _chain_sonnet_stream(),
+    },
+    TIER_SONNET_5: {
+        "sync": [_a_claude(_M_CLAUDE_SON5, "CLAUDE_SONNET_5_DISPLAY", TIER_SONNET_5, fallback=False)]
+                + _chain_sonnet(fallback_primary=False, fallback_secondary=True),
+        "stream": [_Attempt(family="claude", model=_M_CLAUDE_SON5, tier=TIER_SONNET_5,
+                            label=_lbl("CLAUDE_SONNET_5_DISPLAY", _M_CLAUDE_SON5),
+                            check_error=False)] + _chain_sonnet_stream(),
+    },
+
+    # Reachable only by direct call to _try_openai_oss(): _dispatch sends
+    # TIER_LOCAL_MINI to the local gateway instead. Kept because callers
+    # outside the router still use it.
+    "_oss": {
+        "sync": [_a_openai(_M_OPENAI_OSS, "OPENAI_OSS_DISPLAY", TIER_LOCAL_MINI),
+                 _a_openai(_M_OPENAI_SIMPLE, "OPENAI_SIMPLE_DISPLAY", TIER_MINI, " [fallback]")],
+        "stream": [_a_openai(_M_OPENAI_OSS, "OPENAI_OSS_DISPLAY", TIER_LOCAL_MINI),
+                   _a_openai(_M_OPENAI_SIMPLE, "OPENAI_SIMPLE_DISPLAY", TIER_MINI, " [fallback]")],
+    },
+}
+
+
+# ============================================================
 # MODEL ROUTER
 # ============================================================
 
@@ -1436,6 +1927,47 @@ class ModelRouter:
 
     # _last_actual_tier: set by _try_* methods alongside last_model_label so that
     # generate() can build FallbackInfo with accurate from/to tier information.
+    # ── §L.5 audit: why did this request use this model? ──────────────────
+    # Written by _record_selection() right after route(), i.e. in the CALLER's
+    # thread, which is what the six ainxt.metrics producers read. Deliberately
+    # NULL on the legacy path: "the .env constants decided" is not one of the
+    # three vocabulary values, and inventing a fourth would put a claim in the
+    # audit trail that the column was created to avoid.
+    @property
+    def last_selection_mode(self) -> Optional[str]:
+        return getattr(self._tl, "last_selection_mode", None)
+
+    @last_selection_mode.setter
+    def last_selection_mode(self, v: Optional[str]):
+        self._tl.last_selection_mode = v
+
+    @property
+    def last_requested_tier(self) -> Optional[str]:
+        return getattr(self._tl, "last_requested_tier", None)
+
+    @last_requested_tier.setter
+    def last_requested_tier(self, v: Optional[str]):
+        self._tl.last_requested_tier = v
+
+    def _record_selection(self, decision: "RoutingDecision") -> None:
+        """Record the §L.5 provenance of this decision for the audit row."""
+        if decision.resolved:
+            top = decision.resolved[0]
+            self.last_selection_mode = top.selection_mode
+            self.last_requested_tier = (
+                top.requested_tier.value if top.requested_tier is not None else None)
+        elif decision.tier == TIER_REGISTRY:
+            # The user named a model. True with the flag off as well as on,
+            # and worth recording either way: the rollout is measured by a
+            # shift in the model distribution, and a shift caused by users
+            # picking differently has to be separable from one caused by
+            # governance.
+            self.last_selection_mode = "explicit"
+            self.last_requested_tier = None
+        else:
+            self.last_selection_mode = None
+            self.last_requested_tier = None
+
     @property
     def _last_actual_tier(self) -> str:
         return getattr(self._tl, "_last_actual_tier", "")
@@ -1546,6 +2078,25 @@ class ModelRouter:
             return None, None
         family = reg["family"]
 
+        return self._gateway_for_registry_family(family, provider_model), family
+
+    def _gateway_for_registry_family(self, family: str, provider_model: Optional[str]):
+        """Gateway for a model identified by its REGISTRY ROW, any family.
+
+        Distinct from _gateway_for_family(), which answers "is this provider
+        configured in .env". This one can construct a gateway for a provider
+        that has no .env vars at all — the case an admin-only setup always
+        produces, since install.sh's LLM Providers flow writes the API key and
+        nothing else.
+
+        gemini and ollama were added in Phase 5. Before it, route() intercepted
+        those two families and sent them down the TIER_GEMINI / TIER_SIMPLE
+        chains, so _try_registry never saw them — which was fine while the only
+        caller was the user-explicit path, and is not fine now that a tier
+        assignment can name any model of any family. Without them, assigning an
+        Ollama model to `medium` would resolve correctly and then fail to
+        dispatch.
+        """
         if family == "anthropic":
             gw = self._get_claude()
             if gw is None:
@@ -1555,7 +2106,7 @@ class ModelRouter:
                 except Exception as e:
                     logger.warning(f"ModelRouter: registry Claude gateway unavailable → {e}")
                     gw = None
-            return gw, family
+            return gw
 
         if family == "openai":
             gw = self._get_openai()
@@ -1566,22 +2117,38 @@ class ModelRouter:
                 except Exception as e:
                     logger.warning(f"ModelRouter: registry OpenAI gateway unavailable → {e}")
                     gw = None
-            return gw, family
+            return gw
+
+        if family == "gemini":
+            gw = self._get_gemini()
+            if gw is None:
+                try:
+                    from gateway_gemini import GeminiGateway
+                    gw = GeminiGateway()
+                except Exception as e:
+                    logger.warning(f"ModelRouter: registry Gemini gateway unavailable → {e}")
+                    gw = None
+            return gw
+
+        if family == "ollama":
+            # The in-house gateway serves every local model; the specific id
+            # travels as the `model` kwarg, exactly as a "local:<id>" hint does.
+            return self._get_local()
 
         if family == "openai_compatible":
             try:
                 from core.llm_provider_registry import get_client_for
                 client_info = get_client_for(provider_model)
                 if not client_info or not client_info.get("base_url"):
-                    return None, family
+                    return None
                 from gateway_generic_openai import get_generic_gateway
-                gw = get_generic_gateway(client_info["base_url"], client_info.get("api_key"))
+                return get_generic_gateway(client_info["base_url"], client_info.get("api_key"))
             except Exception as e:
                 logger.warning(f"ModelRouter: registry generic-openai gateway unavailable → {e}")
-                gw = None
-            return gw, family
+                return None
 
-        return None, family
+        logger.warning("ModelRouter: no gateway for provider family %r", family)
+        return None
 
     @staticmethod
     def _filter_kwargs_for(func, kwargs: dict) -> dict:
@@ -1656,37 +2223,182 @@ class ModelRouter:
             return TIER_MEDIUM
 
     # --------------------------------------------------------
+    # GOVERNED RESOLUTION  (Phase 5)
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _attempts_from_resolved(resolved: list) -> list:
+        """The resolver's ordered candidates as dispatcher attempts.
+
+        This is the whole point of making the legacy chains data: a tier's
+        candidate list and a hand-written fallback chain are the same shape,
+        so §M.5's "candidate 1 fails, candidate 2 is tried" costs no new
+        control flow. The label is the bare model id — `_estimate_cost` and
+        `_resolve_web_search_pricing_key` both parse last_model_label, and a
+        bare id is the one form neither has to unwrap.
+        """
+        def _attempt(rm):
+            return _Attempt(
+                family=rm.family,
+                model=lambda ctx, _m=rm.model_id: _m,
+                label=lambda ctx, gw, _m=rm.model_id: _m,
+                tier=TIER_GOVERNED,
+                forward_kwargs=True,
+                gateway=lambda router, _rm=rm: router._gateway_for_registry_family(
+                    _rm.family, _rm.model_id),
+                # §M.4 — per provider/model, not per family, so one failing
+                # model cannot fast-fail every other model of the same vendor.
+                breaker_key=f"{rm.provider_slug}:{rm.model_id}",
+            )
+        return [_attempt(rm) for rm in resolved]
+
+    def _resolve_governed(self, governed_tier, extra: dict, *, legacy_tier: str,
+                          complexity: str, is_vision: bool, hint,
+                          constraints_kw: dict, channel):
+        """Resolve one tier through the admin's assignments, or None to fall back.
+
+        Returns None — meaning "run the legacy chain" — when the tier has
+        nothing eligible, after warning once about the .env constants that
+        will serve instead. The single exception is no_cloud_egress, where
+        falling back is the one thing that must not happen (§M.1/§M.5): that
+        re-raises so the caller can surface an explicit failure rather than
+        quietly sending confidential data to whichever cloud model the env
+        constants happen to name.
+        """
+        from core.tier_resolver import (
+            Constraints, NoEligibleModel, resolve_tier_candidates,
+        )
+        c = Constraints(**{**constraints_kw, **extra})
+        try:
+            candidates = resolve_tier_candidates(governed_tier, c, channel=channel)
+        except NoEligibleModel as exc:
+            if c.no_cloud_egress or governed_tier in _NO_ENV_FALLBACK:
+                raise
+            _warn_env_fallback(legacy_tier or governed_tier.value, exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 — governance must never break routing
+            if governed_tier in _NO_ENV_FALLBACK:
+                raise
+            logger.warning(
+                "ModelRouter: tier resolution for %r raised %s — using the "
+                "legacy chain for this request.",
+                legacy_tier or governed_tier.value, exc)
+            return None
+
+        top = candidates[0]
+        logger.info(
+            "ModelRouter: tier governance — %s → %s (%s, priority %s, %s)",
+            governed_tier.value, top.model_id, top.family, top.priority,
+            top.selection_mode,
+        )
+        return RoutingDecision(
+            tier=TIER_GOVERNED, model=top.model_id, complexity=complexity,
+            is_vision=is_vision, hint=hint, fallback=top.via_fallback,
+            provider_model_override=top.model_id,
+            resolved=candidates, requested_tier=governed_tier,
+        )
+
+    # --------------------------------------------------------
     # ROUTING
     # --------------------------------------------------------
 
     def route(self, prompt, model_hint: Optional[str] = None,
               data_classification: Optional[str] = None,
               context_tokens: int = 0,
-              *, tier: Optional[Tier] = None) -> RoutingDecision:
+              *, tier: Optional[Tier] = None,
+              distinct_from_family: Optional[str] = None,
+              budget_state: Optional[str] = None,
+              needs_tools: bool = False,
+              needs_streaming: bool = False,
+              channel: Optional[str] = None) -> RoutingDecision:
         """Return the RoutingDecision for this prompt.
         prompt: str OR list[dict] (multi-turn messages array).
         tier: OPTIONAL approved application tier (core.tiers.Tier). Keyword-only
             and enum-typed so it can never collide with the legacy `model_hint`
             string vocabulary — see _coerce_tier. Mutually exclusive with
-            model_hint. Nothing in production passes this during Phase 1.
+            model_hint. With TIER_GOVERNANCE_ENABLED set this resolves through
+            the admin's tier assignments directly, which is the only way to
+            reach image-output, video-generation or intent-classification —
+            they have no legacy hint.
         data_classification: optional sensitivity tag (PUBLIC/INTERNAL/
-            CONFIDENTIAL/RESTRICTED/PCI_SENSITIVE, per core/rag_acl.py). When it
-            is at/above CONFIDENTIAL the PRIVACY FLOOR forces the local model.
+            CONFIDENTIAL/RESTRICTED/PCI_SENSITIVE, per core/rag_acl.py). At or
+            above CONFIDENTIAL this becomes the no_cloud_egress constraint when
+            governance is on, and the historical TIER_SIMPLE pin when it is off.
         context_tokens: optional estimated token footprint of the whole turn.
-            When it would not fit the complexity-derived tier's window (with
-            headroom), CONTEXT-SIZE ROUTING promotes to a larger-window model.
-            Never overrides the privacy floor or an explicit model_hint.
+            Governance on: becomes min_context_window, filtering the requested
+            tier's candidates (§M.2). Governance off: promotes to a
+            larger-window TIER, as before.
+
+        distinct_from_family / budget_state / needs_tools / needs_streaming:
+            §M constraints that only the CALLER can know. Plumbed through to
+            the resolver and passed by nobody in Phase 5 — the SDLC
+            cross-model-review site and the budget governors connect them in
+            Phase 6. They exist now so that wiring is a one-line change at the
+            call site rather than a signature change here.
+
+        Raises NoEligibleModel only under no_cloud_egress, where falling back
+        is the one outcome the constraint exists to prevent. Every other
+        resolution failure degrades to the legacy chain with a warning.
         """
+        requested_tier = Tier(tier) if tier is not None else None
         model_hint = self._coerce_tier(model_hint, tier)
         prompt_str = _as_str(prompt)  # routing signals always derived from text
 
+        _governed = _governance_enabled()
+        _no_cloud = _privacy_requires_local(data_classification)
+
+        # §M.2 — the same arithmetic _promote_for_context does, expressed as a
+        # filter on the requested tier instead of a switch to a different one.
+        # Only from a CALLER-SUPPLIED count here; the prompt-length estimate
+        # stays confined to the auto path at step 3c, exactly as today, so
+        # governance does not widen where the estimate applies.
+        _min_window = None
+        if _CONTEXT_SIZE_ROUTING and context_tokens and context_tokens > 0:
+            _min_window = int(context_tokens / max(0.1, _CONTEXT_FIT_FRACTION))
+
+        _constraints_kw = {
+            "no_cloud_egress": _no_cloud,
+            "min_context_window": _min_window,
+            "distinct_from_family": distinct_from_family,
+            "budget_state": budget_state,
+            "needs_tools": needs_tools,
+            "needs_streaming": needs_streaming,
+        }
+
+        def _govern(legacy_tier, *, complexity, is_vision, hint,
+                    explicit: Optional[Tier] = None, min_window=None):
+            """Try the assignments for this tier; None means run the legacy chain."""
+            if not _governed:
+                return None
+            if explicit is not None:
+                pair = (explicit, {})
+            else:
+                pair = _LEGACY_TO_GOVERNED.get(legacy_tier)
+                if pair is None:
+                    return None            # a user's SKU pick, or an unmigrated tier
+            gtier, extra = pair
+            kw = dict(_constraints_kw)
+            if min_window is not None:
+                kw["min_context_window"] = min_window
+            return self._resolve_governed(
+                gtier, extra, legacy_tier=legacy_tier, complexity=complexity,
+                is_vision=is_vision, hint=hint, constraints_kw=kw, channel=channel,
+            )
+
         # 0. PRIVACY FLOOR (hard enterprise invariant) — runs FIRST so nothing
         #    downstream (hint, vision, complexity) can re-route restricted data to
-        #    a cloud provider. When the request carries CONFIDENTIAL+ data it is
-        #    pinned to the in-house Local model (TIER_SIMPLE, which _dispatch maps
-        #    to _try_local_simple). This override even supersedes an explicit
-        #    model_hint: a user cannot opt restricted data onto the cloud.
-        if _privacy_requires_local(data_classification):
+        #    a cloud provider.
+        #
+        #    Governance OFF: the historical behaviour — the TIER is rewritten to
+        #    TIER_SIMPLE, so a hard reasoning task on confidential data runs on
+        #    the smallest local model.
+        #    Governance ON (§M.1): the tier is UNCHANGED and the candidate set
+        #    narrows to privacy_class == deployment_local. Capability and policy
+        #    stop being the same axis. The guarantee is identical either way —
+        #    confidential data never reaches a cloud provider — and under
+        #    governance the resolver additionally refuses to walk the fallback
+        #    ladder, so "no local model" fails loudly instead of degrading.
+        if _no_cloud and not _governed:
             _cls = str(data_classification).strip().upper()
             # AUDIT/ALERT: every enforcement is logged at WARNING so it surfaces
             # in SIEM/alerting — a restricted turn hitting the cloud would be a
@@ -1701,6 +2413,25 @@ class ModelRouter:
                 complexity=TIER_SIMPLE, is_vision=False,
                 hint=model_hint, fallback=False,
             )
+        if _no_cloud:
+            logger.warning(
+                "ModelRouter: PRIVACY FLOOR enforced — data_classification=%s → "
+                "no_cloud_egress constraint; the requested tier is unchanged and "
+                "only deployment-local candidates are eligible.",
+                str(data_classification).strip().upper(),
+            )
+
+        # 0b. An explicit `tier=` under governance resolves directly. This is
+        #     the only path to image-output, video-generation and
+        #     intent-classification: _coerce_tier maps all three onto legacy
+        #     hints that mean something else, which is fine while nothing
+        #     dispatches on them and wrong the moment something does.
+        if requested_tier is not None and _governed:
+            _d = _govern(None, complexity=requested_tier.value,
+                         is_vision=(requested_tier is Tier.IMAGE_INPUT),
+                         hint=None, explicit=requested_tier)
+            if _d is not None:
+                return _d
 
         # 1. Caller hint
         if model_hint:
@@ -1785,6 +2516,15 @@ class ModelRouter:
                 # the tier's default model (e.g. gemini-3.5-flash) regardless
                 # of which Gemini model actually ran.
                 _label = _gemini_model_label(_gemini_override) if _gemini_override else _tier_label(tier)
+                # Governance: a hint that names a CAPABILITY resolves through
+                # the assignments; one that names a SKU does not — see
+                # _LEGACY_TO_GOVERNED for which is which and why. A specific
+                # Gemini id is always the latter, so it short-circuits.
+                if _gemini_override is None:
+                    _d = _govern(tier, complexity=tier,
+                                 is_vision=(tier == TIER_VISION), hint=model_hint)
+                    if _d is not None:
+                        return _d
                 return RoutingDecision(
                     tier=tier, model=_label,
                     complexity=tier, is_vision=(tier == TIER_VISION),  # TIER_GEMINI is not vision
@@ -1801,6 +2541,9 @@ class ModelRouter:
                                   for p in _NON_VISION_HINT_PREFIXES)
         if not _hint_is_non_vision and _prompt_has_image(prompt) and self._detect_vision(prompt_str):
             logger.info("ModelRouter: vision keywords + image attachment → Gemini")
+            _d = _govern(TIER_VISION, complexity="N/A", is_vision=True, hint=None)
+            if _d is not None:
+                return _d
             return RoutingDecision(
                 tier=TIER_VISION, model=_tier_label(TIER_VISION),
                 complexity="N/A", is_vision=True, hint=None, fallback=False,
@@ -1846,6 +2589,29 @@ class ModelRouter:
                 context_tokens = int(len(prompt_str) / 4)
             except Exception:  # noqa: BLE001
                 context_tokens = 0
+
+        # Governance ON: the tier does NOT change. The same token count becomes
+        # min_context_window and filters the requested tier's own candidates
+        # (§M.2) — the window is a property of the model, and
+        # capabilities.context_window already holds it per model, so a per-tier
+        # constant table cannot be right for a tier with two models in it.
+        if _governed:
+            _d = _govern(
+                tier, complexity=complexity, is_vision=False, hint=None,
+                min_window=(int(context_tokens / max(0.1, _CONTEXT_FIT_FRACTION))
+                            if (_CONTEXT_SIZE_ROUTING and context_tokens > 0) else None),
+            )
+            if _d is not None:
+                return _d
+
+        # Governance OFF: promote to a larger-window TIER, as before.
+        #
+        # _TIER_CONTEXT_WINDOW and _CONTEXT_PROMOTION_LADDER survive here
+        # rather than being deleted as plan.html §M.2 asks. Deleting them would
+        # remove context promotion from the path a deployment runs with the
+        # flag OFF — a routing change in the very release whose safety argument
+        # is "turn the flag off and nothing moves". They go in Phase 10, with
+        # the rest of the legacy chain, once nothing reaches this branch.
         if context_tokens and context_tokens > 0:
             _promoted = _promote_for_context(tier, context_tokens)
             if _promoted != tier:
@@ -1902,6 +2668,9 @@ class ModelRouter:
             # stash whichever instance actually served the request here so
             # token/cost tracking isn't silently zero for these models.
             TIER_REGISTRY:  getattr(self._tl, "_last_registry_gw", None),
+            # Same reason as TIER_REGISTRY: a governed hop's gateway depends on
+            # which model the resolver picked, so the dispatcher stashes it.
+            TIER_GOVERNED:  getattr(self._tl, "_last_registry_gw", None),
         }
         gw = _gw_map.get(tier)
         self.last_input_tokens          = getattr(gw, "_last_input_tokens",          0) or 0
@@ -1913,13 +2682,22 @@ class ModelRouter:
     # DISPATCH  (blocking — collects full response)
     # --------------------------------------------------------
 
-    def _dispatch(self, tier: str, prompt: str, provider_model: Optional[str] = None, **kwargs) -> tuple[str, bool]:
+    def _dispatch(self, tier: str, prompt: str, provider_model: Optional[str] = None,
+                  candidates: Optional[list] = None, **kwargs) -> tuple[str, bool]:
         # kwargs carries precleared / precleared_findings when the upstream
         # caller has already run compliance_engine.validate_input().
         # privacy_local_only is consumed ONLY by the local path (a privacy-pinned
         # turn is always TIER_SIMPLE); pop it so it never leaks into cloud
         # gateways' generate() signatures.
         _privacy_local_only = kwargs.pop("privacy_local_only", False)
+        if tier == TIER_GOVERNED:
+            # §M.5's within-tier fallback: the resolver handed over every
+            # eligible candidate in the admin's priority order, so a candidate
+            # whose call fails right now yields to the next one. No cross-tier
+            # substitution happens here — the ladder was already walked, once,
+            # inside resolve_tier_candidates().
+            return self._dispatch_by_family(
+                self._attempts_from_resolved(candidates or []), prompt, **kwargs)
         if tier == TIER_SIMPLE:
             return self._try_local_simple(prompt, local_model=provider_model,
                                           privacy_local_only=_privacy_local_only, **kwargs)
@@ -1969,405 +2747,265 @@ class ModelRouter:
         )
         return self._try_local_simple(prompt, local_model=provider_model, **kwargs)
 
+    # --------------------------------------------------------
+    # FAMILY DISPATCH  (Phase 5 — the one control flow)
+    # --------------------------------------------------------
+
+    def _gateway_for_family(self, family: str):
+        """Legacy-path gateway lookup: the four cached provider singletons.
+
+        Distinct from _resolve_registry_gateway(), which resolves a gateway
+        from a REGISTRY ROW and can construct one for a provider that has no
+        .env vars at all. This one answers "is the openai/claude/gemini/local
+        provider configured", which is the question the legacy chains ask.
+        """
+        return {
+            "local":  self._get_local,
+            "openai": self._get_openai,
+            "claude": self._get_claude,
+            "gemini": self._get_gemini,
+        }[family]()
+
+    @staticmethod
+    def _attempt_kwargs(a: "_Attempt", ctx: dict, kwargs: dict) -> dict:
+        call_kw = dict(a.extra or {})
+        if a.model is not None:
+            resolved = a.model(ctx)
+            # None means "send no model at all" and let the gateway use its
+            # own default — which several hops genuinely rely on.
+            if resolved is not None:
+                call_kw["model"] = resolved
+        if a.forward_kwargs:
+            call_kw.update(kwargs)
+        return call_kw
+
+    def _call_kwargs(self, a: "_Attempt", ctx: dict, kwargs: dict, gw) -> dict:
+        """The legacy chains know their gateways; the governed path does not."""
+        if a.gateway is None:
+            return self._attempt_kwargs(a, ctx, kwargs)
+        return self._filtered_attempt_kwargs(a, ctx, kwargs, gw)
+
+    def _filtered_attempt_kwargs(self, a: "_Attempt", ctx: dict, kwargs: dict, gw) -> dict:
+        """Attempt kwargs, minus anything this particular gateway cannot take.
+
+        Only the governed path needs this. The legacy chains were written
+        against four known gateways and hand-pick which hops receive the
+        compliance kwargs; a resolved candidate can be served by any of five
+        families, including a generic openai_compatible instance, so the
+        filtering has to be dynamic. Same reasoning as _filter_kwargs_for,
+        which _try_registry has used for the user-explicit path since Phase 2.
+        """
+        call_kw = self._attempt_kwargs(a, ctx, kwargs)
+        model = call_kw.pop("model", None)
+        filtered = self._filter_kwargs_for(gw.generate, call_kw)
+        if model is not None:
+            filtered["model"] = model
+        return filtered
+
+    @staticmethod
+    def _attempt_breaker(a: "_Attempt"):
+        if a.breaker_key:
+            return get_breaker(a.breaker_key)
+        return _breaker_for(a.family)
+
+    def _usable_gateway(self, a: "_Attempt"):
+        """The gateway for this hop, or None when the hop must be skipped."""
+        gw = a.gateway(self) if a.gateway is not None else self._gateway_for_family(a.family)
+        if gw is None:
+            return None
+        if a.family == "local" and not getattr(gw, "available", False):
+            return None
+        if self._attempt_breaker(a).is_open:
+            return None
+        return gw
+
+    def _dispatch_by_family(self, attempts, prompt, ctx=None, *,
+                            exhausted_fallback: bool = False,
+                            exhausted_text: Optional[str] = None,
+                            **kwargs) -> tuple[str, bool]:
+        """Walk an ordered attempt list, blocking. First usable hop wins.
+
+        Serves both the legacy chains in _LEGACY_CHAIN and the governed path's
+        candidate list from tier_resolver — same shape, different source.
+        """
+        ctx = ctx or {}
+        for i, a in enumerate(attempts):
+            gw = self._usable_gateway(a)
+            if gw is None:
+                continue
+            if a.gateway is not None:
+                # Governed hops have no fixed gateway attribute on the router
+                # (openai_compatible builds a fresh instance per call), so the
+                # instance that actually served is stashed thread-locally for
+                # _propagate_tokens — same mechanism _try_registry has used
+                # since Phase 2.
+                self._tl._last_registry_gw = gw
+            try:
+                result = self._collect(self._attempt_breaker(a).call(
+                    gw.generate, prompt, **self._call_kwargs(a, ctx, kwargs, gw)))
+            except Exception as e:
+                logger.warning("ModelRouter: %s hop %d raised → %s", a.family, i, e)
+                continue
+            if a.check_error and ((a.empty_is_error and not result)
+                                  or (result or "").startswith("Error")):
+                logger.warning("ModelRouter: %s hop %d returned an error → next hop",
+                               a.family, i)
+                continue
+            if a.label is not None:
+                self.last_model_label = a.label(ctx, gw)
+            if a.tier is not None:
+                self._last_actual_tier = a.tier
+            return result, (i > 0) if a.fallback is None else a.fallback
+        return (exhausted_text or "Error: no gateway available"), exhausted_fallback
+
+    def _dispatch_by_family_stream(self, attempts, prompt, ctx=None, *,
+                                   walk_chain: bool = False,
+                                   precleared: bool = False,
+                                   precleared_findings: Optional[list] = None):
+        """Streaming twin. Three deliberate differences from the blocking form:
+
+        the label is set BEFORE the call (there is no result to judge first),
+        the circuit breaker is only consulted and never wrapped around the
+        call, and a leading-"Error" token is streamed to the client rather
+        than advancing to the next hop. Local hops are the exception on that
+        last point — they count tokens and fall through when none arrived,
+        which is what `empty_is_error` selects.
+
+        _last_actual_tier is deliberately NOT set here: no streaming method
+        ever set it, and starting to would change what _propagate_tokens reads
+        for every streaming caller.
+        """
+        ctx = ctx or {}
+        kwargs = {"precleared": precleared, "precleared_findings": precleared_findings}
+        for i, a in enumerate(attempts):
+            gw = self._usable_gateway(a)
+            if gw is None:
+                continue
+            if a.gateway is not None:
+                self._tl._last_registry_gw = gw
+            call_kw = self._call_kwargs(a, ctx, kwargs, gw)
+            try:
+                if a.empty_is_error:
+                    token_yielded = False
+                    for tok in gw.generate(prompt, **call_kw):
+                        if tok and not str(tok).startswith("Error"):
+                            token_yielded = True
+                            yield tok
+                    if token_yielded:
+                        if a.label is not None:
+                            self.last_model_label = a.label(ctx, gw)
+                        return
+                    logger.info("ModelRouter stream: %s hop %d empty/error → next hop",
+                                a.family, i)
+                    continue
+                if a.label is not None:
+                    self.last_model_label = a.label(ctx, gw)
+                yield from gw.generate(prompt, **call_kw)
+                if a.capture_thinking:
+                    try:
+                        self.last_thinking_text = getattr(gw, "_last_thinking_text", "") or ""
+                    except Exception:  # noqa: BLE001 — thinking text is never load-bearing
+                        pass
+                return
+            except Exception as e:
+                logger.warning("ModelRouter stream: %s hop %d failed → %s", a.family, i, e)
+                continue
+        if walk_chain:
+            # CHAT_FALLBACK_CHAIN, env-configured and empty by default. Only
+            # TIER_MINI's streaming path uses it; its blocking twin falls back
+            # to Claude Sonnet instead. That divergence predates Phase 5.
+            _yielded = yield from self._walk_fallback_chain_stream(
+                prompt, precleared=precleared, precleared_findings=precleared_findings,
+            )
+            if _yielded:
+                return
+        yield "Error: no gateway available"
+
     def _try_local_simple(self, prompt: str, local_model: Optional[str] = None,
                           privacy_local_only: bool = False,
                           **kwargs) -> tuple[str, bool]:
-        local = self._get_local()
-        if local and local.available and not _CB_LOCAL.is_open:
-            try:
-                # local_model pins a SPECIFIC in-house model (from a
-                # "local:<model>" hint); otherwise the gateway picks the tier default.
-                if local_model:
-                    result = self._collect(_CB_LOCAL.call(
-                        local.generate, prompt, model=local_model, tier="simple"))
-                else:
-                    result = self._collect(_CB_LOCAL.call(local.generate, prompt, tier="simple"))
-                if result and not result.startswith("Error"):
-                    # Fix 1+2: read the model ID that generate() actually resolved.
-                    _actual = (
-                        local_model
-                        or getattr(local, "_last_selected_model", None)
-                    )
-                    self.last_model_label = (
-                        f"Local ({_actual})" if _actual else _tier_label(TIER_SIMPLE)
-                    )
-                    self._last_actual_tier = TIER_SIMPLE
-                    return result, False
-                logger.warning("ModelRouter: Local model returned error → fallback GPT-5 mini")
-            except Exception as e:
-                logger.warning(f"ModelRouter: Local failed → {e}")
-        # PRIVACY FLOOR: for CONFIDENTIAL+ data we must FAIL CLOSED rather than
-        # egress to a cloud provider. A local outage on restricted data returns
-        # an explicit error (never OpenAI/Claude). This is the hard invariant.
+        """Local first, then GPT-5-mini, then Claude Sonnet.
+
+        privacy_local_only truncates the chain to its first hop: a
+        CONFIDENTIAL+ turn that the local model cannot serve must FAIL rather
+        than reach a cloud provider. That is the hard enterprise invariant, so
+        it is enforced by never offering the cloud hops to the dispatcher at
+        all, rather than by a flag the dispatcher has to remember to honour.
+        """
+        chain = _LEGACY_CHAIN[TIER_SIMPLE]["sync"]
+        ctx = {"local_model": local_model}
         if privacy_local_only:
-            logger.error(
-                "ModelRouter: PRIVACY FLOOR — local model unavailable for "
-                "restricted data; FAILING CLOSED (cloud fallback suppressed)."
-            )
-            self.last_model_label = _tier_label(TIER_SIMPLE)
-            self._last_actual_tier = TIER_SIMPLE
-            return ("Error: the in-house (local) model was requested but is not "
-                    "available, and this request may not be sent to a cloud "
-                    "provider. Check that LOCAL_LLM_BASE_URL points at a running "
-                    "OpenAI-compatible server (e.g. http://localhost:11434 for "
-                    "Ollama) and that it has at least one model pulled."), False
-        logger.info("ModelRouter: Local unavailable → fallback GPT-5 mini")
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(openai.generate, prompt, **kwargs))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{OPENAI_SIMPLE_DISPLAY} ({_resolve_tier_model(OPENAI_SIMPLE_MODEL, 'openai', 'simple')}) [fallback]"
-                    self._last_actual_tier = TIER_MINI
-                    return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: GPT-5 mini fallback failed → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-                ))
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                self._last_actual_tier = TIER_COMPLEX
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude fallback failed → {e}")
-        return "Error: no gateway available", False
+            out, fb = self._dispatch_by_family(
+                chain[:1], prompt, ctx,
+                exhausted_text=_PRIVACY_FAIL_CLOSED_TEXT, **kwargs)
+            if out is _PRIVACY_FAIL_CLOSED_TEXT:
+                logger.error(
+                    "ModelRouter: PRIVACY FLOOR — local model unavailable for "
+                    "restricted data; FAILING CLOSED (cloud fallback suppressed)."
+                )
+                self.last_model_label = _tier_label(TIER_SIMPLE)
+                self._last_actual_tier = TIER_SIMPLE
+            return out, fb
+        return self._dispatch_by_family(chain, prompt, ctx, **kwargs)
 
     def _try_openai_mini(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(openai.generate, prompt, model=_resolve_tier_model(OPENAI_SIMPLE_MODEL, "openai", "simple"), **kwargs))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{OPENAI_SIMPLE_DISPLAY} ({_resolve_tier_model(OPENAI_SIMPLE_MODEL, 'openai', 'simple')})"
-                    self._last_actual_tier = TIER_MINI
-                    return result, False
-                logger.warning("ModelRouter: GPT-5-mini failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: GPT-5-mini circuit-breaker rejected → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-                ))
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                self._last_actual_tier = TIER_COMPLEX
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude fallback for mini failed → {e}")
-        return "Error: no gateway available", False
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_MINI]["sync"], prompt, **kwargs)
 
     def _try_openai_oss(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        """Route to the in-house GPT-OSS-120B model (OpenAI-compat endpoint).
-
-        Falls back to GPT-5-mini (cloud) if the OSS model is unavailable, so
-        intent classification always gets an answer even during local outages.
-        """
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(
-                    openai.generate, prompt, model=_resolve_tier_model(OPENAI_OSS_MODEL, "openai", "oss"), **kwargs
-                ))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{OPENAI_OSS_DISPLAY} ({_resolve_tier_model(OPENAI_OSS_MODEL, 'openai', 'oss')})"
-                    self._last_actual_tier = TIER_LOCAL_MINI
-                    return result, False
-                logger.warning("ModelRouter: GPT-OSS-120B failed → fallback GPT-5-mini")
-            except Exception as e:
-                logger.warning(f"ModelRouter: GPT-OSS-120B circuit-breaker rejected → {e}")
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(
-                    openai.generate, prompt, model=_resolve_tier_model(OPENAI_SIMPLE_MODEL, "openai", "simple"), **kwargs
-                ))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{OPENAI_SIMPLE_DISPLAY} ({_resolve_tier_model(OPENAI_SIMPLE_MODEL, 'openai', 'simple')}) [fallback]"
-                    self._last_actual_tier = TIER_MINI
-                    return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: GPT-5-mini fallback for OSS failed → {e}")
-        return "Error: no gateway available", False
+        """In-house GPT-OSS-120B over the OpenAI-compatible endpoint, falling
+        back to GPT-5-mini so intent classification still answers during a
+        local outage. Not reached from _dispatch, which sends TIER_LOCAL_MINI
+        to the local gateway instead; kept for direct callers."""
+        return self._dispatch_by_family(_LEGACY_CHAIN["_oss"]["sync"], prompt, **kwargs)
 
     def _try_openai_coding(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(openai.generate, prompt, **kwargs))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{OPENAI_CODING_DISPLAY} ({_resolve_tier_model(OPENAI_CODING_MODEL, 'openai', 'medium')})"
-                    self._last_actual_tier = TIER_MEDIUM
-                    return result, False
-                logger.warning("ModelRouter: GPT-5.4 failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: OpenAI circuit-breaker rejected → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-                ))
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                self._last_actual_tier = TIER_COMPLEX
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude fallback failed → {e}")
-        # LAST RESORT: local/Ollama. Tried only after both cloud options have
-        # failed or are unconfigured — installs with a working OpenAI/Claude
-        # key see no behavior change. Without this, an install with only
-        # Ollama configured (no cloud key at all) hard-fails every TIER_MEDIUM
-        # request — e.g. every KB "Auto" chat — with "no gateway available"
-        # instead of using the free/local model it actually has. Mirrors the
-        # local-call block in _try_local_simple(), minus that function's own
-        # cloud fallback (already exhausted above, so no point repeating it).
-        local = self._get_local()
-        if local and local.available and not _CB_LOCAL.is_open:
-            try:
-                result = self._collect(_CB_LOCAL.call(local.generate, prompt, tier="simple"))
-                if result and not result.startswith("Error"):
-                    _actual = getattr(local, "_last_selected_model", None)
-                    self.last_model_label = (
-                        f"Local ({_actual}) [fallback]" if _actual else f"{_tier_label(TIER_SIMPLE)} [fallback]"
-                    )
-                    self._last_actual_tier = TIER_SIMPLE
-                    return result, True
-                logger.warning("ModelRouter: Local fallback returned error")
-            except Exception as e:
-                logger.warning(f"ModelRouter: Local fallback failed → {e}")
-        return "Error: no gateway available", False
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_MEDIUM]["sync"], prompt, **kwargs)
 
     def _try_openai_deep(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(openai.generate, prompt, model=_resolve_tier_model(OPENAI_LATEST_MODEL, "openai", "deep"), **kwargs))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{OPENAI_LATEST_DISPLAY} ({_resolve_tier_model(OPENAI_LATEST_MODEL, 'openai', 'deep')})"
-                    self._last_actual_tier = TIER_DEEP
-                    return result, False
-                logger.warning("ModelRouter: GPT-5.4 failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: GPT-5.4 circuit-breaker rejected → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-                ))
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                self._last_actual_tier = TIER_COMPLEX
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude fallback for deep failed → {e}")
-        return "Error: no gateway available", False
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_DEEP]["sync"], prompt, **kwargs)
 
     def _try_openai_tera(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        """Dispatch to GPT-5.6 Tera (high-capacity variant). Falls back to Claude Sonnet."""
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(openai.generate, prompt, model=_resolve_tier_model(OPENAI_TERA_MODEL, "openai", "gpt56-tera"), **kwargs))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{OPENAI_TERA_DISPLAY} ({_resolve_tier_model(OPENAI_TERA_MODEL, 'openai', 'gpt56-tera')})"
-                    self._last_actual_tier = TIER_TERA
-                    return result, False
-                logger.warning("ModelRouter: GPT-5.6 Tera failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: GPT-5.6 Tera circuit-breaker rejected → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-                ))
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                self._last_actual_tier = TIER_COMPLEX
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude fallback for Tera failed → {e}")
-        return "Error: no gateway available", False
+        """GPT-5.6 Tera (high-capacity variant). Falls back to Claude Sonnet."""
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_TERA]["sync"], prompt, **kwargs)
 
     def _try_openai_luna(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        """Dispatch to GPT-5.6 Luna (efficient variant). Falls back to Claude Sonnet."""
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(openai.generate, prompt, model=_resolve_tier_model(OPENAI_LUNA_MODEL, "openai", "gpt56-luna"), **kwargs))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{OPENAI_LUNA_DISPLAY} ({_resolve_tier_model(OPENAI_LUNA_MODEL, 'openai', 'gpt56-luna')})"
-                    self._last_actual_tier = TIER_LUNA
-                    return result, False
-                logger.warning("ModelRouter: GPT-5.6 Luna failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: GPT-5.6 Luna circuit-breaker rejected → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-                ))
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                self._last_actual_tier = TIER_COMPLEX
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude fallback for Luna failed → {e}")
-        return "Error: no gateway available", False
+        """GPT-5.6 Luna (efficient variant). Falls back to Claude Sonnet."""
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_LUNA]["sync"], prompt, **kwargs)
 
     def _try_claude_sonnet(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-                ))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')})"
-                    self._last_actual_tier = TIER_COMPLEX
-                    return result, False
-                logger.warning("ModelRouter: Claude Sonnet failed → fallback GPT-5.4")
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude circuit-breaker rejected → {e}")
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(openai.generate, prompt, **kwargs))
-                self.last_model_label = f"{OPENAI_CODING_DISPLAY} ({_resolve_tier_model(OPENAI_CODING_MODEL, 'openai', 'medium')}) [fallback]"
-                self._last_actual_tier = TIER_MEDIUM
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: OpenAI fallback failed → {e}")
-        return "Error: no gateway available", False
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_COMPLEX]["sync"], prompt, **kwargs)
 
     def _try_claude_haiku(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_HAIKU, "anthropic", "haiku")
-                ))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{CLAUDE_HAIKU_DISPLAY} ({_resolve_tier_model(CLAUDE_HAIKU, 'anthropic', 'haiku')})"
-                    self._last_actual_tier = TIER_HAIKU
-                    return result, False
-                logger.warning("ModelRouter: Claude Haiku failed → fallback GPT-5.4")
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude Haiku circuit-breaker rejected → {e}")
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                result = self._collect(_CB_OPENAI.call(openai.generate, prompt, **kwargs))
-                self.last_model_label = f"{OPENAI_CODING_DISPLAY} ({_resolve_tier_model(OPENAI_CODING_MODEL, 'openai', 'medium')}) [fallback]"
-                self._last_actual_tier = TIER_MEDIUM
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: OpenAI fallback for Haiku failed → {e}")
-        return "Error: no gateway available", False
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_HAIKU]["sync"], prompt, **kwargs)
 
     def _try_claude_solution(self, prompt: str, **kwargs) -> tuple[str, bool]:
-        """Solution-tier: Opus if ENABLE_OPUS=true, otherwise Sonnet. Falls back to Sonnet."""
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=SOLUTION_MODEL
-                ))
-                if not result.startswith("Error"):
-                    self.last_model_label = _tier_label(TIER_SOLUTION)
-                    self._last_actual_tier = TIER_SOLUTION
-                    return result, False
-                logger.warning("ModelRouter: solution model failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: solution circuit-breaker rejected → {e}")
-        # Fallback: Sonnet — force was_fallback=True regardless of Sonnet's own result.
-        result, _ = self._try_claude_sonnet(prompt, **kwargs)
-        return result, True
+        """Opus if ENABLE_OPUS=true, otherwise Sonnet, then the Sonnet chain.
+
+        was_fallback is True for every outcome except the Opus hop itself —
+        including total failure. That is what the pre-Phase-5 method did (it
+        overwrote the delegated flag unconditionally) and callers may be
+        reading it, so exhausted_fallback carries it rather than correcting it.
+        """
+        return self._dispatch_by_family(
+            _LEGACY_CHAIN[TIER_SOLUTION]["sync"], prompt,
+            exhausted_fallback=_LEGACY_CHAIN[TIER_SOLUTION]["exhausted_fallback"],
+            **kwargs)
 
     def _try_claude_opus48(self, prompt: str, **kwargs) -> tuple[str, bool]:
         """Explicit Claude Opus 4.8 selection (CLI/IDE only). Falls back to Sonnet."""
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_OPUS_48_MODEL, "anthropic", "opus-4-8")
-                ))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{CLAUDE_OPUS_48_DISPLAY} ({_resolve_tier_model(CLAUDE_OPUS_48_MODEL, 'anthropic', 'opus-4-8')})"
-                    return result, False
-                logger.warning("ModelRouter: Claude Opus 4.8 failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude Opus 4.8 circuit-breaker rejected → {e}")
-        return self._try_claude_sonnet(prompt, **kwargs)
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_OPUS_48]["sync"], prompt, **kwargs)
 
     def _try_claude_opus5(self, prompt: str, **kwargs) -> tuple[str, bool]:
         """Explicit Claude Opus 5 selection (CLI/IDE opt-in). Falls back to Sonnet."""
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_OPUS_5_MODEL, "anthropic", "opus-5")
-                ))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{CLAUDE_OPUS_5_DISPLAY} ({_resolve_tier_model(CLAUDE_OPUS_5_MODEL, 'anthropic', 'opus-5')})"
-                    self._last_actual_tier = TIER_OPUS_5
-                    return result, False
-                logger.warning("ModelRouter: Claude Opus 5 failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude Opus 5 circuit-breaker rejected → {e}")
-        return self._try_claude_sonnet(prompt, **kwargs)
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_OPUS_5]["sync"], prompt, **kwargs)
 
     def _try_claude_sonnet5(self, prompt: str, **kwargs) -> tuple[str, bool]:
         """Explicit Claude Sonnet 5 selection (all channels). Falls back to Sonnet 4.6."""
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_SONNET_5_MODEL, "anthropic", "sonnet-5")
-                ))
-                if not result.startswith("Error"):
-                    self.last_model_label = f"{CLAUDE_SONNET_5_DISPLAY} ({_resolve_tier_model(CLAUDE_SONNET_5_MODEL, 'anthropic', 'sonnet-5')})"
-                    self._last_actual_tier = TIER_SONNET_5
-                    return result, False
-                logger.warning("ModelRouter: Claude Sonnet 5 failed → fallback Claude Sonnet 4.6")
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude Sonnet 5 circuit-breaker rejected → {e}")
-        return self._try_claude_sonnet(prompt, **kwargs)
+        return self._dispatch_by_family(_LEGACY_CHAIN[TIER_SONNET_5]["sync"], prompt, **kwargs)
 
     def _try_gemini(self, prompt: str, model: Optional[str] = None, **kwargs) -> tuple[str, bool]:
-        gemini = self._get_gemini()
-        if gemini and not _CB_GEMINI.is_open:
-            try:
-                # model=None → gateway uses its module-level MODEL default.
-                _kw = {"model": model} if model else {}
-                _kw.update(kwargs)  # forward precleared / precleared_findings
-                result = self._collect(_CB_GEMINI.call(gemini.generate, prompt, **_kw))
-                if not result.startswith("Error"):
-                    # last_model_label already set to tier-appropriate label by route()
-                    # _last_actual_tier mirrors the original vision/gemini tier
-                    self._last_actual_tier = TIER_VISION  # set here; route() already has the exact tier
-                    return result, False
-                logger.warning("ModelRouter: Gemini failed → fallback Claude Sonnet")
-            except Exception as e:
-                logger.warning(f"ModelRouter: Gemini circuit-breaker rejected → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                result = self._collect(_CB_CLAUDE.call(
-                    claude.generate, prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-                ))
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                self._last_actual_tier = TIER_COMPLEX
-                return result, True
-            except Exception as e:
-                logger.warning(f"ModelRouter: Claude fallback failed → {e}")
-        return "Error: no gateway available", False
-
-    # --------------------------------------------------------
-    # STREAMING DISPATCH  (yields tokens, never collects)
-    # --------------------------------------------------------
+        return self._dispatch_by_family(
+            _LEGACY_CHAIN[TIER_VISION]["sync"], prompt, {"provider_model": model}, **kwargs)
 
     def _dispatch_stream(
             self,
@@ -2377,11 +3015,18 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
             provider_model: Optional[str] = None,
+            candidates: Optional[list] = None,
     ):
         # precleared / precleared_findings are only meaningful for providers
         # that run a second-pass compliance gate inside their generate()
         # (OpenAI + Gemini, direct or via LLM proxy). Claude and Local LLM do
         # not re-validate, so they ignore the flag.
+        if tier == TIER_GOVERNED:
+            yield from self._dispatch_by_family_stream(
+                self._attempts_from_resolved(candidates or []), prompt,
+                precleared=precleared, precleared_findings=precleared_findings,
+            )
+            return
         if tier == TIER_SIMPLE:
             # Fix: honor an explicit local model override on the STREAMING path.
             # Previously provider_model (from a "local:<id>" hint) was dropped
@@ -2478,66 +3123,20 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        # Fix 5: emit at WARNING so this line survives log-level filters and
-        # appears in per-request exports even when INFO is suppressed.
-        # Cross-check: if [LLM DISPATCH]/[LOCAL USAGE] are absent from an export
-        # but this line IS present, the request was served from the Redis/semantic
-        # cache before reaching generate() — check bypass metrics
+        # Emitted at WARNING so it survives log-level filters and appears in
+        # per-request exports even when INFO is suppressed. Cross-check: if
+        # [LLM DISPATCH]/[LOCAL USAGE] are absent from an export but this line
+        # IS present, the request was served from the Redis/semantic cache
+        # before reaching generate() — check bypass metrics
         # (ainxt:bypass:{date}:redis / :semantic) to confirm.
         from core.logger import get_request_id as _gri
         logger.warning(
             "[LOCAL STREAM ENTRY] request_id=%s local_model=%r cb_open=%s",
-            _gri() or "n/a",
-            local_model,
-            _CB_LOCAL.is_open,
+            _gri() or "n/a", local_model, _CB_LOCAL.is_open,
         )
-        local = self._get_local()
-        if local and local.available and not _CB_LOCAL.is_open:
-            try:
-                token_yielded = False
-                for tok in local.generate(prompt, model=local_model, tier="simple"):
-                    if tok and not tok.startswith("Error"):
-                        token_yielded = True
-                        yield tok
-                if token_yielded:
-                    # Fix 1+2: use the model ID that generate() actually resolved
-                    # (_last_selected_model) rather than re-calling _tier_label(TIER_SIMPLE),
-                    # which invokes _catalog.pick() again and can return a different entry
-                    # if the catalog refreshed between the generate() call and here.
-                    _actual = (
-                        local_model
-                        or getattr(local, "_last_selected_model", None)
-                    )
-                    self.last_model_label = (
-                        f"Local ({_actual})" if _actual else _tier_label(TIER_SIMPLE)
-                    )
-                    return
-                logger.info("ModelRouter stream: Local empty/error → fallback GPT-5 mini")
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Local failed → {e}")
-        logger.info("ModelRouter: Local unavailable → fallback GPT-5 mini")
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_SIMPLE_DISPLAY} ({_resolve_tier_model(OPENAI_SIMPLE_MODEL, 'openai', 'simple')}) [fallback]"
-                yield from openai.generate(
-                    prompt,
-                    model=_resolve_tier_model(OPENAI_SIMPLE_MODEL, "openai", "simple"),
-                    precleared=precleared,
-                    precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: GPT-5 mini fallback failed → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude fallback failed → {e}")
-        yield "Error: no gateway available"
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_SIMPLE]["stream"], prompt, {"local_model": local_model},
+            precleared=precleared, precleared_findings=precleared_findings)
 
     def _try_openai_mini_stream(
             self,
@@ -2545,27 +3144,11 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_SIMPLE_DISPLAY} ({_resolve_tier_model(OPENAI_SIMPLE_MODEL, 'openai', 'simple')})"
-                yield from openai.generate(
-                    prompt,
-                    model=_resolve_tier_model(OPENAI_SIMPLE_MODEL, "openai", "simple"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: GPT-5-mini failed → {e}")
-        # Env-configurable fallback chain: haiku → local:kimi-k2.7 → local:glm-5.2
-        # (CHAT_FALLBACK_CHAIN). Each hop is circuit-breaker gated; first hop that
-        # yields tokens wins. Replaces the old hard-coded Claude-Sonnet fallback.
-        _yielded = yield from self._walk_fallback_chain_stream(
-            prompt, precleared=precleared, precleared_findings=precleared_findings,
-        )
-        if _yielded:
-            return
-        yield "Error: no gateway available"
+        """GPT-5-mini, then CHAT_FALLBACK_CHAIN — NOT the blocking twin's Claude hop."""
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_MINI]["stream"], prompt,
+            walk_chain=True, precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _walk_fallback_chain_stream(
             self, prompt: str, *, precleared: bool = False,
@@ -2621,38 +3204,11 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        """Streaming dispatch to in-house GPT-OSS model (TIER_LOCAL_MINI).
-
-        Mirrors the blocking _try_openai_oss() path: primary is OPENAI_OSS_MODEL
-        (in-house hosted, OpenAI-compat API, zero cloud cost); falls back to
-        OPENAI_SIMPLE_MODEL (GPT-5-mini) when the in-house endpoint is down or
-        the circuit breaker is open.
-        """
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_OSS_DISPLAY} ({_resolve_tier_model(OPENAI_OSS_MODEL, 'openai', 'oss')})"
-                yield from openai.generate(
-                    prompt,
-                    model=_resolve_tier_model(OPENAI_OSS_MODEL, "openai", "oss"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: GPT-OSS failed → {e}")
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_SIMPLE_DISPLAY} ({_resolve_tier_model(OPENAI_SIMPLE_MODEL, 'openai', 'simple')}) [fallback]"
-                yield from openai.generate(
-                    prompt,
-                    model=_resolve_tier_model(OPENAI_SIMPLE_MODEL, "openai", "simple"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: GPT-5-mini fallback for OSS failed → {e}")
-        yield "Error: no gateway available"
+        """In-house GPT-OSS over the OpenAI-compat endpoint, then GPT-5-mini."""
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN["_oss"]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_openai_coding_stream(
             self,
@@ -2660,48 +3216,10 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_CODING_DISPLAY} ({_resolve_tier_model(OPENAI_CODING_MODEL, 'openai', 'medium')})"
-                yield from openai.generate(
-                    prompt,
-                    model=_resolve_tier_model(OPENAI_CODING_MODEL, "openai", "medium"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: GPT-5.4 failed → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude fallback failed → {e}")
-        # LAST RESORT: local/Ollama — see _try_openai_coding()'s non-streaming
-        # twin for why. KB chat's /ask streams, so this is the branch that
-        # actually runs for KB "Auto" mode; fixing only the sync version above
-        # left this one still hard-failing (confirmed via live testing).
-        local = self._get_local()
-        if local and local.available and not _CB_LOCAL.is_open:
-            try:
-                token_yielded = False
-                for tok in local.generate(prompt, tier="simple"):
-                    if tok and not tok.startswith("Error"):
-                        token_yielded = True
-                        yield tok
-                if token_yielded:
-                    _actual = getattr(local, "_last_selected_model", None)
-                    self.last_model_label = (
-                        f"Local ({_actual}) [fallback]" if _actual else f"{_tier_label(TIER_SIMPLE)} [fallback]"
-                    )
-                    return
-                logger.warning("ModelRouter stream: Local fallback returned empty/error")
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Local fallback failed → {e}")
-        yield "Error: no gateway available"
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_MEDIUM]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_openai_deep_stream(
             self,
@@ -2709,26 +3227,10 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_LATEST_DISPLAY} ({_resolve_tier_model(OPENAI_LATEST_MODEL, 'openai', 'deep')})"
-                yield from openai.generate(
-                    prompt, model=_resolve_tier_model(OPENAI_LATEST_MODEL, "openai", "deep"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: GPT-5.4 failed → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude fallback for deep failed → {e}")
-        yield "Error: no gateway available"
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_DEEP]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_openai_tera_stream(
             self,
@@ -2736,27 +3238,11 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        """Streaming dispatch to GPT-5.6 Tera. Falls back to Claude Sonnet."""
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_TERA_DISPLAY} ({_resolve_tier_model(OPENAI_TERA_MODEL, 'openai', 'gpt56-tera')})"
-                yield from openai.generate(
-                    prompt, model=_resolve_tier_model(OPENAI_TERA_MODEL, "openai", "gpt56-tera"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: GPT-5.6 Tera failed → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude fallback for Tera failed → {e}")
-        yield "Error: no gateway available"
+        """GPT-5.6 Tera. Falls back to Claude Sonnet."""
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_TERA]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_openai_luna_stream(
             self,
@@ -2764,27 +3250,11 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        """Streaming dispatch to GPT-5.6 Luna. Falls back to Claude Sonnet."""
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_LUNA_DISPLAY} ({_resolve_tier_model(OPENAI_LUNA_MODEL, 'openai', 'gpt56-luna')})"
-                yield from openai.generate(
-                    prompt, model=_resolve_tier_model(OPENAI_LUNA_MODEL, "openai", "gpt56-luna"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: GPT-5.6 Luna failed → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude fallback for Luna failed → {e}")
-        yield "Error: no gateway available"
+        """GPT-5.6 Luna. Falls back to Claude Sonnet."""
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_LUNA]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_claude_sonnet_stream(
             self,
@@ -2792,35 +3262,10 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')})"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex"))
-                # Forward any extended-thinking content captured by the Claude
-                # gateway during streaming so the UI can render it.
-                try:
-                    self.last_thinking_text = getattr(claude, "_last_thinking_text", "") or ""
-                except Exception:
-                    pass
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude Sonnet failed → {e}")
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_CODING_DISPLAY} ({_resolve_tier_model(OPENAI_CODING_MODEL, 'openai', 'medium')}) [fallback]"
-                # OpenAI fallback path: forward precleared so /ask false-positive
-                # blocks don't reappear when Claude trips a circuit breaker.
-                yield from openai.generate(
-                    prompt,
-                    model=_resolve_tier_model(OPENAI_CODING_MODEL, "openai", "medium"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: OpenAI fallback failed → {e}")
-        yield "Error: no gateway available"
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_COMPLEX]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_claude_haiku_stream(
             self,
@@ -2828,27 +3273,10 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_HAIKU_DISPLAY} ({_resolve_tier_model(CLAUDE_HAIKU, 'anthropic', 'haiku')})"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_HAIKU, "anthropic", "haiku"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude Haiku failed → {e}")
-        openai = self._get_openai()
-        if openai and not _CB_OPENAI.is_open:
-            try:
-                self.last_model_label = f"{OPENAI_CODING_DISPLAY} ({_resolve_tier_model(OPENAI_CODING_MODEL, 'openai', 'medium')}) [fallback]"
-                yield from openai.generate(
-                    prompt,
-                    model=_resolve_tier_model(OPENAI_CODING_MODEL, "openai", "medium"),
-                    precleared=precleared, precleared_findings=precleared_findings,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: OpenAI fallback for Haiku failed → {e}")
-        yield "Error: no gateway available"
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_HAIKU]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_claude_solution_stream(
             self,
@@ -2856,18 +3284,11 @@ class ModelRouter:
             precleared: bool = False,
             precleared_findings: Optional[list] = None,
     ):
-        """Solution-tier streaming: Opus if ENABLE_OPUS=true, else Sonnet."""
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = _tier_label(TIER_SOLUTION)
-                yield from claude.generate(prompt, model=SOLUTION_MODEL)
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: solution model failed → {e}")
-        yield from self._try_claude_sonnet_stream(
-            prompt, precleared=precleared, precleared_findings=precleared_findings,
-        )
+        """Opus if ENABLE_OPUS=true, else Sonnet, then the Sonnet chain."""
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_SOLUTION]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_claude_opus5_stream(
             self,
@@ -2876,55 +3297,34 @@ class ModelRouter:
             precleared_findings: Optional[list] = None,
     ):
         """Explicit Claude Opus 5 streaming (CLI/IDE opt-in). Falls back to Sonnet."""
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_OPUS_5_DISPLAY} ({_resolve_tier_model(CLAUDE_OPUS_5_MODEL, 'anthropic', 'opus-5')})"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_OPUS_5_MODEL, "anthropic", "opus-5"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude Opus 5 failed → {e}")
-        yield from self._try_claude_sonnet_stream(
-            prompt, precleared=precleared, precleared_findings=precleared_findings,
-        )
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_OPUS_5]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_claude_opus48_stream(
-        self,
-        prompt: str,
-        precleared: bool = False,
-        precleared_findings: Optional[list] = None,
+            self,
+            prompt: str,
+            precleared: bool = False,
+            precleared_findings: Optional[list] = None,
     ):
         """Explicit Claude Opus 4.8 streaming (CLI-only). Falls back to Sonnet."""
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_OPUS_48_DISPLAY} ({_resolve_tier_model(CLAUDE_OPUS_48_MODEL, 'anthropic', 'opus-4-8')})"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_OPUS_48_MODEL, "anthropic", "opus-4-8"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude Opus 4.8 failed → {e}")
-        yield from self._try_claude_sonnet_stream(
-            prompt, precleared=precleared, precleared_findings=precleared_findings,
-        )
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_OPUS_48]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_claude_sonnet5_stream(
-        self,
-        prompt: str,
-        precleared: bool = False,
-        precleared_findings: Optional[list] = None,
+            self,
+            prompt: str,
+            precleared: bool = False,
+            precleared_findings: Optional[list] = None,
     ):
         """Explicit Claude Sonnet 5 streaming (all channels). Falls back to Sonnet 4.6."""
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_SONNET_5_DISPLAY} ({_resolve_tier_model(CLAUDE_SONNET_5_MODEL, 'anthropic', 'sonnet-5')})"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_SONNET_5_MODEL, "anthropic", "sonnet-5"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude Sonnet 5 failed → {e}")
-        yield from self._try_claude_sonnet_stream(
-            prompt, precleared=precleared, precleared_findings=precleared_findings,
-        )
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_SONNET_5]["stream"], prompt,
+            precleared=precleared,
+            precleared_findings=precleared_findings)
 
     def _try_gemini_stream(
             self,
@@ -2933,31 +3333,9 @@ class ModelRouter:
             precleared_findings: Optional[list] = None,
             model: Optional[str] = None,
     ):
-        gemini = self._get_gemini()
-        if gemini and not _CB_GEMINI.is_open:
-            try:
-                # last_model_label already set to tier-appropriate label by stream().
-                # model=None → gateway uses its module-level MODEL default.
-                _kw = {"model": model} if model else {}
-                yield from gemini.generate(
-                    prompt, precleared=precleared, precleared_findings=precleared_findings, **_kw,
-                )
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Gemini failed → {e}")
-        claude = self._get_claude()
-        if claude and not _CB_CLAUDE.is_open:
-            try:
-                self.last_model_label = f"{CLAUDE_PRIMARY_DISPLAY} ({_resolve_tier_model(CLAUDE_PRIMARY_MODEL, 'anthropic', 'complex')}) [fallback]"
-                yield from claude.generate(prompt, model=_resolve_tier_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex"))
-                return
-            except Exception as e:
-                logger.warning(f"ModelRouter stream: Claude fallback failed → {e}")
-        yield "Error: no gateway available"
-
-    # --------------------------------------------------------
-    # HELPERS
-    # --------------------------------------------------------
+        yield from self._dispatch_by_family_stream(
+            _LEGACY_CHAIN[TIER_VISION]["stream"], prompt, {"provider_model": model},
+            precleared=precleared, precleared_findings=precleared_findings)
 
     @staticmethod
     def _collect(gen) -> str:
@@ -3024,6 +3402,15 @@ class ModelRouter:
             _model = CLAUDE_SONNET_5_MODEL
         elif decision.tier in (TIER_COMPLEX, TIER_HAIKU):
             _model = CLAUDE_PRIMARY_MODEL
+        elif decision.tier == TIER_GOVERNED:
+            # This method speaks only to the Claude proxy gateway (it sends
+            # content_blocks for prompt caching), so a governed decision is
+            # usable only when the resolver picked an Anthropic model. When it
+            # picked something else, fall back to the Claude default rather
+            # than sending an OpenAI id to ClaudeGateway, which 400s.
+            _top = (decision.resolved or [None])[0]
+            _model = (_top.model_id if _top is not None and _top.family == "anthropic"
+                      else CLAUDE_PRIMARY_MODEL)
         else:
             _model = CLAUDE_PRIMARY_MODEL  # default Claude for any other tier
 
@@ -3094,8 +3481,26 @@ class ModelRouter:
         model_hint = self._coerce_tier(model_hint, tier)
         if not prompt:
             return ""
-        decision = self.route(prompt, model_hint=model_hint,
-                              data_classification=data_classification)
+        try:
+            # `tier` goes to route() as well as being coerced above: with
+            # governance on, route() resolves the Tier directly, and the three
+            # modality tiers have no legacy hint to be coerced into.
+            decision = self.route(prompt, model_hint=None if tier is not None else model_hint,
+                                  tier=tier, data_classification=data_classification)
+        except Exception as exc:
+            # Only reachable under no_cloud_egress, which is the one constraint
+            # the resolver refuses to degrade around. Returned as a string
+            # because generate()'s contract is that it never raises.
+            if type(exc).__name__ != "NoEligibleModel":
+                raise
+            logger.error("ModelRouter: PRIVACY FLOOR — %s", exc)
+            return (
+                "Error: this request carries data that may not be sent to a "
+                f"cloud provider, and no in-house model can serve it ({exc}). "
+                "Assign a deployment-local model to this tier, or configure a "
+                "local provider."
+            )
+        self._record_selection(decision)
         logger.info(f"ModelRouter → {decision.model} (tier={decision.tier})")
         # PRIVACY FLOOR: when enforced, no-cloud-fallback is propagated into
         # _dispatch so a local outage fails closed instead of egressing.
@@ -3130,6 +3535,7 @@ class ModelRouter:
 
         output, was_fallback = self._dispatch(
             decision.tier, prompt, provider_model=decision.provider_model_override,
+            candidates=decision.resolved,
             **_compliance_kw,
         )
 
@@ -3217,7 +3623,20 @@ class ModelRouter:
         model_hint = self._coerce_tier(model_hint, tier)
         if not prompt:
             return
-        decision = self.route(prompt, model_hint=model_hint)
+        try:
+            # needs_streaming: the call shape is known HERE and nowhere else,
+            # so the resolver can drop a candidate whose capabilities say it
+            # cannot stream rather than discovering it mid-response.
+            decision = self.route(prompt, model_hint=None if tier is not None else model_hint,
+                                  tier=tier, needs_streaming=True)
+        except Exception as exc:
+            if type(exc).__name__ != "NoEligibleModel":
+                raise
+            logger.error("ModelRouter: PRIVACY FLOOR — %s", exc)
+            yield ("Error: this request carries data that may not be sent to a "
+                   f"cloud provider, and no in-house model can serve it ({exc}).")
+            return
+        self._record_selection(decision)
         logger.info(f"ModelRouter.stream → {decision.model} (tier={decision.tier})"
                     + (f" [local_model={local_model}]" if local_model else ""))
         self.last_model_label   = decision.model
@@ -3230,6 +3649,7 @@ class ModelRouter:
             precleared=precleared,
             precleared_findings=precleared_findings,
             provider_model=decision.provider_model_override,
+            candidates=decision.resolved,
         )
         self._propagate_tokens(decision.tier)
         # Sentinel — read the values RIGHT NOW (same thread frame as
@@ -3271,6 +3691,7 @@ class ModelRouter:
             # Local dev: no proxy, fall back to sync (run in threadpool via caller)
             return self.generate(prompt, model_hint=model_hint)
         decision = self.route(prompt, model_hint=model_hint)
+        self._record_selection(decision)
         logger.info(f"ModelRouter.async_generate → {decision.model} (tier={decision.tier})")
         gw_map = {
             TIER_SIMPLE:     self._get_local(),    # local stays sync
@@ -3374,6 +3795,7 @@ class ModelRouter:
             return
 
         decision = self.route(prompt, model_hint=model_hint)
+        self._record_selection(decision)
         logger.info(
             f"ModelRouter.async_stream → {decision.model} (tier={decision.tier})"
             + (f" [local_model={local_model}]" if local_model else "")
@@ -3394,6 +3816,13 @@ class ModelRouter:
             gw = self._get_claude()
         elif decision.tier in (TIER_VISION, TIER_GEMINI):
             gw = self._get_gemini()
+        # TIER_GOVERNED is deliberately absent: the native-async branch below
+        # calls ONE gateway and has no way to try the next candidate when that
+        # call fails. Leaving gw None routes governed streaming through the
+        # sync bridge, which goes via _dispatch_stream and therefore keeps
+        # §M.5's within-tier fallback. A native async path for the governed
+        # tier is worth having, but not at the cost of silently dropping the
+        # fallback the whole tier model is built on.
 
         if gw is not None and hasattr(gw, "async_stream"):
             # Native async streaming path — no thread held.
@@ -3431,6 +3860,7 @@ class ModelRouter:
                                 precleared=precleared,
                                 precleared_findings=precleared_findings,
                                 provider_model=decision.provider_model_override,
+                                candidates=decision.resolved,
                         ):
                             _loop.call_soon_threadsafe(_queue.put_nowait, tok)
                         self._propagate_tokens(decision.tier)
@@ -3484,3 +3914,27 @@ class ModelRouter:
 # ============================================================
 
 model_router = ModelRouter()
+
+
+def last_selection_audit() -> dict:
+    """The §L.5 fields for the ainxt.metrics event, for the CURRENT thread.
+
+    A function rather than two attribute reads so the six producers in
+    gateway.py / kb_ask_router.py stay one line each and cannot disagree about
+    the key names the Kafka consumer expects.
+
+    Thread affinity is the same as last_model_label's: the values are written
+    where route() ran. Two consequences, both absorbed by the columns being
+    nullable — a gap in the measurement, never a wrong answer in the billing
+    trail:
+
+      * a producer on a different thread from the router call reads None;
+      * a turn served from the Redis or semantic cache never calls route() at
+        all, so it reports whatever that thread last routed. Read the column
+        as "provenance of the last routed turn on this thread", not as a
+        per-row guarantee, when analysing the rollout.
+    """
+    return {
+        "selection_mode": model_router.last_selection_mode,
+        "requested_tier": model_router.last_requested_tier,
+    }

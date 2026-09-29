@@ -490,6 +490,28 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
       pass "llm channel restrictions" "none — no model is channel-restricted"
     fi
 
+    # ── Is tier governance actually deciding anything? (Phase 5) ────────────
+    # The single most useful line in this section, because every check below
+    # it means something different depending on the answer. With the flag off
+    # an unassigned tier is future work; with it on, that tier falls back to
+    # the deprecated .env model constants on every request.
+    # .env first, then the environment: the gateway reads the value through
+    # python-dotenv, so a value present only in .env is still the live one.
+    tg_raw="$(envval TIER_GOVERNANCE_ENABLED || true)"
+    [[ -z "$tg_raw" ]] && tg_raw="${TIER_GOVERNANCE_ENABLED:-}"
+    tg_raw="$(printf '%s' "$tg_raw" | tr '[:upper:]' '[:lower:]')"
+    case "$tg_raw" in
+      1|true|yes|on) tg_on=1 ;;
+      *)             tg_on=0 ;;
+    esac
+    if [[ "$tg_on" -eq 1 ]]; then
+      pass "llm tier governance" "ON — models resolve from the tier assignments"
+    else
+      # Not a pass and not a warning: off is the correct default, and a green
+      # tick would suggest the assignments below are in effect when they are not.
+      skip "llm tier governance" "OFF — .env model constants still decide; set TIER_GOVERNANCE_ENABLED=true to switch over"
+    fi
+
     # ── Tier assignment coverage (Phase 3) ──────────────────────────────────
     # An unassigned tier is not an error: a deployment with no image model
     # genuinely cannot generate images, and saying so is the point. But it
@@ -503,8 +525,13 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
       pass "llm tier assignments" "all 8 tiers have at least one eligible model"
     else
       unassigned="$(run_sql "SELECT string_agg(t, ', ' ORDER BY t) FROM unnest(ARRAY['mini','simple','medium','complex','image-input','image-output','video-generation','intent-classification']) AS t WHERE t NOT IN (SELECT tier FROM ainxt.llm_tier_models WHERE enabled = TRUE AND org_id = 'default')" | tr -d '\r' | sed 's/^ *//;s/ *$//')"
-      warno "llm tier assignments" "$tiers_n/8 assigned — unassigned: ${unassigned:-unknown}" \
-            "features using these tiers report unavailable; assign models in Admin → Model Governance → Tiers"
+      if [[ "$tg_on" -eq 1 ]]; then
+        warno "llm tier assignments" "$tiers_n/8 assigned — unassigned: ${unassigned:-unknown}" \
+              "governance is ON, so every request for these tiers falls back to the deprecated .env model constants; assign models in Admin → Model Governance → Tiers"
+      else
+        warno "llm tier assignments" "$tiers_n/8 assigned — unassigned: ${unassigned:-unknown}" \
+              "features using these tiers report unavailable; assign models in Admin → Model Governance → Tiers"
+      fi
     fi
 
     # A tier row whose model has since been disabled still occupies a priority

@@ -164,3 +164,12 @@ AUDIT_OUTPUT/
 # Local AI/editor tool settings (per-developer, never shared)
 .claude/
 node_modules/
+
+# Local planning/scratch notes — working docs for in-progress work, not repo content
+llm_tier_governance_claude_prompt.md
+phase0-findings.md
+phase1-2-plan.md
+plan.html
+docs/
+CLAUDE.md
+.gitignore

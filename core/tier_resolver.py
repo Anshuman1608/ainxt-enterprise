@@ -340,9 +340,18 @@ def _candidates_for(tier: Tier, channel: Optional[str], org_id: str) -> list[dic
     return out
 
 
-def _pick(candidates: list[dict], tier: Tier, c: Constraints,
-          rejections: dict) -> Optional[dict]:
-    """First survivor in priority order, with the two §M refinements."""
+def _survivors(candidates: list[dict], tier: Tier, c: Constraints,
+               rejections: dict) -> list[dict]:
+    """Every candidate that passes, in the order they should be TRIED.
+
+    Returns the whole list rather than just its head because §M.5 has two
+    different fallbacks and only one of them is a filtering question. "Candidate
+    1 is filtered out, candidate 2 is tried" is answered here; "candidate 1 was
+    tried and the call failed" can only be answered at dispatch time, and
+    re-resolving after a failure would return the same model — one failure does
+    not open a breaker (failure_threshold is 10). So the dispatcher needs the
+    list, not the head of it.
+    """
     survivors = []
     for model in candidates:
         reason = _reject_reason(model, tier, c)
@@ -352,7 +361,7 @@ def _pick(candidates: list[dict], tier: Tier, c: Constraints,
             rejections[model["model_id"]] = reason
 
     if not survivors:
-        return None
+        return []
 
     # §M.3a — require_role is a PREFERENCE, not a filter. A deployment with one
     # model must still be able to run a review stage; the admin sees author and
@@ -368,32 +377,38 @@ def _pick(candidates: list[dict], tier: Tier, c: Constraints,
     if c.budget_state in (BUDGET_NEARING_CAP, BUDGET_OVER):
         survivors = sorted(survivors, key=_cost_key)
 
-    return survivors[0]
+    return survivors
 
 
-def resolve_tier(tier: Tier, c: Optional[Constraints] = None, *,
-                 channel: Optional[str] = None,
-                 org_id: str = "default") -> ResolvedModel:
-    """Resolve a capability tier to a concrete model under `c`.
+def resolve_tier_candidates(tier: Tier, c: Optional[Constraints] = None, *,
+                            channel: Optional[str] = None,
+                            org_id: str = "default") -> list[ResolvedModel]:
+    """Every model that may serve `tier` under `c`, in the order to TRY them.
 
     1. candidates = enabled assignments for `tier`, in admin priority order
-    2. drop any that fail a constraint, or whose breaker is open
-    3. FIRST SURVIVOR WINS — no scoring (see the module docstring)
-    4. none left → walk TIER_FALLBACK_LADDER AT MOST ONCE, re-applying the
+    2. drop any that fail a constraint, or whose breaker is already open
+    3. none left → walk TIER_FALLBACK_LADDER AT MOST ONCE, re-applying the
        same constraints
-    5. still none → raise NoEligibleModel
+    4. still none → raise NoEligibleModel
 
-    Raises NoEligibleModel rather than returning None: a caller that forgets to
-    check a None gets a wrong model silently, which is the failure mode this
-    replaces.
+    Raises rather than returning [] so that every caller inherits the same
+    contract resolve_tier() has always had, and so the rejection detail — the
+    part that tells an operator what is actually wrong with the deployment —
+    cannot be dropped on the floor by a caller that only checks for emptiness.
+
+    The list is never mixed across tiers: either the requested tier supplied
+    every element, or the ladder was walked and the NEXT tier supplied every
+    element. Trying a weaker tier's model before exhausting the requested
+    tier's own candidates would invert the admin's priority ordering, which is
+    the one thing §M.5's two mechanisms are ordered to prevent.
     """
     tier = Tier(tier)
     c = c or Constraints()
     rejections: dict = {}
 
-    chosen = _pick(_candidates_for(tier, channel, org_id), tier, c, rejections)
-    if chosen is not None:
-        return _to_resolved(chosen, tier, tier)
+    survivors = _survivors(_candidates_for(tier, channel, org_id), tier, c, rejections)
+    if survivors:
+        return [_to_resolved(m, tier, tier) for m in survivors]
 
     # ── Fallback ladder, walked at most once ────────────────────────────────
     # Never under no_cloud_egress (§M.5): the current code already refuses to
@@ -411,16 +426,33 @@ def resolve_tier(tier: Tier, c: Optional[Constraints] = None, *,
         raise NoEligibleModel(tier, c, rejections)
 
     fallback_rejections: dict = {}
-    chosen = _pick(_candidates_for(nxt, channel, org_id), nxt, c, fallback_rejections)
-    if chosen is not None:
+    survivors = _survivors(_candidates_for(nxt, channel, org_id), nxt, c, fallback_rejections)
+    if survivors:
         logger.warning(
             "[tier_resolver] tier %s had no eligible model (%s) — fell back to %s",
             tier.value, rejections or "unassigned", nxt.value,
         )
-        return _to_resolved(chosen, nxt, tier)
+        return [_to_resolved(m, nxt, tier) for m in survivors]
 
     rejections.update({f"{nxt.value}/{k}": v for k, v in fallback_rejections.items()})
     raise NoEligibleModel(tier, c, rejections)
+
+
+def resolve_tier(tier: Tier, c: Optional[Constraints] = None, *,
+                 channel: Optional[str] = None,
+                 org_id: str = "default") -> ResolvedModel:
+    """Resolve a capability tier to the ONE concrete model that should serve it.
+
+    The head of resolve_tier_candidates() — FIRST SURVIVOR WINS, no scoring
+    (see the module docstring). Kept as the primary entry point because almost
+    every caller wants an answer, not a list: only the dispatcher, which has to
+    try candidate 2 when candidate 1's call fails, needs the rest.
+
+    Raises NoEligibleModel rather than returning None: a caller that forgets to
+    check a None gets a wrong model silently, which is the failure mode this
+    replaces.
+    """
+    return resolve_tier_candidates(tier, c, channel=channel, org_id=org_id)[0]
 
 
 def _to_resolved(model: dict, serving: Tier, requested: Tier) -> ResolvedModel:

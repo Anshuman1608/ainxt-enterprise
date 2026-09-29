@@ -431,6 +431,12 @@ def _handle_metrics(records: list) -> None:
                 request_id=rec.get("request_id"),
                 cache_read_tokens=rec.get("cache_read_tokens", 0) or 0,
                 cache_write_tokens=rec.get("cache_write_tokens", 0) or 0,
+                # §L.5 — nullable and absent from every event produced before
+                # the Phase 5 switchover, so .get() with no default is exactly
+                # right: an older producer's row simply records no provenance
+                # rather than claiming a wrong one.
+                selection_mode=rec.get("selection_mode"),
+                requested_tier=rec.get("requested_tier"),
             ))
         db.commit()
     except Exception as e:

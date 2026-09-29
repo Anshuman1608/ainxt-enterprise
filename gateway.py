@@ -125,6 +125,22 @@ from core.generation_registry import (
     should_stop as _gen_should_stop,
 )
 
+def _last_selection_audit() -> dict:
+    """§L.5 provenance for an ainxt.metrics row: why did this model run?
+
+    Imported lazily, and swallowing every failure, because it decorates an
+    audit event that is already best-effort — the producers around it log and
+    continue when Kafka is unreachable. A usage row with no provenance is a
+    gap in the tier-rollout measurement; a usage row that never got written
+    because the provenance lookup raised would be a gap in the billing trail.
+    """
+    try:
+        from models.model_router import last_selection_audit
+        return last_selection_audit()
+    except Exception:  # noqa: BLE001
+        return {"selection_mode": None, "requested_tier": None}
+
+
 from metrics import metrics
 
 from models.query_rewriter import rewrite_query
@@ -8871,6 +8887,8 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                     "WEB-CHAT"
                 )
                 _kafka_produce("ainxt.metrics", {
+                    # §L.5 — why this model: tier | explicit | fallback | NULL
+                    **_last_selection_audit(),
                     "event":          "llm_cost",
                     "request_id":     request_id,
                     "user_id":        _user_id,
@@ -9817,6 +9835,8 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
             try:
                 from core.time_utils import now_ist_iso as _now_ist_iso_cli
                 _kafka_produce("ainxt.metrics", {
+                    # §L.5 — why this model: tier | explicit | fallback | NULL
+                    **_last_selection_audit(),
                     "event":         "llm_cost",
                     "request_id":    request_id,
                     "user_id":       _user_id,
@@ -10129,6 +10149,8 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 )
                 from core.time_utils import now_ist_iso as _now_ist_iso_ask
                 _kafka_produce("ainxt.metrics", {
+                    # §L.5 — why this model: tier | explicit | fallback | NULL
+                    **_last_selection_audit(),
                     "event":         "llm_cost",
                     "request_id":    request_id,
                     "user_id":       _user_id,
@@ -10325,6 +10347,8 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 # fall back to WEB-CHAT if somehow that block was skipped.
                 _ask_channel_b = locals().get("_ask_channel", "WEB-CHAT")
                 _kafka_produce("ainxt.metrics", {
+                    # §L.5 — why this model: tier | explicit | fallback | NULL
+                    **_last_selection_audit(),
                     "event":         "llm_cost",
                     "request_id":    request_id,
                     "user_id":       _user_id,
@@ -11346,6 +11370,8 @@ def openai_chat_completions(
                     "platform":      "WEB-IDE",
                 }.get(_cs_ide, "IDE")
                 _kafka_produce("ainxt.metrics", {
+                    # §L.5 — why this model: tier | explicit | fallback | NULL
+                    **_last_selection_audit(),
                     "event":         "llm_cost",
                     "request_id":    request_id,
                     "user_id":       _user_id,

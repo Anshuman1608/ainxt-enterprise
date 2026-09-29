@@ -579,3 +579,37 @@ def test_reordering_changes_which_model_resolves(client, visible, db):
         db.execute(text("DELETE FROM llm_models WHERE id = CAST(:m AS uuid)"), {"m": second})
         db.commit()
         invalidate_cache()
+
+
+# ── Phase 5: the flag the API reports is the flag the router obeys ──────────
+
+
+def test_the_router_routes_to_the_model_this_api_reports(client, visible, monkeypatch):
+    """`governance_active` stopped being cosmetic in Phase 5.
+
+    Phase 4 reported the flag so the admin screen could say "not live yet".
+    Phase 5 made it decide routing. Nothing else asserts that the two are the
+    same flag — the screen could go on claiming the assignments are live while
+    the router ignores them, and every existing test would still pass.
+    """
+    from core.tier_resolver import invalidate_tier_cache
+    from models.model_router import ModelRouter, TIER_GOVERNED
+
+    # api_model_id is the provider's model STRING; visible["text"] is the
+    # llm_models.id UUID. The router dispatches the former.
+    expected = next(c["api_model_id"] for c in _candidates(client, "medium")
+                    if c["model_id"] == visible["text"])
+
+    _put(client, "medium", [{"model_id": visible["text"], "priority": 1}])
+    invalidate_tier_cache()
+
+    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
+    assert client.get(BASE).json()["governance_active"] is True
+
+    decision = ModelRouter().route("a question", model_hint="medium")
+    assert decision.tier == TIER_GOVERNED
+    assert decision.provider_model_override == expected
+
+    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
+    assert client.get(BASE).json()["governance_active"] is False
+    assert ModelRouter().route("a question", model_hint="medium").tier != TIER_GOVERNED

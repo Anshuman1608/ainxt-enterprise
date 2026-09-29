@@ -263,12 +263,31 @@ _BREAKER_DEFAULTS: dict[str, tuple[int, int]] = {
 }
 
 
+def _defaults_for(name: str) -> tuple[int, int]:
+    """Tuning for a breaker name, with a "<provider>:<model>" prefix fallback.
+
+    Phase 5 rekeyed the LLM breakers from per-PROVIDER to per-provider/model
+    (plan.html §M.4): ten failures on one model must no longer fast-fail every
+    other model of the same vendor. Without this fallback that rekey would
+    silently retune every LLM breaker to the generic (10, 30) — losing, for
+    example, the local gateway's deliberately shorter (8, 20) — because
+    "ollama:llama3.2:1b" is not a key in the table and never will be.
+
+    Split on the FIRST colon only: a model id may contain colons of its own
+    ("llama3.2:1b"), and the provider slug may not.
+    """
+    if name in _BREAKER_DEFAULTS:
+        return _BREAKER_DEFAULTS[name]
+    provider = name.split(":", 1)[0]
+    return _BREAKER_DEFAULTS.get(provider, (10, 30))
+
+
 def get_breaker(name: str, failure_threshold: int = None, recovery_timeout: int = None) -> CircuitBreaker:
     """Return a named CircuitBreaker instance (singleton per name).
     Uses per-provider tuned defaults from _BREAKER_DEFAULTS if no override given.
     """
     if name not in _breakers:
-        defaults = _BREAKER_DEFAULTS.get(name, (10, 30))
+        defaults = _defaults_for(name)
         ft = failure_threshold if failure_threshold is not None else defaults[0]
         rt = recovery_timeout  if recovery_timeout  is not None else defaults[1]
         _breakers[name] = CircuitBreaker(
