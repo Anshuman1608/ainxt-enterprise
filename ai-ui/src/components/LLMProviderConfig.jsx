@@ -238,16 +238,77 @@ function ProviderModal({ provider, families, onSave, onClose }) {
 // Model row + inline add form
 // ---------------------------------------------------------------------------
 
-function ModelRow({ model, onToggle, onDelete, onSetDefault }) {
+// ── Tier usage (plan.html §J.1) ─────────────────────────────────────────────
+// Which capability tiers a model or provider currently serves. The point is
+// that an admin sees what depends on a model BEFORE disabling or deleting it:
+// a disabled model stays assigned, occupying a priority slot it can never
+// fill, and nothing else on this screen would say so.
+//
+// Read-only and non-fatal — if the fetch fails these columns render "—",
+// exactly as the screen already degrades when /all-models is unreachable.
+function useTierUsage(isAdmin) {
+  const [usage, setUsage] = useState({ byModel: null, byProvider: null });
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    authFetch(`${API_BASE}/model-governance/tiers`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d) return;
+        const byModel = new Map();
+        const byProvider = new Map();
+        for (const t of d.tiers || []) {
+          for (const m of t.models || []) {
+            // Keyed on llm_models.id, which is what both this screen's
+            // `model.id` and the tier assignment reference — NOT the
+            // provider's model string, which both also call `model_id`.
+            if (!byModel.has(m.model_id)) byModel.set(m.model_id, []);
+            byModel.get(m.model_id).push(t.tier);
+            if (!byProvider.has(m.provider_name)) byProvider.set(m.provider_name, new Set());
+            byProvider.get(m.provider_name).add(t.tier);
+          }
+        }
+        setUsage({ byModel, byProvider });
+      })
+      .catch(() => { /* columns render "—" */ });
+  }, [isAdmin]);
+
+  return usage;
+}
+
+function TierChips({ tiers }) {
+  if (!tiers || tiers.length === 0) return <span className="text-gray-300">—</span>;
+  return (
+    <span className="flex flex-wrap gap-1">
+      {tiers.map((t) => (
+        <span key={t} className="rounded bg-indigo-50 px-1.5 py-0.5 font-mono text-[10px] text-indigo-700">
+          {t}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function ModelRow({ model, onToggle, onDelete, onSetDefault, tiers }) {
   const caps = model.capabilities || {};
+  // The fields the tier resolver actually filters on (core/tier_resolver.py),
+  // so what the resolver can see is visible here rather than buried in JSON.
+  const modality = Array.isArray(caps.modality)
+    ? caps.modality
+    : caps.modality ? [caps.modality] : [];
   return (
     <tr className="hover:bg-gray-50">
       <td className="px-3 py-2 font-mono text-xs text-gray-800">{model.model_id}</td>
       <td className="px-3 py-2 text-sm text-gray-700">{model.display_name}</td>
       <td className="px-3 py-2 text-xs text-gray-500">
         {caps.context_window ? `${(caps.context_window / 1000).toFixed(0)}K ctx` : "—"}
+        {modality.length > 0 && <span className="text-gray-400"> · {modality.join(", ")}</span>}
+        {caps.supports_tools !== false && caps.supports_tools !== undefined && (
+          <span className="text-gray-400"> · tools</span>
+        )}
         {caps.billing_tier === "free" && <span className="ml-1.5 text-green-600">free</span>}
       </td>
+      <td className="px-3 py-2 text-xs"><TierChips tiers={tiers} /></td>
       <td className="px-3 py-2 text-xs text-gray-400">{model.source}</td>
       <td className="px-3 py-2">
         <button onClick={() => onToggle(model)} className="text-gray-400 hover:text-indigo-600">
@@ -606,7 +667,7 @@ function TypeaheadAddModelForm({ providerId, onAdded, toast }) {
 // Provider drill-in (models table)
 // ---------------------------------------------------------------------------
 
-function ProviderModels({ provider, toast, confirm }) {
+function ProviderModels({ provider, toast, confirm, tierUsage }) {
   const [models, setModels] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
@@ -742,6 +803,7 @@ function ProviderModels({ provider, toast, confirm }) {
               <th className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase">Model ID</th>
               <th className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase">Display Name</th>
               <th className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase">Capabilities</th>
+              <th className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase">Tiers</th>
               <th className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase">Source</th>
               <th className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase">Enabled</th>
               <th className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase">Default</th>
@@ -750,10 +812,11 @@ function ProviderModels({ provider, toast, confirm }) {
           </thead>
           <tbody className="divide-y divide-gray-100">
             {models.length === 0 && (
-              <tr><td colSpan={7} className="text-center py-6 text-gray-400 text-xs">No models yet — add one below.</td></tr>
+              <tr><td colSpan={8} className="text-center py-6 text-gray-400 text-xs">No models yet — add one below.</td></tr>
             )}
             {models.map((m) => (
-              <ModelRow key={m.id} model={m} onToggle={handleToggle} onDelete={handleDelete} onSetDefault={handleSetDefault} />
+              <ModelRow key={m.id} model={m} onToggle={handleToggle} onDelete={handleDelete}
+                onSetDefault={handleSetDefault} tiers={tierUsage?.byModel?.get(m.id)} />
             ))}
           </tbody>
         </table>
@@ -792,6 +855,7 @@ export default function LLMProviderConfig({ user }) {
   const [showCreateEdit, setShowCreateEdit] = useState(false);
   const [editingProvider, setEditingProvider] = useState(null);
   const [expandedId, setExpandedId] = useState(null);
+  const tierUsage = useTierUsage(isAdmin);
 
   const loadProviders = useCallback(async () => {
     setLoading(true);
@@ -921,6 +985,7 @@ export default function LLMProviderConfig({ user }) {
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Provider</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Family</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Models</th>
+                <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Used in tiers</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Verified</th>
                 <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Status</th>
                 <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Actions</th>
@@ -928,11 +993,11 @@ export default function LLMProviderConfig({ user }) {
             </thead>
             <tbody className="divide-y divide-gray-100">
               {loading ? (
-                <tr><td colSpan={7} className="text-center py-12 text-gray-400">
+                <tr><td colSpan={8} className="text-center py-12 text-gray-400">
                   <RefreshCw size={20} className="animate-spin mx-auto mb-2" /> Loading providers…
                 </td></tr>
               ) : providers.length === 0 ? (
-                <tr><td colSpan={7} className="text-center py-16">
+                <tr><td colSpan={8} className="text-center py-16">
                   <Server size={36} className="text-gray-200 mx-auto mb-3" />
                   <p className="text-gray-500 font-medium">No providers configured</p>
                   <p className="text-gray-400 text-xs mt-1">Click "Add Provider" to get started.</p>
@@ -952,6 +1017,9 @@ export default function LLMProviderConfig({ user }) {
                     <td className="px-4 py-3"><FamilyBadge family={p.family} /></td>
                     <td className="px-4 py-3 text-gray-600 flex items-center gap-1.5">
                       <Cpu size={13} className="text-gray-400" /> {p.model_count}
+                    </td>
+                    <td className="px-4 py-3 text-xs">
+                      <TierChips tiers={[...(tierUsage.byProvider?.get(p.name) || [])].sort()} />
                     </td>
                     <td className="px-4 py-3"><StatusDot status={p.last_verify_status} /></td>
                     <td className="px-4 py-3">
@@ -994,8 +1062,8 @@ export default function LLMProviderConfig({ user }) {
                   </tr>
                   {expandedId === p.id && (
                     <tr>
-                      <td colSpan={7} className="p-0">
-                        <ProviderModels provider={p} toast={toast} confirm={confirm} />
+                      <td colSpan={8} className="p-0">
+                        <ProviderModels provider={p} toast={toast} confirm={confirm} tierUsage={tierUsage} />
                       </td>
                     </tr>
                   )}

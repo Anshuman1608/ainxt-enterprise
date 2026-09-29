@@ -45,6 +45,51 @@ def db():
         s.close()
 
 
+@pytest.fixture(autouse=True)
+def _preserve_tier_assignments():
+    """Put the real tier assignments back after every test in this module.
+
+    Most tests here have to WRITE to a tier to prove anything, and PUT is
+    whole-list replacement — so a test that assigns its own fixture model to
+    `medium` destroys the assignment migration Part AD1 seeded there. The
+    damage is invisible: every test still passes, the suite still goes green,
+    and the deployment quietly loses a tier that some later run, or some
+    later engineer reading the table, has no way to trace back to here.
+
+    Autouse and unconditional rather than opt-in, because remembering to ask
+    for it is exactly the step that gets missed — it already was, in the
+    Phase 3 tests this fixture was added alongside.
+
+    Uses its own session: it outlives the `db` fixture and must not depend on
+    a session another fixture may have closed.
+    """
+    from db.database import SessionLocal
+
+    snap = SessionLocal()
+    try:
+        rows = snap.execute(text(
+            "SELECT tier, model_id, priority, role, enabled, created_by "
+            "FROM llm_tier_models WHERE org_id = 'default'"
+        )).all()
+    finally:
+        snap.close()
+
+    yield
+
+    restore = SessionLocal()
+    try:
+        restore.execute(text("SET CONSTRAINTS uq_tier_priority DEFERRED"))
+        restore.execute(text("DELETE FROM llm_tier_models WHERE org_id = 'default'"))
+        for r in rows:
+            restore.execute(text(
+                "INSERT INTO llm_tier_models (tier, model_id, priority, role, enabled, "
+                "org_id, created_by) VALUES (:t, :m, :p, :r, :e, 'default', :by)"
+            ), {"t": r[0], "m": str(r[1]), "p": r[2], "r": r[3], "e": r[4], "by": r[5]})
+        restore.commit()
+    finally:
+        restore.close()
+
+
 @pytest.fixture
 def client():
     """Both routers, in gateway.py's order, so the shadowing test is real."""
@@ -306,3 +351,231 @@ def test_resolved_echoes_the_constraints(client):
 
 def _tier(client, name: str) -> dict:
     return next(t for t in client.get(BASE).json()["tiers"] if t["tier"] == name)
+
+
+# ── Phase 4: GET /tiers/{tier}/candidates ───────────────────────────────────
+#
+# The endpoint exists so the admin screen's "+ Add model" dropdown and the PUT
+# guardrail above cannot disagree. The load-bearing test is the last one in
+# this block, which asserts that equivalence directly rather than trusting
+# that both call the same helper today.
+
+
+@pytest.fixture
+def visible(fixture_models):
+    """fixture_models, with the registry cache dropped so they are visible.
+
+    /candidates reads through get_enabled_models(), which is Redis-cached, so
+    rows inserted directly by the fixture are invisible until the cache is
+    invalidated — exactly as they would be for a real admin write, which is
+    why every admin write calls this.
+    """
+    from core.llm_provider_registry import invalidate_cache
+    invalidate_cache()
+    yield fixture_models
+    invalidate_cache()
+
+
+def _candidates(client, tier):
+    r = client.get(f"{BASE}/{tier}/candidates")
+    assert r.status_code == 200, r.text
+    return r.json()["candidates"]
+
+
+def test_candidates_reports_the_tiers_modality_requirement(client):
+    r = client.get(f"{BASE}/image-output/candidates")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tier"] == "image-output"
+    assert body["modality_requirement"] == "image-out"
+
+
+def test_candidates_rejects_an_unknown_tier(client):
+    assert client.get(f"{BASE}/deep/candidates").status_code == 400
+
+
+def test_candidates_offers_a_text_model_for_a_text_tier(client, visible):
+    ids = {c["model_id"] for c in _candidates(client, "medium")}
+    assert visible["text"] in ids
+
+
+def test_candidates_excludes_a_disabled_model(client, visible):
+    """A disabled model must never be offered — assigning it is a 422."""
+    ids = {c["model_id"] for c in _candidates(client, "medium")}
+    assert visible["disabled"] not in ids
+
+
+def test_candidates_excludes_a_model_of_a_disabled_provider(client, visible, db):
+    db.execute(text("UPDATE llm_providers SET enabled = FALSE WHERE id = CAST(:p AS uuid)"),
+               {"p": visible["provider_id"]})
+    db.commit()
+    from core.llm_provider_registry import invalidate_cache
+    invalidate_cache()
+    try:
+        ids = {c["model_id"] for c in _candidates(client, "medium")}
+        assert visible["text"] not in ids
+    finally:
+        db.execute(text("UPDATE llm_providers SET enabled = TRUE WHERE id = CAST(:p AS uuid)"),
+                   {"p": visible["provider_id"]})
+        db.commit()
+        invalidate_cache()
+
+
+def test_candidates_excludes_a_text_model_from_a_modality_tier(client, visible):
+    """The check that matters: a text model must not be offered for video."""
+    ids = {c["model_id"] for c in _candidates(client, "video-generation")}
+    assert visible["text"] not in ids
+
+
+def test_candidates_includes_a_capable_model_for_a_modality_tier(client, visible):
+    ids = {c["model_id"] for c in _candidates(client, "video-generation")}
+    assert visible["video"] in ids
+
+
+def test_candidates_returns_an_empty_list_rather_than_404(client, monkeypatch):
+    """No image model is a normal deployment state, not an error.
+
+    404 would make the screen show a failure where the honest answer is "this
+    deployment cannot do image output" — the state §J.2 renders as Unassigned.
+    """
+    import core.llm_provider_registry as reg
+    monkeypatch.setattr(reg, "get_enabled_models", lambda channel=None: [])
+    r = client.get(f"{BASE}/image-output/candidates")
+    assert r.status_code == 200
+    assert r.json()["candidates"] == []
+
+
+def test_candidates_returns_the_row_uuid_not_the_provider_model_string(client, visible):
+    """The two are both called model_id in llm_models; the PUT takes the UUID."""
+    c = next(c for c in _candidates(client, "medium") if c["model_id"] == visible["text"])
+    assert uuid.UUID(c["model_id"])
+    assert c["api_model_id"] != c["model_id"]
+
+
+def test_candidates_carries_what_the_picker_displays(client, visible):
+    c = next(c for c in _candidates(client, "medium") if c["model_id"] == visible["text"])
+    assert c["provider_name"].startswith("TierTest")
+    assert c["family"] == "openai_compatible"
+    assert c["modality"] == ["text"]
+    assert c["privacy_class"] == "external"
+
+
+@pytest.mark.parametrize("tier", ["medium", "video-generation"])
+def test_every_candidate_is_accepted_and_every_omission_rejected(
+        client, visible, tier):
+    """THE D7 INVARIANT, asserted rather than asserted-in-a-comment.
+
+    The dropdown is only trustworthy if the set it offers is exactly the set
+    the PUT accepts. Both sides are checked here: each candidate assigns
+    cleanly, and each fixture model the endpoint left out is refused with 422.
+    """
+    offered = {c["model_id"] for c in _candidates(client, tier)}
+    ours = {v for k, v in visible.items() if k != "provider_id"}
+
+    for model_id in ours & offered:
+        r = _put(client, tier, [{"model_id": model_id, "priority": 1}])
+        assert r.status_code == 200, f"{model_id} was offered but rejected: {r.text}"
+
+    for model_id in ours - offered:
+        r = _put(client, tier, [{"model_id": model_id, "priority": 1}])
+        assert r.status_code == 422, f"{model_id} was omitted but accepted"
+
+    _put(client, tier, [])
+
+
+# ── Phase 4: governance_active ──────────────────────────────────────────────
+
+
+def test_governance_is_reported_inactive_by_default(client, monkeypatch):
+    """Phases 3 and 4 change no routing, and the screen must say so."""
+    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
+    assert client.get(BASE).json()["governance_active"] is False
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on"])
+def test_governance_active_when_the_flag_is_set(client, monkeypatch, raw):
+    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", raw)
+    assert client.get(BASE).json()["governance_active"] is True
+
+
+@pytest.mark.parametrize("raw", ["", "0", "false", "off", "no", "maybe"])
+def test_anything_not_clearly_true_reads_as_inactive(client, monkeypatch, raw):
+    """Fail safe: an unparseable value must not claim the runtime is live."""
+    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", raw)
+    assert client.get(BASE).json()["governance_active"] is False
+
+
+# ── Phase 4 exit criterion ──────────────────────────────────────────────────
+
+
+def test_an_assignment_changes_what_the_tier_resolves_to(client, visible):
+    """THE PHASE 4 EXIT CRITERION.
+
+    "An admin can populate all 8 tiers with multiple models and see
+    /tiers/resolved change immediately" (plan.html §N). The screen's entire
+    value rests on that round trip: an admin who corrects an assignment and
+    sees no confirmation has no way to tell whether the correction took.
+
+    Uses video-generation because no registry in practice has a video-capable
+    model, so the unresolved → resolved → unresolved transition is
+    unambiguous — but the tier is cleared explicitly rather than assumed
+    empty, so this does not depend on what the seed happened to find.
+    """
+    def _status():
+        r = client.get(f"{BASE}/resolved", params={"tier": "video-generation"})
+        assert r.status_code == 200, r.text
+        return r.json()["resolved"][0]
+
+    assert _put(client, "video-generation", []).status_code == 200
+    assert _status()["status"] == "unresolved"
+
+    assert _put(client, "video-generation",
+                [{"model_id": visible["video"], "priority": 1}]).status_code == 200
+
+    after = _status()
+    assert after["status"] == "resolved"
+    assert after["model_id"].startswith("__tiertest_video_")
+
+    # And clearing it puts the tier back to reporting the feature unavailable,
+    # rather than leaving a stale resolution behind.
+    assert _put(client, "video-generation", []).status_code == 200
+    assert _status()["status"] == "unresolved"
+
+
+def test_reordering_changes_which_model_resolves(client, visible, db):
+    """Priority order is the decision, so reordering must change the answer."""
+    second = str(uuid.uuid4())
+    db.execute(text(
+        "INSERT INTO llm_models (id, provider_id, model_id, display_name, "
+        "capabilities, enabled, is_default, sort_order, source) VALUES "
+        "(:id, :pid, :mid, 'TierTest text2', "
+        "'{\"modality\": [\"text\"], \"privacy_class\": \"external\"}'::jsonb, "
+        "TRUE, FALSE, 9999, 'manual')"
+    ), {"id": second, "pid": visible["provider_id"], "mid": f"__tiertest_text2_{second[:8]}"})
+    db.commit()
+    from core.llm_provider_registry import invalidate_cache
+    invalidate_cache()
+
+    def _resolved():
+        r = client.get(f"{BASE}/resolved", params={"tier": "medium"})
+        return r.json()["resolved"][0]
+
+    try:
+        _put(client, "medium", [
+            {"model_id": visible["text"], "priority": 1},
+            {"model_id": second, "priority": 2},
+        ])
+        first_choice = _resolved()["model_id"]
+
+        _put(client, "medium", [
+            {"model_id": second, "priority": 1},
+            {"model_id": visible["text"], "priority": 2},
+        ])
+        assert _resolved()["model_id"] != first_choice
+    finally:
+        _put(client, "medium", [])
+        db.execute(text("DELETE FROM llm_tier_models WHERE model_id = CAST(:m AS uuid)"),
+                   {"m": second})
+        db.execute(text("DELETE FROM llm_models WHERE id = CAST(:m AS uuid)"), {"m": second})
+        db.commit()
+        invalidate_cache()

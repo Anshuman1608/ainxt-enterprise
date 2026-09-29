@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 import { useState, useEffect } from 'react'
-import { ChevronDown, ChevronRight, Shield, Users } from 'lucide-react'
+import { ChevronDown, ChevronRight, Layers, Shield, Users } from 'lucide-react'
 import { authFetch, API_BASE as API } from '../config'
+import { usePermission } from '../hooks/usePermission'
 import { validateIdentifier } from '../utils/securityValidation'
+import TierGovernance from './TierGovernance.jsx'
 
 const CLAUDE_HAIKU_4_5 = ['claude', 'haiku', '4-5', '20251001'].join('-')
 
@@ -305,7 +307,18 @@ function ModelsSection({ models, onToast, dynamicMeta }) {
 
 // ── Main component ─────────────────────────────────────────────────────────────
 
-export default function ModelGovernance() {
+// Two tabs, not §J.2's three: "Web Search" is a per-row toggle on the Access
+// tab in the shipped UI, not a separate screen.
+//
+// Tiers is admin-only because every tier endpoint is require_role("admin"),
+// while this screen itself is visible from ad_level 1 (Sidebar.jsx) — so a
+// Director can legitimately be here and must not be shown a tab that 403s on
+// every request.
+
+export default function ModelGovernance({ user }) {
+  const { isAdmin } = usePermission(user)
+
+  const [tab, setTab]                 = useState(isAdmin ? 'tiers' : 'access')
   const [models, setModels]           = useState([])
   const [toast, setToast]             = useState('')
   const [dynamicMeta, setDynamicMeta] = useState({})
@@ -349,15 +362,46 @@ export default function ModelGovernance() {
         <div className="flex items-center gap-3">
             <Shield className="h-5 w-5 text-indigo-500" />
             <div>
-            <h1 className="text-sm font-semibold  text-indigo-700">Model Access</h1>
-            <p className="text-xs text-gray-500">Control which AI models each user can access, and whether they can use Web Search.</p>
+            <h1 className="text-sm font-semibold  text-indigo-700">Model Governance</h1>
+            <p className="text-xs text-gray-500">Which model the platform picks for itself, and which models each user can reach.</p>
             </div>
           </div>
         </div>
+
+        {/* Sub-tabs */}
+        <div className="flex border-b border-gray-200 px-4">
+          {isAdmin && (
+            <button onClick={() => setTab('tiers')}
+              className={`px-4 py-2.5 cursor-pointer flex items-center gap-1.5 text-sm font-medium border-b-2 transition-colors ${
+                tab === 'tiers' ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700'
+              }`}>
+              <Layers size={14} /> Tiers
+            </button>
+          )}
+          <button onClick={() => setTab('access')}
+            className={`px-4 py-2.5 cursor-pointer flex items-center gap-1.5 text-sm font-medium border-b-2 transition-colors ${
+              tab === 'access' ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700'
+            }`}>
+            <Users size={14} /> Access (per user)
+          </button>
+        </div>
       </div>
-      <div className="mx-auto max-w-3xl px-6 py-8">
-        <ModelsSection models={models} onToast={setToast} dynamicMeta={dynamicMeta} />
-      </div>
+
+      {tab === 'tiers' && isAdmin && (
+        <div className="px-6 py-6">
+          <TierGovernance />
+        </div>
+      )}
+
+      {tab === 'access' && (
+        <div className="mx-auto max-w-3xl px-6 py-8">
+          <p className="mb-4 text-xs text-gray-500">
+            Control which AI models each user can access, and whether they can use Web Search.
+            This does not affect which model the platform picks on its own — that is the Tiers tab.
+          </p>
+          <ModelsSection models={models} onToast={setToast} dynamicMeta={dynamicMeta} />
+        </div>
+      )}
     </div>
   )
 }

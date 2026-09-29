@@ -422,7 +422,7 @@ const MODULES = [
     id: "model-governance",
     icon: Shield,
     label: "Model Governance",
-    what: "Control which models each user, department or product is allowed to reach.",
+    what: "Assign models to the eight capability tiers the platform routes on, and control which models each user is allowed to reach.",
     why: "Not every workload should be able to call every provider. Governance makes that a policy rather than a convention.",
     who: "Administrators and compliance owners.",
     when: "During setup, and whenever a provider or data-residency rule changes.",

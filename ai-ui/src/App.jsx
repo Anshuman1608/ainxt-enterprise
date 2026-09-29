@@ -590,7 +590,10 @@ export default function App() {
           } />
           <Route path="/model-governance" element={
             <ErrorBoundary key={`model-governance-${refreshKey}`}>
-              <ModelGovernance />
+              {/* `user` gates the admin-only Tiers tab: this route is reachable
+                  from ad_level 1 (see Sidebar.jsx) but every tier endpoint is
+                  require_role("admin"). */}
+              <ModelGovernance user={user} />
             </ErrorBoundary>
           } />
           <Route path="/endpoint-manager" element={

@@ -116,6 +116,22 @@ jobs:
             cd ai-ui && npm install --no-audit --no-fund --silent && npm run lint
           fi
 
+      - name: Frontend tests
+        # NOT continue-on-error, unlike the lint step above. `npm test` existed
+        # in package.json from the start but no workflow ever called it, so the
+        # two suites in src/utils had never gated anything. Added 2026-09-25
+        # with Phase 4's src/utils/tierGovernance.test.js, which holds the
+        # rules the Tiers admin screen enforces — including the assertion that
+        # the screen issues no DELETE or POST, i.e. exposes no way to create or
+        # delete a tier. Those are only worth writing if they run.
+        #
+        # Safe to gate on: the pre-existing suites (sanitizeSvg, piiCrypto)
+        # were verified green before this step was added.
+        run: |
+          if [ -f ai-ui/package.json ]; then
+            cd ai-ui && npm install --no-audit --no-fund --silent && npm test
+          fi
+
   # ── TIER 2 ────────────────────────────────────────────────────────────────
   tests:
     name: Tier 2 · tests

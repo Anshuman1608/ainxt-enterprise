@@ -6,9 +6,10 @@
 # considers eligible for each of the eight tiers in core/tiers.py, in priority
 # order. Three endpoints, per plan.html §L.4:
 #
-#   GET /model-governance/tiers                  — always exactly 8 rows
-#   PUT /model-governance/tiers/{tier}/models    — replace one tier's list
-#   GET /model-governance/tiers/resolved         — diagnostic: what resolves NOW
+#   GET /model-governance/tiers                    — always exactly 8 rows
+#   PUT /model-governance/tiers/{tier}/models      — replace one tier's list
+#   GET /model-governance/tiers/resolved           — diagnostic: what resolves NOW
+#   GET /model-governance/tiers/{tier}/candidates  — what MAY be assigned (Phase 4)
 #
 # There is deliberately NO create, delete or rename. The vocabulary is fixed in
 # code (core/tiers.py), in the database (ck_llm_tier_models_tier) and here; the
@@ -27,6 +28,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -109,6 +111,27 @@ def _parse_tier(value: str) -> Tier:
         )
 
 
+def _governance_active() -> bool:
+    """Is the runtime actually resolving models through these assignments yet?
+
+    False for the whole of Phases 3 and 4: models/model_router.py is untouched
+    and still reads the env constants, so an assignment saved here changes what
+    GET /tiers/resolved reports but changes nothing about live routing. Phase 5
+    introduces TIER_GOVERNANCE_ENABLED and flips this on.
+
+    The admin screen has no other way to tell the difference — both states look
+    identical from the client — and an admin who reassigns a tier believing it
+    took effect is worse off than one with no screen at all. So the server says
+    which it is, and the banner disappears on its own when Phase 5 lands rather
+    than depending on someone remembering to delete it.
+
+    Vocabulary matches core/config.py::_env_bool; inlined rather than imported
+    so this router keeps its narrow import surface.
+    """
+    raw = (os.getenv("TIER_GOVERNANCE_ENABLED") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _assignments_by_tier(db) -> dict[str, list[dict]]:
     """Every assignment joined to its model and provider, priority-ordered.
 
@@ -161,6 +184,7 @@ def list_tiers(_admin: dict = Depends(_require_admin), db=Depends(_get_db)):
     """
     assigned = _assignments_by_tier(db)
     return {
+        "governance_active": _governance_active(),
         "tiers": [
             {
                 "tier": t.value,
@@ -174,6 +198,67 @@ def list_tiers(_admin: dict = Depends(_require_admin), db=Depends(_get_db)):
             for t in ALL_TIERS
         ]
     }
+
+
+# ── GET /tiers/{tier}/candidates ────────────────────────────────────────────
+
+
+@router.get("/tiers/{tier}/candidates")
+def tier_candidates(tier: str, _admin: dict = Depends(_require_admin)):
+    """Which models MAY be assigned to this tier. Feeds the "+ Add model" picker.
+
+    This endpoint exists so that the dropdown and the PUT below cannot
+    disagree. Both answer the same question — "can this model serve this
+    tier?" — and both answer it by calling MODALITY_REQUIREMENT and
+    modality_of() on the same capabilities dict. Computing it in the browser
+    instead would mean reimplementing modality_of() in JavaScript, including
+    its bare-"video" scalar case, in a second place that nothing keeps in step.
+    An admin picking a model the API then rejects with 422 is the exact failure
+    that would produce.
+
+    Reads through get_enabled_models() rather than querying llm_models, so a
+    disabled model, a model behind a disabled provider, and a model restricted
+    to another channel all drop out for free — and the Redis cache is reused.
+    Ordering is the registry's own (sort_order, then created_at), the same
+    convention get_model() documents.
+
+    An empty list is a valid, meaningful answer: a deployment with no
+    image-capable model genuinely cannot populate image-output, and saying so
+    is the point. It is not a 404 — the tier exists, it simply has nothing to
+    offer.
+
+    Three path segments, so no collision with model_governance_router's
+    GET /{dept} or GET /{dept}/users; the include-order note at the top of this
+    file still covers it.
+    """
+    t = _parse_tier(tier)
+    need = MODALITY_REQUIREMENT[t]
+
+    from core.llm_provider_registry import get_enabled_models
+    from core.tier_resolver import modality_of
+
+    out: list[dict[str, Any]] = []
+    for m in get_enabled_models():
+        caps = m.get("capabilities") or {}
+        have = modality_of(caps)
+        if need not in have:
+            continue
+        out.append({
+            # `model_id` is llm_models.id, the UUID the PUT takes — NOT the
+            # provider's model string, which is `api_model_id`. The column
+            # names collide; the client must send the former.
+            "model_id": str(m["id"]),
+            "api_model_id": m["model_id"],
+            "display_name": m["display_name"],
+            "provider_name": m["provider_name"],
+            "family": m["family"],
+            "modality": have,
+            "context_window": caps.get("context_window"),
+            "privacy_class": caps.get("privacy_class"),
+            "is_default": bool(m.get("is_default")),
+        })
+
+    return {"tier": t.value, "modality_requirement": need, "candidates": out}
 
 
 # ── PUT /tiers/{tier}/models ────────────────────────────────────────────────
