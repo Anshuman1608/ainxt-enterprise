@@ -173,6 +173,53 @@ def modality_for_model_id(model_id: str) -> list[str]:
     return out
 
 
+# ── Modality provenance ──────────────────────────────────────────────────────
+# Who decided a model's modality: we guessed from its id, or a human said so.
+#
+# The distinction cannot be recovered after the fact. A genuinely text-only
+# model and a model the heuristic above gave up on both store exactly
+# ["text"], so without a marker written at inference time there is no way to
+# ask "which of these is a guess?" — and a wrong guess removes a model from
+# the image/video tiers permanently, with no error anywhere. Recorded so
+# doctor.sh can report it and the Providers screen can show it.
+#
+# "absent" and "inferred" mean the same thing to every reader: nobody has
+# confirmed this. Only "declared" is a positive claim, which is why the
+# checks test for `!= declared` rather than `== inferred` and no backfill
+# migration is needed for rows seeded before this existed.
+MODALITY_SOURCE_INFERRED: Final = "inferred"
+MODALITY_SOURCE_DECLARED: Final = "declared"
+MODALITY_SOURCES: Final[frozenset[str]] = frozenset(
+    {MODALITY_SOURCE_INFERRED, MODALITY_SOURCE_DECLARED}
+)
+
+
+def seed_modality(caps: dict, model_id: str, *, declared: bool = False) -> dict:
+    """Backfill `capabilities.modality` and record who decided it.
+
+    Mutates and returns `caps`, so it drops into the `setdefault` position it
+    replaces. The single home for both the guess and its provenance, for the
+    same reason modality_for_model_id() has one: the previous arrangement had
+    the heuristic in two byte-identical copies and the third caller that
+    needed it silently did without.
+
+    `declared=True` — an administrator supplied the modality through the admin
+    API. Marks it as such and does NOT touch `modality` itself.
+
+    Otherwise a missing modality is filled from the id heuristic and marked
+    inferred. An existing value is left alone, including its existing marker:
+    model discovery re-runs over rows it has already seen, and it must not
+    downgrade a human's `declared` back to `inferred` on every sync.
+    """
+    if declared:
+        caps["modality_source"] = MODALITY_SOURCE_DECLARED
+        return caps
+    if not caps.get("modality"):
+        caps["modality"] = modality_for_model_id(model_id)
+        caps.setdefault("modality_source", MODALITY_SOURCE_INFERRED)
+    return caps
+
+
 # ── Presentation metadata ────────────────────────────────────────────────────
 # Lives here, beside the vocabulary it describes, so the admin screen cannot
 # invent a ninth tier by inventing a ninth label. Served by

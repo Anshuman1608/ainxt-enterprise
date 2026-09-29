@@ -97,12 +97,34 @@ def main() -> int:
                 from routers.llm_provider_admin_router import _discover_models
                 discovered = _discover_models(provider)
                 added = 0
+                # No provider's list-models API reports modality or privacy
+                # class, so a discovered row arrives capability-blind and the
+                # tier resolver reads an absent modality as text-only (§L.3a)
+                # — permanently invisible to the image/video tiers, with no
+                # error anywhere. That was the 59-model bug on a live
+                # deployment, and THIS path had it too: it calls
+                # _discover_models() directly rather than the admin router's
+                # _upsert_discovered_models(), so it never picked up the
+                # seeding that path applies. Same fix, applied here rather
+                # than by sharing the loop — this path owns source="seed",
+                # and re-tagging install-time rows as "discovered" would
+                # change what the admin screen's "delete discovered models"
+                # sweeps up.
+                from core.tiers import seed_modality
+                try:
+                    from core.llm_provider_registry import derive_privacy_class
+                    _privacy = derive_privacy_class(provider.family, provider.base_url)
+                except Exception:
+                    _privacy = "external"   # fails safe — see llm_provider_registry
                 for d in discovered:
                     if d["model_id"] in existing_model_ids:
                         continue
+                    _caps = dict(d["capabilities"] or {})
+                    _caps.setdefault("privacy_class", _privacy)
+                    seed_modality(_caps, d["model_id"])
                     db.add(LLMModel(
                         provider_id=provider.id, model_id=d["model_id"], display_name=d["display_name"],
-                        capabilities=d["capabilities"], enabled=True, source="seed", created_by="install.sh",
+                        capabilities=_caps, enabled=True, source="seed", created_by="install.sh",
                     ))
                     existing_model_ids.add(d["model_id"])
                     added += 1
@@ -132,9 +154,17 @@ def main() -> int:
                 print(f"  = seed model '{args.seed_model}' not found among {args.slug}'s actual "
                       f"models — skipping (pull it, or check the exact tag with `ollama list`)")
             else:
+                # capabilities={} used to mean text-only-forever to the tier
+                # resolver. Found on a live install: llama3.2:1b, the model
+                # assigned to the highest-volume tier, carried nothing but
+                # {"billing_tier": "free"}. Harmless for that model — the
+                # guess is text-only too — but the next --seed-model could as
+                # easily be an image model.
+                from core.tiers import seed_modality
                 db.add(LLMModel(
                     provider_id=provider.id, model_id=args.seed_model, display_name=args.seed_model,
-                    capabilities={}, enabled=True, source="seed", created_by="install.sh",
+                    capabilities=seed_modality({}, args.seed_model),
+                    enabled=True, source="seed", created_by="install.sh",
                 ))
                 print(f"  + registered model '{args.seed_model}' under '{args.slug}'")
 

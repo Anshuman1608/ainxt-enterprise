@@ -479,6 +479,36 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
       pass "llm models have modality" "all have modality"
     fi
 
+    # Having a modality is not the same as having the RIGHT one. Almost every
+    # row's modality was guessed from its model id by
+    # core.tiers.modality_for_model_id — no provider's list-models API reports
+    # it — and the guess only ADDS a modality on a positive signal in the name.
+    # So an image model whose id contains no signal word comes out text-only
+    # and vanishes from the image tiers with no error anywhere. Absent and
+    # 'inferred' both mean "nobody has confirmed this"; only 'declared' is a
+    # positive claim, which is why this tests for the absence of one.
+    unconfirmed="$(run_sql "SELECT count(*) FROM ainxt.llm_models WHERE enabled = TRUE AND capabilities->>'modality_source' IS DISTINCT FROM 'declared'" | tr -d ' \r')"
+    if [[ -n "$unconfirmed" && "$unconfirmed" -gt 0 ]]; then
+      warno "llm modality confirmed" "$unconfirmed of $llm_models_n model(s) have an unconfirmed modality" \
+            "it was inferred from the model id; a wrong guess silently removes the model from the image/video tiers — confirm it in Admin → LLM Providers"
+    else
+      pass "llm modality confirmed" "every modality is administrator-declared"
+    fi
+
+    # Video models bill per output SECOND, not per token, and the rate is a
+    # fact about the model rather than about the platform. Where a row does not
+    # declare one, chat_router falls back to the flat VEO_COST_PER_SECOND — so
+    # a cheaper "fast" variant costs exactly as much as the full one, which is
+    # invisible on the bill until someone compares it to the vendor's price
+    # list. Not a failure: a deployment may genuinely have one rate.
+    vid_norate="$(run_sql "SELECT count(*) FROM ainxt.llm_models WHERE enabled = TRUE AND capabilities->'modality' ? 'video-out' AND capabilities->>'cost_per_second' IS NULL" | tr -d ' \r')"
+    if [[ -n "$vid_norate" && "$vid_norate" -gt 0 ]]; then
+      warno "llm video rates set" "$vid_norate video model(s) declare no cost_per_second" \
+            "they all bill at VEO_COST_PER_SECOND, so variants at different prices cost the same — set a per-second rate in Admin → LLM Providers"
+    else
+      pass "llm video rates set" "every video model declares its per-second rate"
+    fi
+
     # Pre-flight for the api-channel fix (R18): once API-key requests are
     # correctly tagged 'api', any model whose channels list omits 'api' stops
     # being reachable by SDK clients that could previously use it.

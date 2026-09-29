@@ -8022,7 +8022,7 @@ def _part_ac1_llm_provider_seed_2026_09_01():
 
     # Shared with Part AC4 and with the admin discovery path — see
     # core.tiers.modality_for_model_id for why it has one home now.
-    from core.tiers import modality_for_model_id as _modality_for
+    from core.tiers import seed_modality as _seed_modality
 
     def _capabilities_for(model_id: str) -> dict:
         low = model_id.lower()
@@ -8076,7 +8076,9 @@ def _part_ac1_llm_provider_seed_2026_09_01():
         if "deep-research" in low:
             cap["requires_tools"] = True
 
-        cap["modality"] = _modality_for(model_id)
+        # Fresh dict, so this always seeds — and always marks the modality as
+        # inferred, because that is exactly what it is (Phase 6.5 item 4).
+        _seed_modality(cap, model_id)
         return cap
 
     # This whole part is best-effort convenience (pre-populating the admin
@@ -8312,8 +8314,10 @@ def _part_ac4_capability_backfill_2026_09_25():
     # One heuristic, three callers — see core.tiers.modality_for_model_id.
     # It used to live here (twice) and nowhere else, which is why the admin
     # Sync-models path imported rows with no modality at all and the three
-    # modality tiers silently had nothing to offer.
-    from core.tiers import modality_for_model_id as _modality_for
+    # modality tiers silently had nothing to offer. seed_modality() wraps it
+    # with the provenance marker (Phase 6.5 item 4), so a row backfilled here
+    # is visibly a GUESS rather than a confirmed fact.
+    from core.tiers import seed_modality as _seed_modality
 
     db = SessionLocal()
     try:
@@ -8331,8 +8335,7 @@ def _part_ac4_capability_backfill_2026_09_25():
                 caps["privacy_class"] = derive_privacy_class(
                     provider.family, provider.base_url
                 )
-            if "modality" not in caps:
-                caps["modality"] = _modality_for(model.model_id)
+            _seed_modality(caps, model.model_id)
 
             if caps != before:
                 # Reassign rather than mutate in place: SQLAlchemy does not

@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from auth.dependencies import require_admin
 from core.llm_provider_registry import ensure_default_model, invalidate_cache
 from core.logger import logger
-from core.tiers import modality_for_model_id
+from core.tiers import MODALITY_SOURCES, seed_modality
 from db.database import SessionLocal
 from db.models import LLMProvider, LLMModel
 
@@ -291,8 +291,7 @@ def _run_ollama_pull(provider_id: str, base_url: str, model_id: str, job_id: str
             if not db.query(LLMModel).filter_by(provider_id=provider_id, model_id=model_id).first():
                 db.add(LLMModel(
                     provider_id=provider_id, model_id=model_id, display_name=model_id,
-                    capabilities={"billing_tier": "free",
-                                  "modality": modality_for_model_id(model_id)},
+                    capabilities=seed_modality({"billing_tier": "free"}, model_id),
                     enabled=True, source="manual", created_by=created_by,
                 ))
                 ensure_default_model(db)
@@ -423,6 +422,17 @@ def _validate_capabilities(caps: Optional[dict]) -> Optional[dict]:
     if billing is not None and billing not in _CAP_BILLING_TIERS:
         raise ValueError(
             f"capabilities.billing_tier must be one of {sorted(_CAP_BILLING_TIERS)}"
+        )
+
+    # Who decided `modality` — a guess from the model id, or a human. Validated
+    # for the same reason every other governed key is: the failure it prevents
+    # is silent. A typo here would make a confirmed model read as unconfirmed
+    # forever, and doctor.sh would keep asking an administrator to do something
+    # they have already done.
+    modality_source = caps.get("modality_source")
+    if modality_source is not None and modality_source not in MODALITY_SOURCES:
+        raise ValueError(
+            f"capabilities.modality_source must be one of {sorted(MODALITY_SOURCES)}"
         )
 
     channels = caps.get("channels")
@@ -809,7 +819,11 @@ def _upsert_discovered_models(provider: LLMProvider, discovered: List[dict], db:
             merged = {**(m.capabilities or {}), **{k: v for k, v in d["capabilities"].items() if v is not None}}
             # Backfill only. An admin-set value already in `merged` is kept.
             merged.setdefault("privacy_class", _derived_privacy)
-            merged.setdefault("modality", modality_for_model_id(mid))
+            # Backfills a blind row and leaves a populated one — including its
+            # existing `modality_source` — alone. Sync runs repeatedly over the
+            # same rows, so downgrading a human's `declared` back to `inferred`
+            # here would erase every confirmation an administrator had made.
+            seed_modality(merged, mid)
             if merged != (m.capabilities or {}):
                 m.capabilities = merged
                 updated.append(mid)
@@ -824,7 +838,7 @@ def _upsert_discovered_models(provider: LLMProvider, discovered: List[dict], db:
             # every Claude invisible to image-input and both Veo models
             # invisible to video-generation. setdefault, so an admin value
             # and anything discovery DID report both survive.
-            _caps.setdefault("modality", modality_for_model_id(mid))
+            seed_modality(_caps, mid)
             db.add(LLMModel(
                 provider_id=provider.id, model_id=mid, display_name=d["display_name"],
                 capabilities=_caps, enabled=True, source="discovered",
@@ -981,8 +995,11 @@ def create_model(
         capabilities["billing_tier"] = "free"   # self-hosted — never billable
     # Same reason as the discovery path: a model added by hand with no
     # modality would be text-only to the tier resolver and so unofferable
-    # for the three modality tiers. An explicit body.capabilities wins.
-    capabilities.setdefault("modality", modality_for_model_id(body.model_id))
+    # for the three modality tiers. An explicit body.capabilities wins — and
+    # when it supplies one, that is a human DECLARING the modality, which is
+    # the distinction doctor.sh and the Providers screen report on.
+    seed_modality(capabilities, body.model_id,
+                  declared=bool((body.capabilities or {}).get("modality")))
 
     model = LLMModel(
         provider_id=provider_id,
@@ -1017,7 +1034,14 @@ def update_model(
     if body.display_name is not None:
         model.display_name = body.display_name.strip() or model.display_name
     if body.capabilities is not None:
-        model.capabilities = body.capabilities
+        # Replace, not merge — PUT semantics, and the Providers screen sends
+        # the full object back for exactly that reason. An administrator who
+        # supplies a modality here is DECLARING it, which stops doctor.sh
+        # reporting the row as an unconfirmed guess (Phase 6.5 item 4).
+        model.capabilities = seed_modality(
+            dict(body.capabilities), model.model_id,
+            declared=bool(body.capabilities.get("modality")),
+        )
     if body.enabled is not None:
         model.enabled = body.enabled
     if body.is_default is not None:

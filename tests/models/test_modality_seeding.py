@@ -32,9 +32,12 @@ import pytest
 from core.tiers import (
     MODALITY_IMAGE_IN,
     MODALITY_IMAGE_OUT,
+    MODALITY_SOURCE_DECLARED,
+    MODALITY_SOURCE_INFERRED,
     MODALITY_TEXT,
     MODALITY_VIDEO_OUT,
     modality_for_model_id,
+    seed_modality,
 )
 from core.tier_resolver import modality_of
 
@@ -104,16 +107,60 @@ def test_the_heuristic_is_not_duplicated_in_migrate():
     assert src.count("modality_for_model_id") >= 2
 
 
-def test_every_llm_models_creation_path_seeds_modality():
+# Every non-test module that constructs an LLMModel row. Derived rather than
+# hand-listed, because a hand-list is how this test came to check only the
+# admin router while db/bootstrap_llm_providers.py quietly inserted
+# capability-blind rows at install time — found on a live deployment, where
+# llama3.2:1b (the model assigned to the highest-volume tier) carried nothing
+# but {"billing_tier": "free"}.
+def _llm_model_creation_files() -> list[pathlib.Path]:
+    found = []
+    for path in sorted(ROOT.rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel.startswith(("tests/", "venv/", ".venv/", "AgentStudio/")):
+            continue
+        try:
+            src = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "LLMModel(" not in src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        if any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "LLMModel"
+               for n in ast.walk(tree)):
+            found.append(path)
+    return found
+
+
+def test_the_set_of_creation_paths_is_the_one_we_think_it_is():
+    """A new file that inserts models is a new place the modality can go
+    missing. Listed explicitly so adding one is a deliberate act — the
+    assertion below then covers it automatically."""
+    rels = {p.relative_to(ROOT).as_posix() for p in _llm_model_creation_files()}
+    assert rels == {
+        "db/bootstrap_llm_providers.py",          # install.sh, at install time
+        "db/migrate.py",                          # Part AC1 seeding
+        "routers/llm_provider_admin_router.py",   # discovery, manual add, ollama pull
+    }, f"the set of LLMModel(...) creation paths changed: {sorted(rels)}"
+
+
+@pytest.mark.parametrize("rel", [
+    "routers/llm_provider_admin_router.py",
+    "db/bootstrap_llm_providers.py",
+    "db/migrate.py",
+])
+def test_every_llm_models_creation_path_seeds_modality(rel):
     """The real assertion. Any code that constructs an LLMModel row must give
     it a modality, or that model is text-only to the resolver forever.
 
-    Walks the admin router's AST for `LLMModel(...)` constructions and checks
-    the capabilities each one passes. A new creation path added without a
-    modality fails here rather than six weeks later as "the dropdown is
-    empty".
+    Walks each file's AST for `LLMModel(...)` constructions and checks the
+    capabilities each one passes. A new creation path added without a modality
+    fails here rather than six weeks later as "the dropdown is empty".
     """
-    path = ROOT / "routers" / "llm_provider_admin_router.py"
+    path = ROOT / rel
     tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
     src_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
 
@@ -130,7 +177,14 @@ def test_every_llm_models_creation_path_seeds_modality():
             f"{path.name}:{node.lineno}: LLMModel(...) passes no capabilities at all")
         # Either an inline dict containing "modality", or a name bound to a
         # dict that had modality setdefault-ed onto it a few lines above.
-        if isinstance(caps, ast.Dict):
+        # Either seed_modality(...) wrapping the dict inline, an inline dict
+        # that names "modality" itself, or a name that seed_modality() was
+        # called on a few lines above.
+        if isinstance(caps, ast.Call):
+            assert getattr(caps.func, "id", "") == "seed_modality", (
+                f"{path.name}:{node.lineno}: LLMModel(...) builds capabilities "
+                f"from a call that is not seed_modality()")
+        elif isinstance(caps, ast.Dict):
             keys = {k.value for k in caps.keys if isinstance(k, ast.Constant)}
             assert "modality" in keys, (
                 f"{path.name}:{node.lineno}: LLMModel(...) builds capabilities "
@@ -139,10 +193,15 @@ def test_every_llm_models_creation_path_seeds_modality():
         else:
             assert isinstance(caps, ast.Name), (
                 f"{path.name}:{node.lineno}: unrecognised capabilities shape")
-            window = "\n".join(src_lines[max(0, node.lineno - 20):node.lineno])
-            assert f'{caps.id}.setdefault("modality"' in window, (
+            window = "\n".join(src_lines[max(0, node.lineno - 40):node.lineno])
+            seeded_here = f"seed_modality({caps.id}" in window
+            # db/migrate.py builds its caps in _capabilities_for(), which
+            # seeds on the way out. Accept the assignment from it, since
+            # test_the_backfill_records_provenance_too pins that function.
+            seeded_upstream = f"{caps.id} = _capabilities_for(" in window
+            assert seeded_here or seeded_upstream, (
                 f"{path.name}:{node.lineno}: capabilities `{caps.id}` reaches "
-                f"LLMModel(...) without modality being seeded onto it")
+                f"LLMModel(...) without seed_modality() being called on it")
 
 
 def test_the_sync_merge_path_repairs_existing_blind_rows():
@@ -152,4 +211,77 @@ def test_the_sync_merge_path_repairs_existing_blind_rows():
     know to do."""
     src = (ROOT / "routers" / "llm_provider_admin_router.py").read_text(
         encoding="utf-8", errors="ignore")
-    assert 'merged.setdefault("modality", modality_for_model_id(mid))' in src
+    assert "seed_modality(merged, mid)" in src
+
+
+# ── Provenance: the guess says that it is a guess (Phase 6.5 item 4) ──────
+
+
+def test_an_inferred_modality_is_marked_as_one():
+    """The whole of item 4. A genuinely text-only model and a model the
+    heuristic gave up on both store exactly ["text"], so without a marker
+    written at seed time there is no way to ask which is which — and a wrong
+    guess removes a model from the image/video tiers with no error anywhere."""
+    caps = seed_modality({}, "veo-3.1-generate-preview")
+    assert caps["modality"] == [MODALITY_TEXT, MODALITY_VIDEO_OUT]
+    assert caps["modality_source"] == MODALITY_SOURCE_INFERRED
+
+
+def test_an_administrator_declaration_is_marked_as_one():
+    caps = seed_modality({"modality": ["video-out"]}, "mystery-v9", declared=True)
+    assert caps["modality_source"] == MODALITY_SOURCE_DECLARED
+    # Declaring does not re-guess: the admin's list is the answer.
+    assert caps["modality"] == ["video-out"]
+
+
+def test_declaring_never_overwrites_the_administrators_modality():
+    """An admin may legitimately declare something the heuristic would never
+    produce — a vision model whose id says nothing, an image model that also
+    reads images. Re-running the guess here would erase exactly the case the
+    editor exists to fix."""
+    caps = seed_modality({"modality": ["text", "image-in"]}, "veo-3.1-generate-preview",
+                         declared=True)
+    assert caps["modality"] == ["text", "image-in"]
+    assert MODALITY_VIDEO_OUT not in caps["modality"]
+
+
+def test_a_resync_does_not_downgrade_a_declaration():
+    """Model discovery re-runs over rows it has already seen, on every press
+    of "Sync models". If the merge path reset the marker, every confirmation
+    an administrator had made would be erased the next time anyone synced —
+    and doctor.sh would go back to asking them to do work they had done."""
+    row = {"modality": ["video-out"], "modality_source": MODALITY_SOURCE_DECLARED}
+    assert seed_modality(row, "veo-3.1-generate-preview") == {
+        "modality": ["video-out"], "modality_source": MODALITY_SOURCE_DECLARED,
+    }
+
+
+def test_an_existing_modality_is_left_alone_marker_or_not():
+    """Rows seeded before provenance existed carry a modality and no marker.
+    Backfilling one would be a lie: nobody confirmed it. Absent and "inferred"
+    read the same to every consumer, which is why the checks test for the
+    absence of "declared" rather than the presence of "inferred"."""
+    row = {"modality": ["text"]}
+    assert seed_modality(row, "gemini-3.1-flash-image") == {"modality": ["text"]}
+
+
+def test_the_marker_is_admin_api_legal():
+    """The admin API validates the governed capability keys. A marker outside
+    its vocabulary would make a seeded row unsaveable by hand — the same class
+    of bug as an illegal modality value."""
+    from routers.llm_provider_admin_router import _validate_capabilities
+    for source in (MODALITY_SOURCE_INFERRED, MODALITY_SOURCE_DECLARED):
+        _validate_capabilities({"modality": ["text"], "modality_source": source})
+    with pytest.raises(ValueError):
+        _validate_capabilities({"modality_source": "guessed"})
+
+
+def test_the_backfill_records_provenance_too():
+    """db/migrate.py's AC4 backfill is an inference like any other. It used to
+    write a bare `caps["modality"] = ...`, which would have produced rows
+    indistinguishable from confirmed ones."""
+    src = (ROOT / "db" / "migrate.py").read_text(encoding="utf-8", errors="ignore")
+    assert 'caps["modality"] = ' not in src, (
+        "db/migrate.py writes modality directly again — go through "
+        "core.tiers.seed_modality so the guess is recorded as a guess")
+    assert src.count("_seed_modality(") >= 2
