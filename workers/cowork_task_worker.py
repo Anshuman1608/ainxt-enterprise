@@ -1040,7 +1040,9 @@ def _reask_email_envelope(raw_output: str, prompt: str, task_id: str = "") -> di
             f"[ORIGINAL TASK]\n{prompt}\n\n"
             f"[ASSISTANT RESPONSE TO CONVERT]\n{raw_output}"
         )
-        reply = model_router.generate(repair_prompt, model_hint="complex")
+        from core.tiers import Tier
+        reply = model_router.generate(
+            repair_prompt, tier=Tier.COMPLEX, legacy_hint="complex")
         parsed = _parse_email_envelope(str(reply or ""))
         if parsed is not None:
             logger.info(
@@ -1153,7 +1155,9 @@ def _reask_teams_envelope(raw_output: str, prompt: str, task_id: str = "") -> di
             f"[ORIGINAL TASK]\n{prompt}\n\n"
             f"[ASSISTANT RESPONSE TO CONVERT]\n{raw_output}"
         )
-        reply = model_router.generate(repair_prompt, model_hint="complex")
+        from core.tiers import Tier
+        reply = model_router.generate(
+            repair_prompt, tier=Tier.COMPLEX, legacy_hint="complex")
         parsed = _parse_teams_envelope(str(reply or ""))
         if parsed is not None:
             logger.info(

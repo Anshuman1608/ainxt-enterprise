@@ -1248,7 +1248,11 @@ class AgentRunner:
                 f"```\n\n"
                 f"Now generate for: '{human_name}'"
             )
-            raw = model_router.generate(prompt, model_hint="gpt")
+            # Phase 6 §N.1 step 4 / §F "Agent builder / runner": "gpt" is a
+            # vendor alias that _HINT_MAP resolves to TIER_MEDIUM. A per-agent
+            # explicit model stays user-controlled and is not governed.
+            from core.tiers import Tier
+            raw = model_router.generate(prompt, tier=Tier.MEDIUM, legacy_hint="gpt")
             # Extract code block
             import re as _re
             match = _re.search(r"```python\s*(.*?)```", raw, _re.DOTALL)

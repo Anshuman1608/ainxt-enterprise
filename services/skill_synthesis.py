@@ -84,7 +84,11 @@ def synthesize_skill(
     skill_type = skill_type if skill_type in ("execution", "behavioral") else "execution"
     prompt = _build_prompt(name, description, skill_type)
 
-    raw = model_router.generate(prompt, model_hint="claude")
+    # Phase 6 §N.1 step 4 ("skills"). model_hint="claude" named a VENDOR to
+    # ask for "the strong model"; _HINT_MAP resolved it to TIER_COMPLEX
+    # anyway, so the vendor name carried no information (R3).
+    from core.tiers import Tier
+    raw = model_router.generate(prompt, tier=Tier.COMPLEX, legacy_hint="claude")
 
     if skill_type == "behavioral":
         code = (raw or "").strip()

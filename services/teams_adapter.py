@@ -511,7 +511,9 @@ def _propose_sdlc_bug(jira_key: str, command: str, conv_id: str, service_url: st
         )
         try:
             from models.model_router import model_router
-            analysis = model_router.generate(triage_prompt, model_hint="complex")
+            from core.tiers import Tier
+            analysis = model_router.generate(
+                triage_prompt, tier=Tier.COMPLEX, legacy_hint="complex")
         except Exception as _ae:
             logger.warning(f"TeamsAdapter: triage LLM failed → {_ae}")
             analysis = f"Auto-triage unavailable. Summary: {summary}"
@@ -601,7 +603,9 @@ def _propose_sdlc_feature(jira_key: str, command: str, conv_id: str, service_url
         )
         try:
             from models.model_router import model_router
-            analysis = model_router.generate(triage_prompt, model_hint="complex")
+            from core.tiers import Tier
+            analysis = model_router.generate(
+                triage_prompt, tier=Tier.COMPLEX, legacy_hint="complex")
         except Exception as _ae:
             logger.warning(f"TeamsAdapter: triage LLM failed → {_ae}")
             analysis = f"Auto-analysis unavailable. Summary: {summary}"
@@ -845,7 +849,9 @@ def _run_orchestrator(command: str, conv_id: str, service_url: str,
     t0 = time.time()
     try:
         from models.model_router import model_router
-        answer = model_router.generate(command, model_hint="complex")
+        from core.tiers import Tier
+        answer = model_router.generate(
+            command, tier=Tier.COMPLEX, legacy_hint="complex")
 
         teams_metrics.inc_agent_run()
         teams_metrics.inc_success()

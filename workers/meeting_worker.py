@@ -164,7 +164,9 @@ def run_post_meeting_job(payload: dict) -> dict:
         # 5. Generate MoM INSIDE AiNxt (model-agnostic)
         _update(meeting_id, "summarizing", subject=subject, transcript_id=transcript_id)
         prompt = mt.build_mom_prompt(subject, transcript_text, part_names)
-        mom = model_router.generate(prompt, model_hint="complex") or ""
+        from core.tiers import Tier
+        mom = model_router.generate(
+            prompt, tier=Tier.COMPLEX, legacy_hint="complex") or ""
 
         # 6. Audit
         graph_audit.record(

@@ -531,8 +531,13 @@ _PHASE6_MIGRATED_MODULES = (
     "routers/threads_router.py",
     "routers/projects_router.py",
     "workers/knowledge_graph_worker.py",
+    "workers/cowork_task_worker.py",
+    "workers/meeting_worker.py",
     "connectors/mcp_bridge.py",
     "integrations/teams_sdk_app.py",
+    "services/teams_adapter.py",
+    "services/skill_synthesis.py",
+    "services/digest_service.py",
     "tools/n8n_autonomous_builder.py",
 )
 
@@ -543,6 +548,14 @@ _PHASE6_TIER_HINTS = (
     "haiku", "claude", "sonnet", "gpt", "coding", "agents",
     "solution", "opus", "deep", "vision",
 )
+
+
+# ModelRouter's public entry points — the only calls whose model_hint= is a
+# routing decision this phase is responsible for.
+_ROUTER_ENTRY_POINTS = frozenset({
+    "generate", "async_generate", "stream", "async_stream",
+    "generate_structured", "route",
+})
 
 
 def check_tier_migration(cfg) -> list[str]:
@@ -570,6 +583,16 @@ def check_tier_migration(cfg) -> list[str]:
             continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
+                continue
+            # Only ModelRouter's own entry points. `model_hint` is also a
+            # parameter on higher-level APIs that forward it — notably
+            # agents/orchestrator.py's run() — and those are migrated by
+            # extending THEIR signature, which is its own piece of work.
+            # Flagging them here would report the caller for a gap in the
+            # callee and there would be no local fix.
+            callee = (node.func.attr if isinstance(node.func, ast.Attribute)
+                      else getattr(node.func, "id", ""))
+            if callee not in _ROUTER_ENTRY_POINTS:
                 continue
             for kw in node.keywords:
                 if kw.arg != "model_hint":
