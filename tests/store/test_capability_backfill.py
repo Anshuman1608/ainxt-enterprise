@@ -182,3 +182,86 @@ def test_sync_backfill_fills_missing_privacy_class() -> None:
     merged = {**existing}
     merged.setdefault("privacy_class", PRIVACY_EXTERNAL)
     assert merged["privacy_class"] == PRIVACY_EXTERNAL
+
+
+# ── Per-second rates (Phase 6.5 item 3) ──────────────────────────────────────
+#
+# Video models bill by output duration, not by tokens, so `cost_per_second` is
+# the only field that prices them. The backfill sources it from
+# core.model_registry.MODEL_COST_PER_SECOND — which Phase 6 accidentally
+# emptied of anything useful, because that map was built as
+# `{VEO_MODEL: VEO_COST_PER_SECOND}` and Phase 6 made VEO_MODEL's
+# docker-compose default bare so the video-generation tier could win.
+#
+# The result was `{"": 0.40}`: a rate for a model id that cannot exist. The
+# backfill's `.get(model_id)` matched nothing, no row got a rate, and both Veo
+# variants billed identically at the flat constant — about $2.40 for a
+# six-second clip whichever one ran.
+
+
+def test_the_per_second_map_has_no_phantom_key() -> None:
+    """`""` is not a model id. It was harmless in the sense that nothing could
+    look it up, and harmful in the sense that its presence made the map look
+    populated while every real lookup missed."""
+    from core.model_registry import MODEL_COST_PER_SECOND
+
+    assert "" not in MODEL_COST_PER_SECOND
+
+
+def test_the_per_second_map_is_empty_when_no_model_is_pinned(monkeypatch) -> None:
+    """The expected state on a tier-governed deployment: VEO_MODEL unset, so
+    there is no env-pinned rate and the answer comes from the model row."""
+    import importlib
+
+    monkeypatch.setenv("VEO_MODEL", "")
+    mr = importlib.reload(importlib.import_module("core.model_registry"))
+    try:
+        assert mr.MODEL_COST_PER_SECOND == {}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(mr)
+
+
+def test_a_pinned_veo_model_still_gets_its_env_rate(monkeypatch) -> None:
+    """The override path has to keep working: a deployment that pins VEO_MODEL
+    is telling us which model runs, and VEO_COST_PER_SECOND is its price."""
+    import importlib
+
+    monkeypatch.setenv("VEO_MODEL", "veo-3.1-generate-preview")
+    monkeypatch.setenv("VEO_COST_PER_SECOND", "0.40")
+    mr = importlib.reload(importlib.import_module("core.model_registry"))
+    try:
+        assert mr.MODEL_COST_PER_SECOND == {"veo-3.1-generate-preview": 0.40}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(mr)
+
+
+def test_no_per_sku_rate_is_invented() -> None:
+    """D19. A vendor's per-second price is not a fact this repo knows, and
+    routers/chat_router.py's video budget gate deliberately does NOT fail open
+    — it denies the request when the budget store is unreachable. A guessed
+    number there would be an authoritative wrong price, which is worse than an
+    honest flat rate that doctor.sh reports as unset.
+    """
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[2] / "core" / "model_registry.py"
+           ).read_text(encoding="utf-8", errors="ignore")
+    block = src.split("MODEL_COST_PER_SECOND")[1][:400]
+    assert '"veo' not in block and "'veo" not in block, (
+        "a Veo SKU literal appeared in MODEL_COST_PER_SECOND — per-model rates "
+        "belong on the model row (Admin > LLM Providers), not in a code table "
+        "of guessed prices")
+
+
+def test_an_absent_rate_is_reported_not_just_defaulted() -> None:
+    """chat_router already warned on a NON-NUMERIC cost_per_second; an absent
+    one fell back silently, which is how two differently priced variants came
+    to bill the same with nothing in the log to say which was which."""
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parents[2] / "routers" / "chat_router.py"
+           ).read_text(encoding="utf-8", errors="ignore")
+    assert "_VEO_RATE_WARNED" in src
+    assert "declares no cost_per_second" in src

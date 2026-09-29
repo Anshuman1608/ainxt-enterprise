@@ -611,11 +611,12 @@ def toggle_pin_chat(chat_id: str, current_user: dict = Depends(get_current_user)
 # ============================================================
 
 # ── Image-gen pricing source-of-truth ─────────────────────────────
-# Image generation has exactly ONE backing model on this platform:
-# gemini-3.1-flash-image. Anthropic / OpenAI / Local models do NOT
-# have an image-gen endpoint here — when the user picks one of those
-# the UI routes the prompt through normal /ask chat instead, so the
-# model can respond with text (typically a refusal). The mapping in
+# Which model backs image generation is the `image-output` tier's decision
+# (Phase 6, §N.1 step 5), and since Phase 6.5 item 2 the tier names the SKU and
+# not just the family. Only the gemini and openai families have an image-gen
+# gateway here, so the endpoint refuses any other family with a 503; when the
+# user picks a text model in the UI the prompt goes through normal /ask instead,
+# so the model can respond with text (typically a refusal). The mapping in
 # ai-ui/src/utils/imageGenerate.js mirrors this.
 #
 # SINGLE SOURCE OF TRUTH: image-token pricing is read from
@@ -679,12 +680,11 @@ def chat_generate_image(body: dict, current_user: dict = Depends(get_current_use
     # Model Governance > Tiers and its provider family is what runs first;
     # the proxy's own gemini -> openai fallback is unchanged underneath.
     #
-    # HONEST LIMIT: the proxy's /llm/imagen contract carries a provider but
-    # not a model id, so the concrete SKU within the family is still chosen
-    # inside services/llm_proxy. Threading it through is a proxy change, and
-    # plan.html scopes proxy work out of this phase (U2). What the tier
-    # controls today is the FAMILY and the audit label; what it does not yet
-    # control is which Gemini image model the proxy picks.
+    # Both the family AND the model come from the tier: /llm/imagen gained a
+    # `model` field in Phase 6.5 item 2, so assigning a specific image model
+    # now actually runs that model. Before then the tier controlled only the
+    # family, and an administrator picking a particular Gemini image model got
+    # whatever GEMINI_IMAGE_MODEL named instead — with no error to notice.
     from core.tiers import Tier as _ImgTier
     from core.tier_resolver import NoEligibleModel as _ImgNoEligible
     from models.model_router import resolve_media_model as _img_resolve
@@ -765,6 +765,7 @@ def chat_generate_image(body: dict, current_user: dict = Depends(get_current_use
             number_of_images=1,
             style_suffix=style,
             provider=provider,
+            model=_img_tier_model,
             return_meta=True,
         )
         _latency_sec = _time.perf_counter() - _img_t0
@@ -1244,6 +1245,12 @@ def _media_dir() -> str:
     p.mkdir(parents=True, exist_ok=True, mode=0o700)
     return str(p)
 
+# Video models already reported as having no declared per-second rate. Warned
+# once each, per process: it is a configuration gap, not a property of any one
+# request. See the rate resolution in chat_generate_video (Phase 6.5 item 3).
+_VEO_RATE_WARNED: set = set()
+
+
 def _veo_video_path(video_id: str) -> str:
     """Resolve and verify video_id is a safe filename (no path traversal)."""
     if not re.fullmatch(r"[A-Za-z0-9_\-]{8,64}", video_id or ""):
@@ -1375,15 +1382,29 @@ def chat_generate_video(
     # configuration of the platform), falling back to the flat
     # VEO_COST_PER_SECOND constant. Two Veo variants at different prices used
     # to bill identically, because the constant could not tell them apart.
+    _declared_rate = _veo_caps.get("cost_per_second")
     try:
-        _rate = float(_veo_caps.get("cost_per_second") or VEO_COST_PER_SECOND)
+        _rate = float(_declared_rate or VEO_COST_PER_SECOND)
     except (TypeError, ValueError):
         logger.warning(
             "chat_router: model %r declares a non-numeric cost_per_second "
             "(%r) — using VEO_COST_PER_SECOND",
-            resolved_veo_model, _veo_caps.get("cost_per_second"),
+            resolved_veo_model, _declared_rate,
         )
         _rate = float(VEO_COST_PER_SECOND)
+    # An ABSENT rate used to fall back silently, which is how two Veo variants
+    # at different prices came to bill identically with nothing in the log to
+    # say which one was being charged at the other's rate (Phase 6.5 item 3).
+    # Once per model per process: this is a configuration gap, not a property
+    # of the request, so repeating it per video would be noise.
+    if not _declared_rate and resolved_veo_model not in _VEO_RATE_WARNED:
+        _VEO_RATE_WARNED.add(resolved_veo_model)
+        logger.warning(
+            "chat_router: model %r declares no cost_per_second — billing at "
+            "VEO_COST_PER_SECOND ($%.2f/s). Set a per-second rate on the model "
+            "in Admin > LLM Providers so variants at different prices bill "
+            "differently.", resolved_veo_model, float(VEO_COST_PER_SECOND),
+        )
     cost_usd = duration_secs * _rate
     try:
         from store.budget_store import (

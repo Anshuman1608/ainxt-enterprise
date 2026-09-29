@@ -478,9 +478,23 @@ class ImagenRequest(BaseModel):
        "gemini" → Imagen-3 Fast on Vertex/Gemini API
        "openai" → DALL-E 3 (HD)
     Stock photo APIs (Pexels / Unsplash / etc.) must never be added.
+
+    ── `model` (Phase 6.5 item 2) ───────────────────────────────────────────
+    The concrete SKU the caller's `image-output` tier resolved to. Until this
+    field existed the contract carried a provider but no model id, so an
+    administrator assigning e.g. `gemini-3-pro-image` to the image-output tier
+    got the right FAMILY and the wrong MODEL — silently, because the request
+    still succeeded and returned an image from whatever GEMINI_IMAGE_MODEL
+    named.
+
+    Optional, and it must stay optional: `sandbox/doc_executor.py` posts here
+    for document illustrations and has not been migrated to a tier (that is
+    §N.1 step 8), so an absent `model` has to keep meaning "use the
+    deployment's configured default".
     """
     provider:        str   = "gemini"
     prompt:          str
+    model:           Optional[str] = None  # SKU from the caller's image-output tier
     aspect_ratio:    str   = "16:9"        # 1:1 | 16:9 | 9:16 | 4:3 | 3:4
     number_of_images: int  = 1             # 1..4
     style_suffix:    str   = ""            # extra style instructions (e.g. "vector flat")
@@ -2238,16 +2252,38 @@ async def generate_image(req: GenerateImageRequest, request: Request):
 from fastapi.responses import Response as _Response
 
 
+# Models already reported as priced at a carry-over rate — warned once each,
+# because this is a per-image code path and the message is about configuration,
+# not about the request.
+_IMAGE_RATE_WARNED: set = set()
+
+
 def _image_cost(model: str, in_tok: int, out_tok: int) -> float:
     """Per-token image-generation cost, using the SAME formula and rate table
     that chat/doc responses use (core.model_registry.MODEL_COST_PER_1M).
 
     rates = (input_per_1M, output_per_1M) → cost = (in*rate_in + out*rate_out)/1e6.
     Falls back to the gemini image rate when the model isn't in the table.
+
+    That fallback used to be silent, which was tolerable while GEMINI_IMAGE_MODEL
+    was the only model that could ever run. Since Phase 6.5 item 2 the
+    image-output tier can name any SKU in the family, so a model with no rate
+    in the table is now genuinely reachable — and it would bill at the old
+    model's price with nothing in the log to say so.
     """
     try:
         from core.model_registry import MODEL_COST_PER_1M, GEMINI_IMAGE_MODEL
-        rates = MODEL_COST_PER_1M.get(model) or MODEL_COST_PER_1M.get(GEMINI_IMAGE_MODEL) or (0.075, 0.30)
+        rates = MODEL_COST_PER_1M.get(model)
+        if rates is None:
+            rates = MODEL_COST_PER_1M.get(GEMINI_IMAGE_MODEL) or (0.075, 0.30)
+            if model and model not in _IMAGE_RATE_WARNED:
+                _IMAGE_RATE_WARNED.add(model)
+                logger.warning(
+                    "image cost: %r has no entry in MODEL_COST_PER_1M — billing "
+                    "at the carry-over rate %r. Set cost_per_1m_input/_output on "
+                    "the model in Admin > LLM Providers so its images are priced "
+                    "correctly.", model, rates,
+                )
     except Exception:
         rates = (0.075, 0.30)  # gemini-3.1-flash-image carry-over rate
     return (int(in_tok or 0) * rates[0] + int(out_tok or 0) * rates[1]) / 1_000_000
@@ -2263,6 +2299,14 @@ async def imagen(req: ImagenRequest):
     aspect = (req.aspect_ratio or "16:9").strip() or "16:9"
     n_imgs = max(1, min(4, int(req.number_of_images or 1)))
     style  = (req.style_suffix or "").strip()
+    # The SKU the caller's image-output tier picked, if it sent one.
+    #
+    # It applies ONLY to req.provider's branch. The cross-provider fallback
+    # below keeps its own default: handing a Gemini model id to the OpenAI
+    # Images API would turn a working fallback into a hard 400, and "which
+    # family" and "which SKU within that family" are separate facts. This is
+    # the one place in the handler where the two could be conflated.
+    want_model = (req.model or "").strip()
 
     full_prompt = req.prompt.strip()
     if style:
@@ -2272,7 +2316,8 @@ async def imagen(req: ImagenRequest):
         f"aspect ratio {aspect}, no text, no watermarks, photorealistic."
     )
     logger.info(
-        f"[{req_id}] IMAGEN REQUEST | provider={req.provider} | aspect={aspect} | "
+        f"[{req_id}] IMAGEN REQUEST | provider={req.provider} | "
+        f"model={want_model or '(provider default)'} | aspect={aspect} | "
         f"n={n_imgs} | prompt={req.prompt[:60].replace(chr(10),' ')!r}..."
     )
 
@@ -2288,9 +2333,15 @@ async def imagen(req: ImagenRequest):
         if _gemini_gw is None:
             raise RuntimeError("Gemini gateway not available")
         from google.genai import types as _gtypes
-        # Image-generation model — sourced from the registry so the env override
-        # (GEMINI_IMAGE_MODEL) is respected without code changes.
-        from core.model_registry import GEMINI_IMAGE_MODEL as _GEMINI_MULTIMODAL
+        # Image-generation model. The caller's image-output tier decides when
+        # it sends one (Phase 6.5 item 2); GEMINI_IMAGE_MODEL is the fallback
+        # for callers that do not — today the document pipeline, which is not
+        # tier-migrated yet. Only honoured when gemini is the PRIMARY provider:
+        # on the fallback leg `want_model` names an OpenAI SKU.
+        from core.model_registry import GEMINI_IMAGE_MODEL as _GEMINI_DEFAULT
+        _GEMINI_MULTIMODAL = (
+            want_model if (want_model and req.provider == "gemini") else _GEMINI_DEFAULT
+        )
 
         # Image generation prompt fed to generate_content with IMAGE modality.
         # The model returns inline image data in candidates[0].content.parts.
@@ -2373,10 +2424,26 @@ async def imagen(req: ImagenRequest):
                     return fh.read()
             raise RuntimeError("OpenAI Images returned neither b64_json nor url")
 
-        # Try gpt-image-1 first (current OpenAI image model). Only fall
-        # through to dall-e-3 if gpt-image-1 failed with "model not found"
-        # — any other error means gpt-image-1 IS available and we shouldn't
-        # mask a real failure by switching models.
+        # When the caller's image-output tier named an OpenAI SKU, that SKU is
+        # the answer — one attempt, no probe (Phase 6.5 item 2). Falling
+        # through to a different model here would reproduce exactly the bug
+        # this item fixes: the administrator's choice appearing to apply while
+        # something else runs.
+        if want_model and req.provider == "openai":
+            r = client.images.generate(
+                model=want_model,
+                prompt=full_prompt,
+                size=size,
+                n=1,
+            )
+            _meta["model"] = want_model      # OpenAI images have no token usage
+            return _to_bytes(r)
+
+        # No model requested (document pipeline, or this is the fallback leg of
+        # a gemini-primary request). Try gpt-image-1 first (current OpenAI
+        # image model). Only fall through to dall-e-3 if gpt-image-1 failed
+        # with "model not found" — any other error means gpt-image-1 IS
+        # available and we shouldn't mask a real failure by switching models.
         try:
             r = client.images.generate(
                 model="gpt-image-1",
@@ -2414,6 +2481,10 @@ async def imagen(req: ImagenRequest):
                 quality="hd",
                 n=1,
             )
+            # This leg used to return without recording the model, so an
+            # OPENAI_IMAGE_MODEL image was reported as "" in the X-Imagen-Model
+            # header and priced by _image_cost's carry-over rate.
+            _meta["model"] = _OPENAI_IMG_MODEL
             return _to_bytes(r)
         except Exception as e_old:
             msg = str(e_old).lower()

@@ -526,6 +526,7 @@ class GeminiGateway:
             style_suffix: str = "",
             provider: str = "gemini",
             return_meta: bool = False,
+            model: str = "",
     ) -> "bytes | None | tuple[bytes | None, dict]":
         """
         Generate an image. Primary attempt uses the gemini image model
@@ -542,6 +543,13 @@ class GeminiGateway:
               the caller can read which provider/model ACTUALLY produced
               the image (post-fallback). Default False preserves the
               legacy bytes-only return shape used by older call sites.
+            model: the SKU the caller's `image-output` tier resolved to
+              (Phase 6.5 item 2). `provider` selects the FAMILY and this
+              selects the model within it — previously only the family was
+              controllable, so an administrator's choice of a specific
+              image model appeared to apply while GEMINI_IMAGE_MODEL ran.
+              Defaults to "" meaning "the deployment's configured default",
+              which is what the un-migrated document pipeline still wants.
 
         Routing policy (matches gateway_claude / gateway_openai / text path
         in this same module — see line ~177):
@@ -608,6 +616,10 @@ class GeminiGateway:
                     json={
                         "provider":         provider,
                         "prompt":           safe_prompt[:4000],
+                        # Omitted rather than sent empty when the caller has no
+                        # tier-resolved model, so an older proxy that does not
+                        # know the field is unaffected either way.
+                        **({"model": model.strip()} if (model or "").strip() else {}),
                         "aspect_ratio":     aspect_ratio,
                         "number_of_images": number_of_images,
                         "style_suffix":     style_suffix or "",
@@ -679,9 +691,11 @@ class GeminiGateway:
         try:
             from google.genai import types as _gtypes
 
-            # Image-generation model — sourced from the registry so env override
-            # (GEMINI_IMAGE_MODEL) is respected without code changes.
-            _GEMINI_MULTIMODAL = GEMINI_IMAGE_MODEL
+            # Image-generation model. The caller's image-output tier decides
+            # when it passes one; GEMINI_IMAGE_MODEL is the fallback for
+            # callers that do not. Kept identical to the proxy branch above so
+            # local dev and production pick the same model for the same call.
+            _GEMINI_MULTIMODAL = (model or "").strip() or GEMINI_IMAGE_MODEL
 
             def _call():
                 return self.client.models.generate_content(

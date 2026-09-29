@@ -258,9 +258,23 @@ def max_output_tokens_for(model_id: str) -> int | None:
 #
 # Video-generation models (Veo) are billed per output second, not per token.
 # Kept as a separate map so per-token math elsewhere is unaffected.
-MODEL_COST_PER_SECOND: dict[str, float] = {
-    VEO_MODEL: VEO_COST_PER_SECOND,
-}
+#
+# Guarded on VEO_MODEL being set, because Phase 6 made its docker-compose
+# default bare so the `video-generation` tier could win — and an unguarded
+# `{VEO_MODEL: ...}` then produced `{"": 0.40}`, a rate for a model that does
+# not exist. db/migrate.py's capability backfill does `.get(model_id)` against
+# this map, so it matched nothing and `capabilities.cost_per_second` was
+# written for no model at all: both Veo variants billed identically at the flat
+# rate, which is Phase 6.5 item 3.
+#
+# Deliberately NOT extended with per-SKU literals (D19). A vendor's per-second
+# price is not a fact this repo knows, and a guessed number in an authoritative
+# budget gate — routers/chat_router.py does not fail open on video — is worse
+# than an honest flat rate. Declare it per model in Admin > LLM Providers; it
+# lands on capabilities.cost_per_second, which chat_router reads first.
+MODEL_COST_PER_SECOND: dict[str, float] = (
+    {VEO_MODEL: VEO_COST_PER_SECOND} if VEO_MODEL else {}
+)
 
 
 # ---------------- VEO ACCESS GATE (ad_level 0 or admin) ----------------
