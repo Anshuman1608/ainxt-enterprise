@@ -135,7 +135,7 @@ def dedupe_names(names: list[str]) -> list[str]:
 # no vendor's models are assumed. Operators who want short-name aliases (e.g.
 # "fast" → their preferred fast model) should extend this table via a local
 # override or set ABSTUDIO_AGENT_DEFAULT_MODEL in their environment.
-# The _TIER_PREFERENCES list below is the multi-provider preference path.
+# The _TIER_PREFERENCES_FALLBACK list below is the multi-provider preference path.
 _MODEL_ALIASES: dict = {}
 
 # Canonical ids accepted verbatim (case-insensitive) when a user pastes a
@@ -184,12 +184,32 @@ def normalize_model_pref(raw: object) -> Optional[str]:
 # are directly comparable. Tier ordering is [fast, balanced, deep].
 _MODEL_TIERS = ("fast", "balanced", "deep")
 
-# Priority-ordered picks for each tier, preferring cloud → in-house so a
-# well-provisioned deployment lands on the strongest fit, but a local-only
-# deployment still gets a workable choice. First entry per tier that appears
-# in ``available_models`` wins; if none are present, we fall back to the
-# first available model overall.
-_TIER_PREFERENCES: dict = {
+# Buckets → governed capability tiers (§N.1 step 7).
+#
+# The wire names below ("fast"/"balanced"/"deep") are NOT renamed: they appear
+# in saved workflow JSON on live deployments, and rewriting them would be a
+# data migration dressed as a refactor. They are mapped inward instead, so the
+# administrator's tier assignments decide which model each bucket gets.
+_TIER_TO_GOVERNED: dict = {
+    "fast":     "mini",
+    "balanced": "medium",
+    "deep":     "complex",
+}
+
+# Priority-ordered picks for each tier — the FALLBACK, used only when the
+# governed resolver is unreachable.
+#
+# This list used to be the primary source, and it is the reason §N.1 step 7
+# exists: twenty vendor model ids hardcoded eleven lines below a comment
+# promising that "No model ids are hardcoded here … so that no vendor's models
+# are assumed". Structurally it is this migration's own design — priority
+# ordered candidates, first available wins — expressed in the wrong place with
+# its own vocabulary. It stays, verbatim, as the fallback: this module already
+# imports core.logger at module scope, so "core/ is not on the path" is not the
+# risk here — the real ones are a database the resolver cannot reach and a tier
+# with no eligible assignment. In either case an Agent Studio that cannot pick
+# a model at all is worse than one picking from a stale list.
+_TIER_PREFERENCES_FALLBACK: dict = {
     "fast": [
         "claude-haiku-4-5-20251001",
         "gemini-3.1-flash-lite",
@@ -255,24 +275,58 @@ def _tier_for_agent(node: dict) -> str:
     return "balanced"
 
 
+def _tier_candidates(tier: str) -> list:
+    """Priority-ordered model ids for a bucket, from the governed tier.
+
+    Asks the platform resolver first, so the models come from the
+    administrator's Model Governance > Tiers assignments and Agent Studio
+    needs no redeploy when they change. Falls back to the hardcoded list
+    above when the resolver cannot answer — an unreachable database, or a
+    tier with no eligible model (``resolve_tier_candidates`` raises
+    ``NoEligibleModel`` rather than returning empty). Same failure posture
+    the rest of this service already takes.
+
+    This is the first consumer of ``resolve_tier_candidates()``'s ORDERING;
+    until now only the resolver's own tests exercised more than its head.
+    """
+    fallback = _TIER_PREFERENCES_FALLBACK.get(tier) or _TIER_PREFERENCES_FALLBACK["balanced"]
+    governed = _TIER_TO_GOVERNED.get(tier)
+    if not governed:
+        return fallback
+    try:
+        from core.tier_resolver import resolve_tier_candidates
+        from core.tiers import Tier
+
+        ids = [c.model_id for c in resolve_tier_candidates(Tier(governed))]
+        return ids or fallback
+    except Exception as exc:  # noqa: BLE001 — never block generation on this
+        logger.warning(
+            f"[AGENT] tier {tier!r} could not be resolved from Model Governance "
+            f"({exc}) — falling back to the built-in preference list"
+        )
+        return fallback
+
+
 def _resolve_tier_to_model(tier: str, available_models: list) -> Optional[str]:
     """Return the first preference for ``tier`` that's in ``available_models``.
 
     Never falls back to a model the runtime can't serve — everything comes
     from ``available_models`` (populated from ``/llm/models``, which is
-    what the CLI actually accepts).
+    what the CLI actually accepts). That filter is kept even though the
+    candidates are now registry rows: a model can be assigned to a tier and
+    still be missing from the runtime catalogue, and serving an id the CLI
+    rejects is the failure this function exists to prevent.
     """
     if not available_models:
         return None
-    prefs = _TIER_PREFERENCES.get(tier) or _TIER_PREFERENCES["balanced"]
-    for candidate in prefs:
+    for candidate in _tier_candidates(tier):
         if candidate in available_models:
             return candidate
     # Nothing in the tier preference matched. Pick a sensible neighbour:
     #  - "deep" downgrades toward the strongest available balanced model
     #  - anything else falls back to the first non-pseudo id
     if tier == "deep":
-        for candidate in _TIER_PREFERENCES["balanced"]:
+        for candidate in _tier_candidates("balanced"):
             if candidate in available_models:
                 return candidate
     for m in available_models:

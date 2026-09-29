@@ -71,6 +71,23 @@ MIGRATED: list[tuple[Tier, str, str]] = [
     # person reading this list would not know the Cowork path existed.
     (Tier.COMPLEX, "complex",
      "workers/cowork_task_worker.py:165 — via agents/orchestrator.py::run()"),
+
+    # ── step 6: CodeWiki, index enrichment, retrieval
+    # Chunk enrichment is the ONE row in this file whose legacy_hint is not a
+    # faithful reproduction, and the parity assertion below is therefore
+    # weaker for it than for every other row. It used to pass
+    # model_hint=ENRICH_MODEL, empty on a default install, which route()
+    # treats as "no hint" and complexity-classifies per chunk. No _HINT_MAP
+    # key means "auto", so there is nothing to put here that reproduces it —
+    # "haiku" is what the tier was chosen to mean, not what the call site did
+    # before. What this row still proves is the narrower claim that matters
+    # at runtime: tier=SIMPLE + legacy_hint="haiku" routes exactly where a
+    # bare "haiku" did, so the rollback path is not itself a new behaviour.
+    (Tier.SIMPLE,  "haiku",    "workers/index_worker.py:752 — chunk enrichment"),
+    (Tier.SIMPLE,  "haiku",
+     "models/hybrid_retriever.py — query expansion + multi-query decomposition"),
+    (Tier.COMPLEX, "solution", "sandbox/self_healing_engine.py:339"),
+    (Tier.COMPLEX, "complex",  "workers/secure_code_gate_worker.py:126"),
 ]
 
 _IDS = [f"{t.value}<-{h}" for t, h, _ in MIGRATED]

@@ -539,6 +539,14 @@ _PHASE6_MIGRATED_MODULES = (
     "services/skill_synthesis.py",
     "services/digest_service.py",
     "tools/n8n_autonomous_builder.py",
+    # §N.1 step 6 — CodeWiki, index enrichment, retrieval. The last two were
+    # in no step's list: leaf consumers in the step-4 mould that step 4 missed,
+    # adopted here so they stop being rediscovered.
+    "workers/index_worker.py",
+    "workers/codewiki_worker.py",
+    "models/hybrid_retriever.py",
+    "sandbox/self_healing_engine.py",
+    "workers/secure_code_gate_worker.py",
 )
 
 # The eight tier names plus the legacy aliases that MEAN one of them. A raw

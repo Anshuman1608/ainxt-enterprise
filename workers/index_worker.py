@@ -48,6 +48,8 @@ from core.config import (
 )
 from core.kv import get_kv
 from core.retrieval_status import describe_embed_svc_error
+# core.tiers is a stdlib-only leaf — safe at module scope.
+from core.tiers import Tier
 
 from core.logger import logger
 
@@ -656,6 +658,24 @@ def _mirror_code_nodes_to_kg(repo_name: str, nodes: list[dict],
         logger.warning(f"index_worker: KG mirror failed: {e}")
 
 _ENRICH_MODEL = os.getenv("ENRICH_MODEL", "")   # set via ENRICH_MODEL in .env — no code default
+
+# §N.1 step 6 — chunk enrichment is the platform's highest-volume LLM consumer
+# (one call per code chunk per indexed repo) and until now nothing governed it:
+# ENRICH_MODEL is empty on a default install, and ModelRouter.route() gates its
+# hint branch on `if model_hint:`, so an empty hint skipped the hint path
+# entirely and every chunk was complexity-classified individually.
+#
+# It now asks for Tier.SIMPLE — short bounded output that still needs reliable
+# instruction-following, which is SIMPLE as against MINI. An explicit
+# ENRICH_MODEL still wins (a named model is a human decision).
+#
+# WHAT THIS SENDS WHERE. The prompt contains source code. On a deployment whose
+# `simple` tier holds a cloud model, enrichment egresses every indexed chunk to
+# that vendor. Set ENRICH_NO_CLOUD_EGRESS to forbid that: resolution then fails
+# loudly rather than falling back, which is the one case where refusing to
+# answer is the correct behaviour.
+_ENRICH_NO_CLOUD_EGRESS = (os.getenv("ENRICH_NO_CLOUD_EGRESS", "").strip().lower()
+                           in ("1", "true", "yes", "on"))
 # ── Constants ──────────────────────────────────────────────────
 ENRICH_MODEL       = _ENRICH_MODEL
 LOCK_TTL           = 43200        # 12 hours — 100k+ vector repos run 10+ hours
@@ -749,7 +769,19 @@ def _enrich_chunk(chunk: dict) -> dict:
 
         # ── Cache miss: call LLM ──────────────────────────────────
         prompt      = _ENRICH_PROMPT.format(code=code)
-        description = _mr.generate(prompt, model_hint=ENRICH_MODEL).strip()
+        if ENRICH_MODEL:
+            # Operator pinned a model — an explicit choice outranks a tier.
+            _route_kwargs = {"model_hint": ENRICH_MODEL}
+        else:
+            # legacy_hint is "haiku" rather than an exact reproduction of the
+            # old behaviour, because there isn't one: the old behaviour was
+            # "no hint at all" (auto-classify per chunk) and no _HINT_MAP key
+            # means that. So governance-off moves from auto to Haiku here —
+            # the one place in the migration where D15 is approximated rather
+            # than guaranteed, and it is called out rather than papered over.
+            _route_kwargs = {"tier": Tier.SIMPLE, "legacy_hint": "haiku",
+                             "no_cloud_egress": _ENRICH_NO_CLOUD_EGRESS}
+        description = _mr.generate(prompt, **_route_kwargs).strip()
         if description and len(description) > 10:
             enriched = f"{description}\n\n{content}"
             chunk = dict(chunk)

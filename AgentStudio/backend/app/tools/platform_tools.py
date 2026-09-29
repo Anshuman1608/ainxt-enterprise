@@ -552,6 +552,21 @@ def run(inputs: dict) -> dict:
 # tool is ever changed to forward untrusted user text, gate it at the ABStudio
 # backend dispatch layer (which CAN import agents.compliance_engine) BEFORE the
 # sandbox subprocess is launched — do NOT reintroduce compliance into the proxy.
+# §N.1 step 7 note — this tool's model_hint does NOT work, in two ways.
+#
+# 1. It is `"draft": True`, so canonical_tools.py never seeds it: nothing can
+#    call it as things stand.
+# 2. If it were activated it would not merely mis-route, it would 422. This
+#    posts to LLM_PROXY_URL/llm/generate, i.e. services/llm_proxy, whose
+#    GenerateRequest (main.py:429) has NO model_hint field and REQUIRES
+#    `provider`. The payload below sends the former and omits the latter.
+#
+# So the vocabulary was never governed and there is nothing here for the tier
+# migration to migrate — the schema is aligned to fast|balanced|deep (dropping
+# "smart", which named nothing anywhere) and says the field is inert, rather
+# than pretending a hint is honoured. Wiring this to the resolver means
+# deciding what the sandbox may resolve on its own, which is proxy
+# re-architecture (plan.html U2) and deliberately out of scope here.
 _LLM_GENERATE_CODE = _PROXY_HELPERS + '''
 def run(inputs: dict) -> dict:
     try:
@@ -834,7 +849,7 @@ PLATFORM_TOOLS = [
             "type": "object",
             "properties": {
                 "prompt":     {"type": "string",  "description": "The prompt to send to the LLM"},
-                "model_hint": {"type": "string",  "description": "Preferred model hint: fast | smart | balanced", "default": "balanced"},
+                "model_hint": {"type": "string",  "description": "Capability bucket: fast | balanced | deep. See the note above _LLM_GENERATE_CODE — this field is not honoured yet.", "default": "balanced", "enum": ["fast", "balanced", "deep"]},
                 "max_tokens": {"type": "integer", "description": "Max tokens in the response", "default": 1024},
             },
             "required": ["prompt"],

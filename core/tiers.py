@@ -36,6 +36,7 @@
 
 from __future__ import annotations
 
+import os
 from enum import Enum
 from typing import Final, Literal, Union
 
@@ -424,3 +425,26 @@ def is_tier(value: object) -> bool:
     if isinstance(value, str):
         return value in {t.value for t in Tier}
     return False
+
+
+# ── Is governed resolution live? ─────────────────────────────────────────────
+# The one reader of TIER_GOVERNANCE_ENABLED.
+#
+# This used to be hand-rolled in two places — models/model_router.py and
+# routers/tier_governance_router.py — each carrying a comment saying the
+# readers "have to agree", which is the kind of note that is true right up
+# until it is not. §N.1 step 6 added three more consumers that bypass
+# ModelRouter entirely (chunk enrichment, CodeWiki's subprocess config, and
+# hybrid retrieval), and a fourth and fifth copy of an env-parsing rule is
+# exactly how they stop agreeing. So there is one now and the others delegate.
+#
+# Default OFF: off means the legacy chains run exactly as they did before
+# Phase 5 (tests/models/test_dispatch_equivalence.py pins that). Read per
+# call rather than at import, so an operator can flip it — and roll it back —
+# without a restart.
+#
+# Vocabulary matches core/config.py::_env_bool.
+def governance_enabled() -> bool:
+    """True when tier assignments decide routing, rather than the .env chains."""
+    return (os.getenv("TIER_GOVERNANCE_ENABLED") or "").strip().lower() in (
+        "1", "true", "yes", "on")

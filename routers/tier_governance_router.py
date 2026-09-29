@@ -28,7 +28,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -43,6 +42,7 @@ from core.tiers import (
     TIER_LABEL,
     TIER_USED_BY,
     Tier,
+    governance_enabled,
 )
 
 router = APIRouter(prefix="/model-governance", tags=["tier-governance"])
@@ -125,11 +125,13 @@ def _governance_active() -> bool:
     which it is, and the banner disappears on its own when Phase 5 lands rather
     than depending on someone remembering to delete it.
 
-    Vocabulary matches core/config.py::_env_bool; inlined rather than imported
-    so this router keeps its narrow import surface.
+    Delegates to core.tiers, which owns the parse. It used to be inlined here
+    to keep this router's import surface narrow, but core.tiers is a
+    stdlib-only leaf, so there is no surface to protect — and three
+    independent copies of one env rule is how the screen comes to report a
+    state the router is not in.
     """
-    raw = (os.getenv("TIER_GOVERNANCE_ENABLED") or "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
+    return governance_enabled()
 
 
 def _assignments_by_tier(db) -> dict[str, list[dict]]:

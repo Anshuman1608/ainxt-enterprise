@@ -21,6 +21,7 @@ import shutil
 import tempfile
 
 from core.logger import logger
+from core.tiers import Tier
 from tools.security_scan_tools import (
     CVSS_BLOCK_THRESHOLD,
     bandit_scan,
@@ -123,7 +124,11 @@ def _llm_fix(path: str, content: str, findings: list[dict], language: str) -> st
     )
     try:
         from models.model_router import model_router
-        out = model_router.generate(prompt, model_hint="complex") or ""
+        # Rewriting a whole file to clear SAST findings while preserving its
+        # public API is agentic code generation — Tier.COMPLEX. legacy_hint
+        # keeps the governance-off path identical to the old "complex" hint.
+        out = model_router.generate(prompt, tier=Tier.COMPLEX,
+                                    legacy_hint="complex") or ""
         fixed = _strip_fences(out)
         return fixed or None
     except Exception as e:

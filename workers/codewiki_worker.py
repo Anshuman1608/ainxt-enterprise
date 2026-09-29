@@ -152,6 +152,129 @@ _CODEWIKI_DEFAULT_MAX_TOKEN_PER_LEAF_MODULE = 16000
 _CODEWIKI_DEFAULT_MAX_DEPTH = 2
 
 
+# ── Tier-resolved LLM config (§N.1 step 6) ───────────────────────────────────
+# Registry provider family → the value CodeWiki's `config set --provider` wants.
+#
+# Checked against the installed codewiki 2.0.0 rather than assumed: its
+# Configuration.provider accepts "openai-compatible" (its default),
+# "atlas-cloud", "anthropic", "bedrock" and "azure-openai", plus the
+# subscription-mode CAW providers "claude-code" and "codex"
+# (codewiki/cli/models/config.py:125, codewiki/src/be/backend.py:68).
+#
+# So Anthropic models ARE usable here — an earlier revision of this worker
+# filtered them out on the belief that CodeWiki spoke only the OpenAI API,
+# which was wrong and would have left a Claude-only deployment falling back
+# to env config forever.
+#
+# gemini is deliberately absent: the CLI has no Gemini provider, and while
+# Google does publish an OpenAI-compatible endpoint, the base_url on a gemini
+# provider row is the NATIVE one (it is what the platform's own Gemini gateway
+# uses). Mapping it to "openai-compatible" would point CodeWiki at an endpoint
+# that speaks a different protocol.
+_FAMILY_TO_CODEWIKI_PROVIDER = {
+    "anthropic":         "anthropic",
+    "openai":            "openai-compatible",
+    "generic_openai":    "openai-compatible",
+    "openai_compatible": "openai-compatible",
+    "ollama":            "openai-compatible",
+    "local":             "openai-compatible",
+}
+
+# Providers that serve their endpoint without authentication (Ollama, most
+# self-hosted vLLM/LiteLLM deployments). `config set` still wants a value for
+# --api-key, so send a recognisable placeholder rather than an empty string,
+# which it would persist and later report as unconfigured.
+_CODEWIKI_NO_AUTH_PLACEHOLDER = "ainxt-local-no-auth"
+
+
+def _codewiki_llm_from_tier(log_info, log_warning) -> dict | None:
+    """Resolve CodeWiki's LLM config from the `medium` tier, or None.
+
+    Returns ``{provider, base_url, api_key, main_model, fallback_model}``.
+
+    Why `medium`: CodeWiki authors multi-paragraph architectural prose over
+    long context, which is MEDIUM's definition, and its previously-validated
+    pinned defaults were mid-size models.
+
+    Why the candidate LIST and not resolve_tier(): CodeWiki's own
+    ``--main-model`` / ``--fallback-model`` pair IS a priority ladder, so the
+    first two eligible candidates map straight onto it. A deployment with one
+    eligible model gets main == fallback, which is exactly what the
+    CODEWIKI_FALLBACK_MODEL default already does today — not a bug.
+
+    A candidate is eligible when it clears two bars:
+
+      1. its family maps to a provider the CLI knows
+         (``_FAMILY_TO_CODEWIKI_PROVIDER``); and
+      2. it has a ``base_url``. CodeWiki validates the URL for every
+         non-subscription provider — ``anthropic`` included
+         (codewiki/cli/models/config.py::validate) — so a provider row with no
+         base_url cannot be used no matter how capable its model is. We do NOT
+         substitute a vendor default: putting ``https://api.anthropic.com`` in
+         this file would re-introduce exactly the hardcoded vendor endpoint
+         this migration removes, and an administrator who needs a regional or
+         proxied endpoint would have it silently overridden. They set it on
+         Admin > LLM Providers, where the field already exists.
+
+    Returns None (saying why) when nothing qualifies, so the caller falls back
+    to the CODEWIKI_* env vars exactly as before.
+    """
+    try:
+        from core.tier_resolver import resolve_tier_candidates
+        from core.tiers import Tier
+        from core.llm_provider_registry import get_provider, resolve_credential
+
+        all_cands = resolve_tier_candidates(Tier.MEDIUM)
+    except Exception as exc:   # noqa: BLE001 — never block a job on resolution
+        log_warning(f"codewiki: tier resolution unavailable ({exc}) — using CODEWIKI_* env vars")
+        return None
+
+    usable, rejected = [], []
+    for c in all_cands:
+        provider = _FAMILY_TO_CODEWIKI_PROVIDER.get(c.family)
+        if not provider:
+            rejected.append(f"{c.model_id} ({c.family}: CodeWiki has no such provider)")
+            continue
+        if not (c.base_url or "").strip():
+            rejected.append(f"{c.model_id} ({c.family}: provider has no base_url set)")
+            continue
+        usable.append((c, provider))
+
+    if not usable:
+        log_warning(
+            "codewiki: no model assigned to the 'medium' tier can be used — "
+            + "; ".join(rejected or ["the tier has no candidates"])
+            + ". Falling back to CODEWIKI_MAIN_MODEL / CODEWIKI_BASE_URL. Set the "
+              "provider's Base URL on Admin > LLM Providers (CodeWiki requires one "
+              "for every provider, Anthropic included) to govern CodeWiki from "
+              "Admin > Model Governance instead."
+        )
+        return None
+
+    (main, provider) = usable[0]
+    fallback = usable[1][0] if len(usable) > 1 else main
+
+    try:
+        api_key = resolve_credential(get_provider(main.provider_id) or {}) or ""
+    except Exception:  # noqa: BLE001 — a keyless provider is a normal outcome
+        api_key = ""
+
+    log_info(
+        "codewiki: LLM config resolved from the 'medium' tier",
+        provider=provider,
+        main_model=main.model_id,
+        fallback_model=fallback.model_id,
+        family=main.family,
+    )
+    return {
+        "provider": provider,
+        "base_url": main.base_url.strip(),
+        "api_key": api_key or _CODEWIKI_NO_AUTH_PLACEHOLDER,
+        "main_model": main.model_id,
+        "fallback_model": fallback.model_id,
+    }
+
+
 def _sync_codewiki_config_from_env(log_info, log_warning) -> None:
     """Write the `codewiki` CLI's own persistent config (normally set once,
     interactively, via `codewiki config set`) from this platform's own env
@@ -197,18 +320,30 @@ def _sync_codewiki_config_from_env(log_info, log_warning) -> None:
         the platform's own env (e.g. rotating the LLM API key) takes effect
         on the very next job without needing to restart the worker.
     """
-    base_url = os.getenv("CODEWIKI_BASE_URL")
+    # §N.1 step 6: the tier supplies endpoint, credential and models when the
+    # operator has NOT pinned a model. An explicit CODEWIKI_MAIN_MODEL is a
+    # human decision and still outranks the tier — and because this whole
+    # function is the "configure your LLM a second time" step, skipping the
+    # resolution entirely when it is pinned keeps that path byte-identical.
+    _tier_cfg = None
+    if not (os.getenv("CODEWIKI_MAIN_MODEL") or "").strip():
+        _tier_cfg = _codewiki_llm_from_tier(log_info, log_warning)
+
+    base_url = os.getenv("CODEWIKI_BASE_URL") or (_tier_cfg or {}).get("base_url")
     if not base_url:
         raise RuntimeError(
-            "CODEWIKI_BASE_URL is not set. CodeWiki needs its own "
-            "OpenAI-compatible LLM endpoint -- it does not reuse the "
-            "platform's chat provider key. Set CODEWIKI_BASE_URL (and "
-            "CODEWIKI_API_KEY) in .env and restart, then retry."
+            "CODEWIKI_BASE_URL is not set and no model assigned to the "
+            "'medium' tier has a usable endpoint. CodeWiki needs a base URL "
+            "for every provider it supports (Anthropic included) -- it does "
+            "not reuse the platform's chat provider key. Either set "
+            "CODEWIKI_BASE_URL (and CODEWIKI_API_KEY) in .env and restart, or "
+            "set the provider's Base URL on Admin > LLM Providers."
         )
-    api_key = os.getenv("CODEWIKI_API_KEY")
+    api_key = os.getenv("CODEWIKI_API_KEY") or (_tier_cfg or {}).get("api_key")
     if not api_key:
         raise RuntimeError(
-            "CODEWIKI_API_KEY is not set. CodeWiki needs its own "
+            "CODEWIKI_API_KEY is not set and no credential could be resolved "
+            "for the tier-assigned provider. CodeWiki needs its own "
             "OpenAI-compatible LLM endpoint -- it does not reuse the "
             "platform's chat provider key. Set CODEWIKI_API_KEY (and "
             "CODEWIKI_BASE_URL) in .env and restart, then retry."
@@ -228,22 +363,30 @@ def _sync_codewiki_config_from_env(log_info, log_warning) -> None:
             return default
 
     codewiki_python = os.getenv("CODEWIKI_PYTHON", "/opt/codewiki-python/bin/python3.12")
-    main_model      = os.getenv("CODEWIKI_MAIN_MODEL") or _CODEWIKI_DEFAULT_MAIN_MODEL
-    cluster_model   = os.getenv("CODEWIKI_CLUSTER_MODEL") or _CODEWIKI_DEFAULT_CLUSTER_MODEL
+    _tier_main     = (_tier_cfg or {}).get("main_model", "")
+    _tier_fallback = (_tier_cfg or {}).get("fallback_model", "")
+    main_model      = (os.getenv("CODEWIKI_MAIN_MODEL")
+                       or _tier_main or _CODEWIKI_DEFAULT_MAIN_MODEL)
+    # Clustering has no reason to differ from main generation, which is why
+    # CODEWIKI_CLUSTER_MODEL already defaults to the main model.
+    cluster_model   = (os.getenv("CODEWIKI_CLUSTER_MODEL")
+                       or _tier_main or _CODEWIKI_DEFAULT_CLUSTER_MODEL)
+    fallback_model  = (os.getenv("CODEWIKI_FALLBACK_MODEL")
+                       or _tier_fallback or _CODEWIKI_DEFAULT_FALLBACK_MODEL)
 
     cmd = [
         codewiki_python, "-m", "codewiki", "config", "set",
         "--base-url", base_url,
         "--main-model", main_model,
         "--cluster-model", cluster_model,
-        "--fallback-model", os.getenv("CODEWIKI_FALLBACK_MODEL") or _CODEWIKI_DEFAULT_FALLBACK_MODEL,
+        "--fallback-model", fallback_model,
         "--max-tokens", str(_int_env("CODEWIKI_MAX_TOKENS_FOR_GENERATION", _CODEWIKI_DEFAULT_MAX_TOKENS_FOR_GENERATION)),
         "--max-token-per-module", str(_int_env("CODEWIKI_MAX_TOKEN_PER_MODULE", _CODEWIKI_DEFAULT_MAX_TOKEN_PER_MODULE)),
         "--max-token-per-leaf-module", str(_int_env("CODEWIKI_MAX_TOKEN_PER_LEAF_MODULE", _CODEWIKI_DEFAULT_MAX_TOKEN_PER_LEAF_MODULE)),
         "--max-depth", str(_int_env("CODEWIKI_MAX_DEPTH", _CODEWIKI_DEFAULT_MAX_DEPTH)),
     ]
     cmd += ["--api-key", api_key]
-    provider = os.getenv("CODEWIKI_PROVIDER")
+    provider = os.getenv("CODEWIKI_PROVIDER") or (_tier_cfg or {}).get("provider")
     if provider:
         cmd += ["--provider", provider]
     # CODEWIKI_MAX_TOKENS_FOR_CLUSTERING has no distinct CLI flag in the
@@ -281,10 +424,12 @@ def _sync_codewiki_config_from_env(log_info, log_warning) -> None:
         )
         return
     log_info(
-        "codewiki: synced CLI config from platform env vars",
+        "codewiki: synced CLI config",
+        source="medium tier" if _tier_cfg else "CODEWIKI_* env vars",
         base_url=base_url,
         main_model=main_model,
         cluster_model=cluster_model,
+        fallback_model=fallback_model,
     )
 
 

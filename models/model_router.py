@@ -48,7 +48,7 @@ from typing import List, Optional, Union
 from core.logger import logger
 from core.proxy_tool_use import llm_proxy_headers as _llm_proxy_headers
 # core.tiers is a leaf module (stdlib only) — safe to import at module scope.
-from core.tiers import Tier
+from core.tiers import Tier, governance_enabled as _tiers_governance_enabled
 
 # core.tier_resolver reaches the DB and the registry, so it is imported lazily
 # inside route(). This one constant is duplicated rather than imported to keep
@@ -957,12 +957,13 @@ def _privacy_requires_local(data_classification: Optional[str]) -> bool:
 # The flag is read per call, not at import, so an operator can flip it without
 # a restart and roll back the same way.
 #
-# Read with the same vocabulary as core/config.py::_env_bool and
-# routers/tier_governance_router.py::_governance_active — the three have to
-# agree, or the admin screen would report a state the router is not in.
+# The three readers of this flag have to agree, or the admin screen would
+# report a state the router is not in. Since §N.1 step 6 they agree by
+# construction rather than by comment: core.tiers owns the parse and everyone
+# else — here, routers/tier_governance_router.py, and the step-6 consumers
+# that never touch ModelRouter — delegates to it.
 def _governance_enabled() -> bool:
-    return (os.getenv("TIER_GOVERNANCE_ENABLED") or "").strip().lower() in (
-        "1", "true", "yes", "on")
+    return _tiers_governance_enabled()
 
 
 # Sentinel tier for a decision that came from the resolver. Not one of the

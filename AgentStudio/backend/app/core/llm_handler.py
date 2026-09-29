@@ -259,8 +259,9 @@ def _usage_from_obj(usage_obj: Any) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Model → provider-family classifier
 # ---------------------------------------------------------------------------
-# Mirrors ``services/llm_proxy/main.py::_provider_from_model`` (line 351) so
-# ABStudio and the proxy agree on which family a given id belongs to. Used
+# Prefers the admin-managed registry (§N.1 step 7); the prefix rules are the
+# fallback and still mirror ``services/llm_proxy/main.py::_provider_from_model``
+# (line 351) so ABStudio and the proxy agree on ids neither knows. Used
 # by ``get_llm_client`` to dispatch the right runtime client:
 #   anthropic / openai / gemini → proxy /llm/*-tools-stream
 #   local                       → LiteLLM directly (proxy bypassed)
@@ -279,6 +280,33 @@ def _classify_model(model_name: str) -> str:
     name = (model_name or "").strip().lower()
     if not name:
         return "local"
+
+    # §N.1 step 7 — ask the admin-managed registry FIRST.
+    #
+    # The prefix rules below are a guess about a vendor's naming convention;
+    # llm_models.provider_id is the administrator's statement of fact. Before
+    # this, an operator could register an in-house model on an
+    # OpenAI-compatible provider through Admin > LLM Providers and Agent Studio
+    # would still classify it "local" and talk to LiteLLM directly — bypassing
+    # the proxy, and with it the audit row, the budget gate and the privacy
+    # scrub. A registry row is strictly better evidence than a prefix.
+    try:
+        from core.llm_provider_registry import get_model as _get_registry_model
+
+        _row = _get_registry_model(name)
+        if _row:
+            _family = (_row.get("family") or "").strip().lower()
+            # Registry families are the PROVIDER vocabulary
+            # ("anthropic"/"openai"/"gemini"/"ollama"/…); this function returns
+            # the RUNTIME-CLIENT vocabulary. They mostly coincide, and anything
+            # that isn't a cloud family the proxy serves is a direct-LiteLLM
+            # call, which is what "local" means here.
+            if _family in ("anthropic", "openai", "gemini"):
+                return _family
+            return "local"
+    except Exception:  # noqa: BLE001 — registry unavailable, use the prefixes
+        pass
+
     if name.startswith("claude"):
         return "anthropic"
     if name.startswith("gemini"):

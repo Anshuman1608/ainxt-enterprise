@@ -27,6 +27,7 @@ import traceback
 from typing import Dict, Optional
 
 from core.logger import logger
+from core.tiers import Tier
 from agents.compliance_engine import compliance_engine
 from sandbox.docker_executor import docker_executor
 from models.model_router import model_router
@@ -333,11 +334,16 @@ RULES:
                 repair_prompt += f"\n\n<context>\n{context}\n</context>"
 
             # ====================================================
-            # CALL MODEL ROUTER (Claude/OpenAI/local)
+            # CALL MODEL ROUTER
             # ====================================================
-
+            # Tier.COMPLEX, not a vendor: repairing code the sandbox just
+            # failed to run is agentic code generation, which is COMPLEX's
+            # definition. "solution" named Opus and there is no `solution`
+            # tier in the governed eight — LEGACY_INBOUND_ALIASES already
+            # maps it onto COMPLEX. legacy_hint keeps the governance-off
+            # path on exactly the model this used before.
             healed_code = model_router.generate(
-                repair_prompt, model_hint="solution"
+                repair_prompt, tier=Tier.COMPLEX, legacy_hint="solution"
             )
 
             # Strip any wrapping markdown fence the model added despite the prompt —

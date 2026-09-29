@@ -48,6 +48,8 @@ import httpx
 
 from core.logger import logger
 from core.telemetry import tracer as _tracer
+# core.tiers is a stdlib-only leaf — safe at module scope.
+from core.tiers import Tier
 from models.hybrid_search import pgvector_search, keyword_search, merge_and_rerank
 
 
@@ -57,23 +59,42 @@ from models.hybrid_search import pgvector_search, keyword_search, merge_and_rera
 # router so the answer cache and compliance engine still apply.
 # ---------------------------------------------------------------------------
 
+def _query_expansion_enabled() -> bool:
+    """Whether the two optional LLM retrieval helpers below may run.
+
+    They used to be gated on ``LLM_PROXY_URL`` being set, because they posted
+    to the proxy directly. That was never an intentional switch — it meant a
+    deployment without a proxy (this one) silently had query expansion and
+    multi-query decomposition turned off, and a deployment that configured a
+    proxy for unrelated reasons silently turned them on. Now that both route
+    through ModelRouter, which works either way, the switch has to be its own
+    thing. Default off, so §N.1 step 6 is a strict no-op: these add an LLM
+    call to the retrieval hot path and turning them on is a latency and cost
+    decision, not a migration side effect.
+    """
+    return os.getenv("QUERY_EXPANSION_ENABLED", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _expand_query(question: str) -> str:
     """
     Generate a single rephrased version of *question* for a second retrieval
     pass.  Returns the original question unchanged if expansion fails so the
     caller can always use the returned value safely.
 
-    Routes through the LLM proxy on the LLM proxy server (LLM_PROXY_URL) — never calls
-    the Anthropic SDK directly from the gateway server.
+    Routes through ModelRouter, which owns provider selection, the answer
+    cache and the compliance engine. This used to POST to the LLM proxy with
+    ``{"provider": "claude", "model": cli_model_for_tier("haiku")}`` — a
+    vendor pin, and a dependency on an SDLC CLI helper that quietly coupled
+    retrieval to SDLC_TIER_SIMPLE_MODEL and ENABLE_OPUS. Note also that the
+    proxy accepts only "claude"/"openai"/"gemini" while the registry's
+    families are "anthropic"/"gemini"/"ollama", so forwarding a resolved
+    family here would 400; going through the router avoids needing to know
+    that at all.
     """
-    import json as _json
-    import os as _os
+    if not _query_expansion_enabled():
+        return question
 
-    proxy_url = _os.getenv("LLM_PROXY_URL", "").rstrip("/")
-    if not proxy_url:
-        return question  # proxy not configured — skip expansion silently
-
-    from core.model_registry import cli_model_for_tier
     _system = (
         "Rephrase the following question using different wording to help "
         "retrieve relevant code and documentation chunks. Output ONLY the "
@@ -81,32 +102,18 @@ def _expand_query(question: str) -> str:
     )
     combined_prompt = f"{_system}\n\nQuestion: {question}"
     try:
-        tokens: list[str] = []
-        from core.proxy_tool_use import llm_proxy_headers as _lph
-        with httpx.Client(timeout=httpx.Timeout(15.0, connect=3.0)) as _hc:
-            with _hc.stream(
-                "POST",
-                f"{proxy_url}/llm/generate",
-                json={"provider": "claude", "prompt": combined_prompt, "model": cli_model_for_tier("haiku")},
-                    headers=_lph(),
-            ) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        obj = _json.loads(line)
-                    except _json.JSONDecodeError:
-                        continue
-                    if "t" in obj:
-                        tokens.append(obj["t"])
-
-        rephrased = "".join(tokens).strip()
+        from models.model_router import model_router as _mr
+        rephrased = (_mr.generate(combined_prompt,
+                                  tier=Tier.SIMPLE,
+                                  legacy_hint="haiku") or "").strip()
+        # generate() never raises; it returns "Error: ..." instead.
+        if rephrased.lower().startswith("error"):
+            raise RuntimeError(rephrased[:200])
         if rephrased and rephrased.lower() != question.lower():
-            logger.info(f"Query expansion (proxy): '{rephrased[:80]}'")
+            logger.info(f"Query expansion: '{rephrased[:80]}'")
             return rephrased
     except Exception as e:
-        logger.warning(f"Query expansion (proxy) failed ({e}) — using original query")
+        logger.warning(f"Query expansion failed ({e}) — using original query")
     return question
 
 
@@ -650,12 +657,15 @@ def _hybrid_retrieve_context_inner(
         if is_complex and _has_conjunction and _word_count >= _MULTI_QUERY_MIN_WORDS:
             try:
                 def _decompose_query(q: str) -> list:
-                    """Split a compound question into 2–3 focused sub-queries via LLM."""
+                    """Split a compound question into 2–3 focused sub-queries via LLM.
+
+                    Same migration as _expand_query: through ModelRouter rather
+                    than a direct proxy POST with a "claude" provider pin, and
+                    behind the same explicit switch.
+                    """
                     import json as _jq
-                    proxy_url = os.getenv("LLM_PROXY_URL", "").rstrip("/")
-                    if not proxy_url:
+                    if not _query_expansion_enabled():
                         return []
-                    from core.model_registry import cli_model_for_tier
                     _sys = (
                         "Split the following compound question into 2-3 focused sub-questions. "
                         "Output ONLY a JSON array of strings, e.g. [\"sub-q1\", \"sub-q2\"]. "
@@ -663,20 +673,17 @@ def _hybrid_retrieve_context_inner(
                     )
                     _prompt = f"{_sys}\n\nQuestion: {q}"
                     try:
-                        from core.proxy_tool_use import llm_proxy_headers as _lph
-                        with httpx.Client(timeout=httpx.Timeout(12.0, connect=3.0)) as _hc:
-                            resp = _hc.post(
-                                f"{proxy_url}/llm/generate",
-                                json={"provider": "claude", "prompt": _prompt, "model": cli_model_for_tier("haiku")},
-                                headers=_lph(),
-                            )
-                            resp.raise_for_status()
-                            raw = resp.json().get("text") or resp.text
-                            # Extract JSON array from response
-                            _m = _re_mq.search(r'\[.*?\]', raw, _re_mq.DOTALL)
-                            if _m:
-                                subs = _jq.loads(_m.group())
-                                return [s.strip() for s in subs if isinstance(s, str) and s.strip()]
+                        from models.model_router import model_router as _mr
+                        # Tier.SIMPLE, not MINI: the contract is "output ONLY a
+                        # JSON array", and a tier defined by bounded cost rather
+                        # than by reliable instruction-following would fail it
+                        # silently — this returns [] on a parse miss.
+                        raw = _mr.generate(_prompt, tier=Tier.SIMPLE,
+                                           legacy_hint="haiku") or ""
+                        _m = _re_mq.search(r'\[.*?\]', raw, _re_mq.DOTALL)
+                        if _m:
+                            subs = _jq.loads(_m.group())
+                            return [s.strip() for s in subs if isinstance(s, str) and s.strip()]
                     except Exception as _dqe:
                         logger.debug(f"query decomposition failed: {_dqe}")
                     return []
