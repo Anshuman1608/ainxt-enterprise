@@ -2,6 +2,10 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
+# core.tiers is a stdlib-only leaf (see the header of that module) — importing
+# it here cannot create a cycle back through models/ or db/.
+from core.tiers import Tier
+
 
 @dataclass
 class AgentState:
@@ -19,6 +23,24 @@ class AgentState:
     question: str
     repo_filter: Optional[str] = None
     model_hint: Optional[str] = None   # explicit user model selection ("gpt"|"claude"|None=auto)
+    # ── Governed routing (Phase 6.5, item 1) ─────────────────────────────────
+    # `model_hint` above and `tier` here are NOT two spellings of the same
+    # thing, which is why both exist:
+    #
+    #   model_hint — the USER picked this model from a dropdown. Governance
+    #                must not second-guess it, for the same reason an explicit
+    #                pick is never overridden anywhere else on the platform.
+    #   tier       — the CALLING CODE is declaring what the task needs
+    #                ("complex"), and the administrator's tier assignment
+    #                decides which model answers.
+    #
+    # `legacy_hint` is D15's companion to `tier`: the hint this call site
+    # passed before it was migrated, used whenever governed resolution produces
+    # nothing (flag off, or the tier is unassigned) so the migration is a no-op
+    # on a deployment that has not opted in. Deleted in Phase 10 with the rest
+    # of the legacy chain.
+    tier: Optional[Tier] = None
+    legacy_hint: Optional[str] = None
     raw_question: Optional[str] = None  # bare user question — used for compliance scanning (no history injected)
     mode: Optional[str] = None         # UI surface: None/"chat" (default) | "office" (Cowork — enable connectors + office persona in planner)
 

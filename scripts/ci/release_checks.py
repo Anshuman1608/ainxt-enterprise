@@ -550,11 +550,17 @@ _PHASE6_TIER_HINTS = (
 )
 
 
-# ModelRouter's public entry points — the only calls whose model_hint= is a
-# routing decision this phase is responsible for.
+# ModelRouter's public entry points, plus the one higher-level API that now
+# accepts a tier of its own: agents.orchestrator.OrchestratorAgent.run().
+#
+# `run` is a common method name, so note WHY including it is safe: this check
+# only fires on a call that passes `model_hint=<tier literal>`, and nothing
+# else named run() takes that keyword. It was exempt until Phase 6.5 item 1
+# gave run() a tier= parameter — before that, flagging its callers would have
+# reported them for a gap in the callee with no local fix available.
 _ROUTER_ENTRY_POINTS = frozenset({
     "generate", "async_generate", "stream", "async_stream",
-    "generate_structured", "route",
+    "generate_structured", "route", "run",
 })
 
 
@@ -584,12 +590,10 @@ def check_tier_migration(cfg) -> list[str]:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            # Only ModelRouter's own entry points. `model_hint` is also a
-            # parameter on higher-level APIs that forward it — notably
-            # agents/orchestrator.py's run() — and those are migrated by
-            # extending THEIR signature, which is its own piece of work.
-            # Flagging them here would report the caller for a gap in the
-            # callee and there would be no local fix.
+            # Only the entry points that actually make the routing decision
+            # (see _ROUTER_ENTRY_POINTS). `model_hint` is also a parameter on
+            # APIs that merely forward it, and flagging those would report a
+            # caller for a gap in its callee.
             callee = (node.func.attr if isinstance(node.func, ast.Attribute)
                       else getattr(node.func, "id", ""))
             if callee not in _ROUTER_ENTRY_POINTS:

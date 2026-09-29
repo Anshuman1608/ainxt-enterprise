@@ -62,6 +62,15 @@ MIGRATED: list[tuple[Tier, str, str]] = [
     # medium routing, which is exactly what makes the before/after comparison
     # in that commit meaningful rather than circular.
     (Tier.SIMPLE,  "medium",  "routers/threads_router.py:225 — medium -> simple"),
+
+    # ── Phase 6.5 item 1: the one call site step 4 left behind.
+    # The pair is the same as the orchestrator row above, so this asserts
+    # nothing new about routing. It is here because the file's invariant is
+    # "every (tier, legacy_hint) pair the migration introduces has a row" —
+    # a pair with no row is a pair nobody proved is a no-op, and the next
+    # person reading this list would not know the Cowork path existed.
+    (Tier.COMPLEX, "complex",
+     "workers/cowork_task_worker.py:165 — via agents/orchestrator.py::run()"),
 ]
 
 _IDS = [f"{t.value}<-{h}" for t, h, _ in MIGRATED]

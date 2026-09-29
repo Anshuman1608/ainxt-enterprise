@@ -161,14 +161,26 @@ def run_scheduled_task(payload) -> dict:
     # ── 2. Run SERVER office mode (same entry point as the gateway) ────────────
     try:
         from agents.orchestrator import agent
+        from core.tiers import Tier as _Tier
         _user_ctx = {"user_id": user_id}
         iterator = agent.run(
             framed_question,
             None,                         # repo_filter — office mode is connector/KB scoped
-            # Cowork is cloud-only, Claude-primary (per the Cowork/SDLC model policy:
-            # Claude Sonnet 4.6 primary, never the local in-house model). 'complex'
-            # → Claude Sonnet, the same model the desktop agent uses successfully.
-            model_hint="complex",
+            # Phase 6.5 item 1. This was the one call site §N.1 step 4 left
+            # behind: run() had its own `model_hint` parameter and no tier, so
+            # migrating the caller needed the callee's signature extended
+            # first. It now is.
+            #
+            # Cowork needs a model that can carry a multi-step office task with
+            # a tool catalogue — a capability requirement, which is `complex`.
+            # The original justification was written as a vendor policy
+            # ("Claude Sonnet 4.6 primary, never the local in-house model");
+            # what it was actually asserting is that the weak local model is
+            # not good enough here, and `complex` says that without naming a
+            # vendor. legacy_hint keeps the pre-governance model on any
+            # deployment that has not turned the flag on (D15).
+            tier=_Tier.COMPLEX,
+            legacy_hint="complex",
             request_id=run_id,
             # MUST be the FRAMED question, not the bare prompt. In office mode the
             # final generation prompt is built from `raw_question`

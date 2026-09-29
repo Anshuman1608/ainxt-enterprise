@@ -10,6 +10,9 @@ from typing import Generator, Optional
 
 from core.logger import logger
 from core.telemetry import tracer
+# Module scope, not function scope: run()'s signature annotates `tier` with it.
+# core.tiers is a stdlib-only leaf, so this cannot introduce a cycle.
+from core.tiers import Tier
 from agents.state import AgentState
 
 # Local-filesystem query detector — gates the deterministic local_mcp_call
@@ -281,7 +284,6 @@ User request: {state.question}
 Return JSON array only:"""
 
         try:
-            from core.tiers import Tier
             from models.model_router import model_router
             # Cowork model policy: this planner needs a model that follows a
             # tool catalogue; a weak one ignores it and the planner degrades
@@ -473,7 +475,6 @@ Return JSON array only:"""
             # Phase 6 §N.1 step 3. Short structured planning output, parsed
             # as a JSON array by the caller — `simple` for the same reason
             # the review verdicts are: a parse failure breaks the caller.
-            from core.tiers import Tier
             from models.model_router import model_router
             raw = model_router.generate(
                 prompt, tier=Tier.SIMPLE, legacy_hint="simple").strip()
@@ -576,7 +577,35 @@ Return JSON array only:"""
         compliance_passed: bool = False,
         rag_mode: Optional[str] = None,
         mode: Optional[str] = None,
+        *,
+        tier: Optional[Tier] = None,
+        legacy_hint: Optional[str] = None,
     ) -> Generator[str, None, None]:
+        """Run the agent loop, yielding answer tokens.
+
+        model_hint / tier / legacy_hint — see AgentState. Briefly: `model_hint`
+        is the user's own dropdown pick and is passed straight through;
+        `tier` is a CALLER declaring what the task needs, resolved through the
+        administrator's tier assignments; `legacy_hint` is D15's flag-off
+        companion to `tier`. Keyword-only and enum-typed, exactly as on
+        ModelRouter's six entry points, so the new vocabulary can never collide
+        with the legacy hint strings.
+        """
+        # Mutually exclusive, and loudly so. These two arguments mean opposite
+        # things — "the user chose this model" versus "the application needs
+        # this capability" — so quietly preferring one would be a routing
+        # decision made by argument order, with no log line to find later.
+        # Mirrors ModelRouter._coerce_tier, which raises for the same pair.
+        if tier is not None and model_hint is not None:
+            raise ValueError(
+                "OrchestratorAgent.run: pass either tier= or model_hint=, not "
+                f"both (got tier={tier!r}, model_hint={model_hint!r})"
+            )
+        if legacy_hint is not None and tier is None:
+            raise ValueError(
+                "OrchestratorAgent.run: legacy_hint= requires tier= "
+                f"(got legacy_hint={legacy_hint!r} with no tier)"
+            )
 
         # rag_mode and repo_filter are captured by closures below (L3 memory
         # extraction thread)
@@ -589,6 +618,8 @@ Return JSON array only:"""
             question=question,
             repo_filter=repo_filter,
             model_hint=model_hint,
+            tier=tier,
+            legacy_hint=legacy_hint,
             raw_question=raw_question or question,
             user_ctx=user_ctx,
             messages=messages or [],

@@ -514,9 +514,29 @@ def generate_answer_tool(state, llm) -> Generator[str, None, None]:
                     "(set DOWNGRADE_MODEL to change)", _complexity
                 )
 
-            # Route: Local LLM (simple/general) → GPT-5.2 (medium/code) → Claude (complex)
-            # Honour explicit model_hint from the request; fall back to complexity.
-            _hint = getattr(state, "model_hint", None) or _complexity
+            # ── Which model answers ─────────────────────────────────────────
+            # Three sources, in strict precedence order. The order is the
+            # point: each one overrides the next because it carries more
+            # information about what the caller actually wants.
+            #
+            #   1. model_hint  — the USER picked a model. Never second-guessed.
+            #   2. tier        — the CALLER declared a capability need
+            #                    (Phase 6.5 item 1; today only
+            #                    workers/cowork_task_worker.py). Resolved
+            #                    through the administrator's tier assignments,
+            #                    with legacy_hint as D15's flag-off fallback.
+            #   3. _complexity — the classifier guessed. This branch is
+            #                    UNCHANGED from before Phase 6.5 on purpose:
+            #                    migrating the Chat Auto complexity mapping is
+            #                    §N.1 step 9, not this item.
+            if getattr(state, "model_hint", None):
+                _route_kwargs = {"model_hint": state.model_hint}
+            elif getattr(state, "tier", None) is not None:
+                _route_kwargs = {"tier": state.tier,
+                                 "legacy_hint": getattr(state, "legacy_hint", None)}
+            else:
+                # Route: Local LLM (simple/general) → GPT-5.2 (medium/code) → Claude (complex)
+                _route_kwargs = {"model_hint": _complexity}
 
             # Build proper multi-turn messages list when conversation history exists.
             # This ensures local and cloud models both get real conversation turns
@@ -531,7 +551,7 @@ def generate_answer_tool(state, llm) -> Generator[str, None, None]:
 
             token_yielded = False
             _answer_buf: List[str] = []
-            for _tok in model_router.stream(_stream_payload, model_hint=_hint):
+            for _tok in model_router.stream(_stream_payload, **_route_kwargs):
                 # Skip dict sentinel (see model_router.stream docstring) —
                 # only string tokens are appended to the answer buffer or
                 # yielded downstream to the SSE consumer.
