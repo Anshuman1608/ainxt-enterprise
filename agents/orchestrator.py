@@ -281,12 +281,15 @@ User request: {state.question}
 Return JSON array only:"""
 
         try:
+            from core.tiers import Tier
             from models.model_router import model_router
-            # Cowork model policy: Claude Sonnet primary, never the local "simple"
-            # tier — the simple model errors/ignores the tool catalogue and the
-            # planner falls back to retrieve+generate (so connectors like Outlook
-            # are never called from scheduled tasks / server office mode).
-            raw = model_router.generate(prompt, model_hint="complex").strip()
+            # Cowork model policy: this planner needs a model that follows a
+            # tool catalogue; a weak one ignores it and the planner degrades
+            # to retrieve+generate, so connectors like Outlook are never
+            # called from scheduled tasks / server office mode. That is a
+            # capability requirement, which is `complex`. Phase 6 §N.1 step 3.
+            raw = model_router.generate(
+                prompt, tier=Tier.COMPLEX, legacy_hint="complex").strip()
             logger.info(f"OFFICE PLAN RAW → {raw[:200]}")
             start, end = raw.find("["), raw.rfind("]") + 1
             if start >= 0 and end > start:
@@ -467,8 +470,13 @@ Context already gathered: {len(state.context)} chunks
 Return JSON array only:"""
 
         try:
+            # Phase 6 §N.1 step 3. Short structured planning output, parsed
+            # as a JSON array by the caller — `simple` for the same reason
+            # the review verdicts are: a parse failure breaks the caller.
+            from core.tiers import Tier
             from models.model_router import model_router
-            raw = model_router.generate(prompt, model_hint="simple").strip()
+            raw = model_router.generate(
+                prompt, tier=Tier.SIMPLE, legacy_hint="simple").strip()
             logger.info(f"AGENT PLAN RAW → {raw[:200]}")
 
             # Extract JSON array from response

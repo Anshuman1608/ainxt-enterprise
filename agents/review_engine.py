@@ -182,8 +182,16 @@ class ReviewEngine:
     def _run_review(self, model: str, prompt: str) -> ReviewResult:
         """Run a review prompt on a single model."""
         try:
+            # Phase 6 §N.1 step 3 / §D.2 "Review-engine verdicts" — the
+            # output is JSON parsed by the caller, so a parse failure breaks
+            # the caller outright. Reliability matters more than minimum
+            # cost, which is `simple` rather than `mini`. temperature=0.0 is
+            # unchanged. legacy_hint keeps today's routing with the flag off.
+            from core.tiers import Tier
             from models.model_router import get_router
-            raw = get_router().generate(prompt, model_hint="simple", temperature=0.0).strip()
+            raw = get_router().generate(
+                prompt, tier=Tier.SIMPLE, legacy_hint="simple",
+                temperature=0.0).strip()
 
             # Parse JSON response
             import json
@@ -375,8 +383,16 @@ class ReviewEngine:
                 f"Output ONLY the JSON."
             )
 
+            # Phase 6 §N.1 step 3 / §D.2 "Review-engine verdicts" — the
+            # output is JSON parsed by the caller, so a parse failure breaks
+            # the caller outright. Reliability matters more than minimum
+            # cost, which is `simple` rather than `mini`. temperature=0.0 is
+            # unchanged. legacy_hint keeps today's routing with the flag off.
+            from core.tiers import Tier
             from models.model_router import get_router
-            raw = get_router().generate(prompt, model_hint="simple", temperature=0.0).strip()
+            raw = get_router().generate(
+                prompt, tier=Tier.SIMPLE, legacy_hint="simple",
+                temperature=0.0).strip()
 
             import json as _json
             m = re.search(r'\{.*\}', raw, re.DOTALL)

@@ -957,8 +957,13 @@ async def suggest_cron(
     )
 
     try:
+        # Phase 6 §N.1 step 4 / §D.2 "Cron expression suggestion" — a
+        # syntactically valid cron string is structured output with a strict
+        # format, so correctness is both required and checkable: `simple`.
+        from core.tiers import Tier
         from models.model_router import model_router
-        raw = model_router.generate(prompt, model_hint="simple") or ""
+        raw = model_router.generate(
+            prompt, tier=Tier.SIMPLE, legacy_hint="simple") or ""
     except Exception as exc:
         logger.warning(f"cowork_tasks.suggest_cron: LLM call failed: {exc}")
         raise HTTPException(

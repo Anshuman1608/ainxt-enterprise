@@ -997,6 +997,59 @@ def _warn_env_fallback(legacy_tier: str, reason: object) -> None:
     )
 
 
+# ============================================================
+# MIGRATED CALL SITES  (Phase 6)
+# ============================================================
+#
+# Several §D.2 tasks have a per-feature env var that names a model or a hint
+# — CIL_INTENT_MODEL, DOC_INTENT_MODEL, ENRICH_MODEL. §I.3 replaces each with
+# a tier request while KEEPING the variable as a deprecated override for one
+# release, so an operator who had pinned something does not lose the pin on
+# upgrade. That is three-way logic (override / tier / pre-migration hint) and
+# it should exist once, not once per feature.
+
+_TIER_OVERRIDE_WARNED: set = set()
+
+
+def tier_request(tier: Tier, legacy_hint: str,
+                 override: Optional[str] = None, *,
+                 override_name: str = "") -> dict:
+    """Routing kwargs for a call site migrated to the tier vocabulary.
+
+    Returns a mapping to splat into generate()/stream():
+
+        model_router.generate(prompt, **tier_request(
+            Tier.INTENT_CLASSIFICATION, "local_mini",
+            _INTENT_MODEL, override_name="CIL_INTENT_MODEL"))
+
+    Precedence, highest first:
+
+      1. `override` — a non-blank per-feature env var. The operator named a
+         model explicitly and governance must not second-guess that, for the
+         same reason a user's dropdown pick is not governed. Warned once per
+         variable per process, because it is going away in Phase 8.
+      2. `tier` — the administrator's assignment, when governance is on.
+      3. `legacy_hint` — what this call site passed before it was migrated,
+         used whenever (2) produces nothing. This is D15; see _coerce_tier.
+
+    `legacy_hint` is REQUIRED rather than optional so a migration cannot
+    forget it — the failure it prevents is silent, and a positional argument
+    is the cheapest way to make forgetting impossible.
+    """
+    if override and override.strip():
+        value = override.strip()
+        if override_name and override_name not in _TIER_OVERRIDE_WARNED:
+            _TIER_OVERRIDE_WARNED.add(override_name)
+            logger.warning(
+                "%s=%r is set, so it overrides the %r tier assignment. This "
+                "variable is DEPRECATED — assign a model to %r on Model "
+                "Governance > Tiers and unset it; it is removed in a later "
+                "release.", override_name, value, tier.value, tier.value,
+            )
+        return {"model_hint": value}
+    return {"tier": tier, "legacy_hint": legacy_hint}
+
+
 # Hints that resolve to a specific Gemini model ID. Covers both the well-known
 # literal (used by CLI / IDE clients) and the registry constant (used when an
 # env override changes the resolved ID) — both must reach the same target.
@@ -1798,30 +1851,67 @@ class ModelRouter:
         self._gemini  = None
         logger.info("ModelRouter initialised")
 
-    # ── Tier → legacy hint coercion (Phase 1) ─────────────────
+    # ── Tier → legacy hint coercion (Phase 1; legacy_hint added in Phase 6) ──
     @staticmethod
-    def _coerce_tier(model_hint: Optional[str], tier: Optional[Tier]) -> Optional[str]:
-        """Collapse the `tier=` and `model_hint=` parameters into one hint string.
+    def _coerce_tier(model_hint: Optional[str], tier: Optional[Tier],
+                     legacy_hint: Optional[str] = None) -> Optional[str]:
+        """Collapse `tier=`, `model_hint=` and `legacy_hint=` into one hint string.
 
         Called as the FIRST statement of every public entry point, so that the
         rest of the router keeps seeing exactly the legacy hint it always has.
         `tier=None` (the overwhelmingly common case during Phases 1-5) returns
         `model_hint` untouched — zero behaviour change by construction.
 
-        Raises ValueError when both are supplied. Note that generate() and
-        friends document "never raises": that contract is about RUNTIME LLM
-        failures, which they still convert to an error string. Passing both
-        parameters is a programming error — statically determinable, caught by
-        tests/models/test_tiers.py, and impossible to reach at runtime in a
-        correct call site — so failing loudly is the right behaviour.
+        ── legacy_hint (Phase 6, decision D15) ──────────────────────────────
+        What the call site used to pass, kept alongside the tier it now asks
+        for. The returned hint is only ever CONSUMED when governance is off,
+        or when governed resolution finds nothing — route() already treats the
+        coerced hint as exactly that fallback. So a migrated call site behaves
+        identically to its pre-migration self on any deployment that has not
+        set TIER_GOVERNANCE_ENABLED, and TIER_GOVERNANCE_ENABLED=false stays a
+        working rollback.
+
+        This matters because _TIER_TO_LEGACY_HINT is not a faithful inverse of
+        the migration: Tier.SIMPLE maps to "haiku" (cloud Claude Haiku) while
+        the ~18 call sites becoming Tier.SIMPLE pass model_hint="simple" today,
+        which means the LOCAL model. Without legacy_hint, Phase 6 would move
+        every one of them local -> cloud on deployments that never opted in.
+        Deleted in Phase 10 with the rest of the legacy chain.
+
+        Raises ValueError when both `tier` and `model_hint` are supplied, when
+        `legacy_hint` is supplied without `tier`, or when `legacy_hint` is not
+        a key of _HINT_MAP. Note that generate() and friends document "never
+        raises": that contract is about RUNTIME LLM failures, which they still
+        convert to an error string. All three of these are programming errors
+        — statically determinable, caught by tests/models/test_tiers.py and
+        tests/models/test_legacy_hint_shim.py, and impossible to reach at
+        runtime in a correct call site — so failing loudly is right.
         """
         if tier is None:
+            if legacy_hint is not None:
+                raise ValueError(
+                    "ModelRouter: legacy_hint= requires tier= "
+                    f"(got legacy_hint={legacy_hint!r} with no tier)"
+                )
             return model_hint
         if model_hint is not None:
             raise ValueError(
                 "ModelRouter: pass either tier= or model_hint=, not both "
                 f"(got tier={tier!r}, model_hint={model_hint!r})"
             )
+        if legacy_hint is not None:
+            # Fail on a typo here rather than letting an unrecognised hint slide
+            # through _HINT_MAP's lookup and silently become the medium default
+            # — the whole point of legacy_hint is that it reproduces a SPECIFIC
+            # prior behaviour, and one that quietly does not is worse than none.
+            if legacy_hint not in _HINT_MAP:
+                raise ValueError(
+                    f"ModelRouter: legacy_hint={legacy_hint!r} is not a known "
+                    "routing hint — it must name the hint this call site used "
+                    "BEFORE it was migrated to tier=, so that governance-off "
+                    "behaviour is unchanged."
+                )
+            return legacy_hint
         # Tier(tier) rejects a bare string that is not one of the eight, so a
         # legacy alias like "solution" or "local" can never sneak in this way.
         return _TIER_TO_LEGACY_HINT[Tier(tier)]
@@ -2306,6 +2396,8 @@ class ModelRouter:
               data_classification: Optional[str] = None,
               context_tokens: int = 0,
               *, tier: Optional[Tier] = None,
+              legacy_hint: Optional[str] = None,
+              no_cloud_egress: bool = False,
               distinct_from_family: Optional[str] = None,
               budget_state: Optional[str] = None,
               needs_tools: bool = False,
@@ -2320,10 +2412,20 @@ class ModelRouter:
             the admin's tier assignments directly, which is the only way to
             reach image-output, video-generation or intent-classification —
             they have no legacy hint.
+        legacy_hint: OPTIONAL (Phase 6, D15) the hint this call site passed
+            BEFORE it was migrated to tier=. Used as the fallback whenever the
+            governed path does not produce a model — governance off, or the
+            tier has no eligible assignment — so migrating a call site is a
+            no-op until an operator turns governance on. Requires tier=; must
+            be a known hint. See _coerce_tier.
         data_classification: optional sensitivity tag (PUBLIC/INTERNAL/
             CONFIDENTIAL/RESTRICTED/PCI_SENSITIVE, per core/rag_acl.py). At or
             above CONFIDENTIAL this becomes the no_cloud_egress constraint when
             governance is on, and the historical TIER_SIMPLE pin when it is off.
+        no_cloud_egress: OPTIONAL policy assertion from a caller that knows its
+            content must stay in the estate whatever the turn is labelled
+            (§M.1, and §D.2's memory rows). OR-ed with the classification-
+            derived value; neither can switch the other off.
         context_tokens: optional estimated token footprint of the whole turn.
             Governance on: becomes min_context_window, filtering the requested
             tier's candidates (§M.2). Governance off: promotes to a
@@ -2341,11 +2443,15 @@ class ModelRouter:
         resolution failure degrades to the legacy chain with a warning.
         """
         requested_tier = Tier(tier) if tier is not None else None
-        model_hint = self._coerce_tier(model_hint, tier)
+        model_hint = self._coerce_tier(model_hint, tier, legacy_hint)
         prompt_str = _as_str(prompt)  # routing signals always derived from text
 
         _governed = _governance_enabled()
-        _no_cloud = _privacy_requires_local(data_classification)
+        # §M.1 — two independent ways to require it, one meaning. The
+        # classification is the data talking; the keyword is a caller that
+        # KNOWS its content must stay in the estate regardless of how the turn
+        # happens to be labelled (§D.2's memory rows). Either alone is enough.
+        _no_cloud = _privacy_requires_local(data_classification) or bool(no_cloud_egress)
 
         # §M.2 — the same arithmetic _promote_for_context does, expressed as a
         # filter on the requested tier instead of a switch to a different one.
@@ -3357,7 +3463,8 @@ class ModelRouter:
     # --------------------------------------------------------
 
     def generate_structured(self, blocks: list, model_hint: Optional[str] = None,
-                            *, tier: Optional[Tier] = None) -> str:
+                            *, tier: Optional[Tier] = None,
+                            legacy_hint: Optional[str] = None) -> str:
         """
         Claude-only call with structured content_blocks for block-level prompt caching.
 
@@ -3378,7 +3485,7 @@ class ModelRouter:
         Returns the model's text output (same shape as generate()).
         Never raises — falls back to flat generate() on any error.
         """
-        model_hint = self._coerce_tier(model_hint, tier)
+        model_hint = self._coerce_tier(model_hint, tier, legacy_hint)
         if model_hint is None:
             # Preserves the historical default for callers that pass neither.
             model_hint = "solution"
@@ -3390,7 +3497,9 @@ class ModelRouter:
             return self.generate(flat, model_hint=model_hint)
 
         # Resolve model for the given hint
-        decision = self.route("placeholder", model_hint=model_hint)
+        decision = self.route("placeholder",
+                              model_hint=None if tier is not None else model_hint,
+                              tier=tier, legacy_hint=legacy_hint)
         _model: Optional[str] = None
         if decision.tier == TIER_SOLUTION:
             _model = SOLUTION_MODEL
@@ -3457,7 +3566,9 @@ class ModelRouter:
     def generate(self, prompt, model_hint: Optional[str] = None, return_meta=False,
                  precleared: bool = False, precleared_findings: Optional[list] = None,
                  data_classification: Optional[str] = None,
-                 *, tier: Optional[Tier] = None):
+                 *, tier: Optional[Tier] = None,
+                 legacy_hint: Optional[str] = None,
+                 no_cloud_egress: bool = False):
         """Route prompt to the correct gateway. Never raises — returns error str on failure.
         prompt: str OR list[dict] (multi-turn messages array).
 
@@ -3478,7 +3589,7 @@ class ModelRouter:
             FLOOR pins routing to the local model AND disables cloud fallback in
             _dispatch — restricted data must never egress, even if local is down.
         """
-        model_hint = self._coerce_tier(model_hint, tier)
+        model_hint = self._coerce_tier(model_hint, tier, legacy_hint)
         if not prompt:
             return ""
         try:
@@ -3486,7 +3597,9 @@ class ModelRouter:
             # governance on, route() resolves the Tier directly, and the three
             # modality tiers have no legacy hint to be coerced into.
             decision = self.route(prompt, model_hint=None if tier is not None else model_hint,
-                                  tier=tier, data_classification=data_classification)
+                                  tier=tier, legacy_hint=legacy_hint,
+                                  no_cloud_egress=no_cloud_egress,
+                                  data_classification=data_classification)
         except Exception as exc:
             # Only reachable under no_cloud_egress, which is the one constraint
             # the resolver refuses to degrade around. Returned as a string
@@ -3574,6 +3687,8 @@ class ModelRouter:
             precleared_findings: Optional[list] = None,
             *,
             tier: Optional[Tier] = None,
+            legacy_hint: Optional[str] = None,
+            no_cloud_egress: bool = False,
     ):
         """Route prompt and yield tokens directly (true token streaming).
         prompt: str OR list[dict] (multi-turn messages array).
@@ -3620,7 +3735,7 @@ class ModelRouter:
         Older callers that don't check for it will harmlessly ignore the
         dict (assuming they typecheck or no-op on non-string tokens).
         """
-        model_hint = self._coerce_tier(model_hint, tier)
+        model_hint = self._coerce_tier(model_hint, tier, legacy_hint)
         if not prompt:
             return
         try:
@@ -3628,7 +3743,8 @@ class ModelRouter:
             # so the resolver can drop a candidate whose capabilities say it
             # cannot stream rather than discovering it mid-response.
             decision = self.route(prompt, model_hint=None if tier is not None else model_hint,
-                                  tier=tier, needs_streaming=True)
+                                  tier=tier, legacy_hint=legacy_hint,
+                                  no_cloud_egress=no_cloud_egress, needs_streaming=True)
         except Exception as exc:
             if type(exc).__name__ != "NoEligibleModel":
                 raise
@@ -3677,20 +3793,31 @@ class ModelRouter:
             logger.debug(f"stream() meta sentinel skipped: {_meta_err}")
 
     async def async_generate(self, prompt, model_hint: Optional[str] = None,
-                             *, tier: Optional[Tier] = None) -> str:
+                             *, tier: Optional[Tier] = None,
+                             legacy_hint: Optional[str] = None,
+                             no_cloud_egress: bool = False) -> str:
         """Async route + generate. Uses persistent AsyncClient — no thread held during LLM I/O.
         Falls back to sync generate() when LLM_PROXY_URL is not set (local dev / direct gateway).
         prompt: str OR list[dict] (multi-turn messages array).
         tier: OPTIONAL approved application tier — see generate().
         """
-        model_hint = self._coerce_tier(model_hint, tier)
+        model_hint = self._coerce_tier(model_hint, tier, legacy_hint)
         if not prompt:
             return ""
         proxy = _llm_proxy_url()
         if not proxy:
             # Local dev: no proxy, fall back to sync (run in threadpool via caller)
-            return self.generate(prompt, model_hint=model_hint)
-        decision = self.route(prompt, model_hint=model_hint)
+            return self.generate(prompt,
+                                 model_hint=None if tier is not None else model_hint,
+                                 tier=tier, legacy_hint=legacy_hint,
+                                 no_cloud_egress=no_cloud_egress)
+        # tier= goes to route() as well as being coerced above, for the same
+        # reason generate() does it: the coerced hint is only the FALLBACK, and
+        # the three modality tiers have no legacy hint at all.
+        decision = self.route(prompt,
+                              model_hint=None if tier is not None else model_hint,
+                              tier=tier, legacy_hint=legacy_hint,
+                              no_cloud_egress=no_cloud_egress)
         self._record_selection(decision)
         logger.info(f"ModelRouter.async_generate → {decision.model} (tier={decision.tier})")
         gw_map = {
@@ -3773,6 +3900,8 @@ class ModelRouter:
             conv_id: Optional[str] = None,
             *,
             tier: Optional[Tier] = None,
+            legacy_hint: Optional[str] = None,
+            no_cloud_egress: bool = False,
     ):
         """Async streaming generator — yields str tokens then a sentinel dict.
 
@@ -3790,11 +3919,14 @@ class ModelRouter:
         does not support async_stream() (e.g. local LLM, direct gateway without
         proxy).
         """
-        model_hint = self._coerce_tier(model_hint, tier)
+        model_hint = self._coerce_tier(model_hint, tier, legacy_hint)
         if not prompt:
             return
 
-        decision = self.route(prompt, model_hint=model_hint)
+        decision = self.route(prompt,
+                              model_hint=None if tier is not None else model_hint,
+                              tier=tier, legacy_hint=legacy_hint,
+                              no_cloud_egress=no_cloud_egress, needs_streaming=True)
         self._record_selection(decision)
         logger.info(
             f"ModelRouter.async_stream → {decision.model} (tier={decision.tier})"
@@ -3914,6 +4046,39 @@ class ModelRouter:
 # ============================================================
 
 model_router = ModelRouter()
+
+
+def resolve_media_model(tier: Tier, *, channel: Optional[str] = None):
+    """Resolve an output-modality tier to a concrete model. Never dispatches.
+
+    Phase 6 §N.1 step 5. Image generation and video generation do not go
+    through generate()/stream() at all — they call generate_imagen() and
+    generate_veo_video() on a provider gateway, whose signatures and return
+    types have nothing in common with a text completion. So the thing those
+    call sites need from governance is not a dispatcher, it is an ANSWER:
+    which model, from which family, with which capabilities.
+
+    Returns a core.tier_resolver.ResolvedModel and raises NoEligibleModel
+    when the tier has no eligible assignment. It does NOT fall back to the
+    .env constants, for the reason _NO_ENV_FALLBACK already records: the
+    legacy hint for both tiers is "vision", which ANALYSES an image and
+    cannot make one. Answering "generate a video of a tiger" with a
+    paragraph about tigers is a confusing wrong answer; an error naming the
+    unassigned tier is a fixable one.
+
+    Ignores TIER_GOVERNANCE_ENABLED deliberately. The flag exists so that
+    turning it off restores the previous routing — and the previous routing
+    for these two paths was a hardcoded provider, which is what this
+    replaces. There is no legacy behaviour here worth preserving, only a
+    hardcode worth removing (R3).
+    """
+    from core.tier_resolver import resolve_tier
+    rm = resolve_tier(tier, channel=channel)
+    logger.info(
+        "ModelRouter: %s → %s (%s, priority %d)",
+        tier.value, rm.model_id, rm.provider_slug, rm.priority,
+    )
+    return rm
 
 
 def last_selection_audit() -> dict:

@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 from auth.dependencies import require_admin
 from core.llm_provider_registry import ensure_default_model, invalidate_cache
 from core.logger import logger
+from core.tiers import modality_for_model_id
 from db.database import SessionLocal
 from db.models import LLMProvider, LLMModel
 
@@ -290,7 +291,9 @@ def _run_ollama_pull(provider_id: str, base_url: str, model_id: str, job_id: str
             if not db.query(LLMModel).filter_by(provider_id=provider_id, model_id=model_id).first():
                 db.add(LLMModel(
                     provider_id=provider_id, model_id=model_id, display_name=model_id,
-                    capabilities={"billing_tier": "free"}, enabled=True, source="manual", created_by=created_by,
+                    capabilities={"billing_tier": "free",
+                                  "modality": modality_for_model_id(model_id)},
+                    enabled=True, source="manual", created_by=created_by,
                 ))
                 ensure_default_model(db)
                 db.commit()
@@ -806,6 +809,7 @@ def _upsert_discovered_models(provider: LLMProvider, discovered: List[dict], db:
             merged = {**(m.capabilities or {}), **{k: v for k, v in d["capabilities"].items() if v is not None}}
             # Backfill only. An admin-set value already in `merged` is kept.
             merged.setdefault("privacy_class", _derived_privacy)
+            merged.setdefault("modality", modality_for_model_id(mid))
             if merged != (m.capabilities or {}):
                 m.capabilities = merged
                 updated.append(mid)
@@ -814,6 +818,13 @@ def _upsert_discovered_models(provider: LLMProvider, discovered: List[dict], db:
         else:
             _caps = dict(d["capabilities"] or {})
             _caps.setdefault("privacy_class", _derived_privacy)
+            # No provider's list-models API reports modality, so without this
+            # every discovered row arrives capability-blind and
+            # tier_resolver.modality_of() reads it as text-only — which made
+            # every Claude invisible to image-input and both Veo models
+            # invisible to video-generation. setdefault, so an admin value
+            # and anything discovery DID report both survive.
+            _caps.setdefault("modality", modality_for_model_id(mid))
             db.add(LLMModel(
                 provider_id=provider.id, model_id=mid, display_name=d["display_name"],
                 capabilities=_caps, enabled=True, source="discovered",
@@ -968,6 +979,10 @@ def create_model(
     capabilities = dict(body.capabilities or {})
     if provider.family == "ollama" and "billing_tier" not in capabilities:
         capabilities["billing_tier"] = "free"   # self-hosted — never billable
+    # Same reason as the discovery path: a model added by hand with no
+    # modality would be text-only to the tier resolver and so unofferable
+    # for the three modality tiers. An explicit body.capabilities wins.
+    capabilities.setdefault("modality", modality_for_model_id(body.model_id))
 
     model = LLMModel(
         provider_id=provider_id,

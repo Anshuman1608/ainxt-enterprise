@@ -666,13 +666,49 @@ def chat_generate_image(body: dict, current_user: dict = Depends(get_current_use
     orig_attachment_ids = [
         aid for aid in (body.get("attachment_ids") or []) if aid
     ]
-    # provider is hard-pinned to "gemini" — gemini-3.1-flash-image is the
-    # only image-capable model on the platform. The legacy `provider` /
-    # `selected_model` body keys are silently ignored; the UI no longer
-    # sends them. Kept as a constant local so the downstream
-    # generate_imagen() signature (which still accepts provider=) stays
-    # untouched.
-    provider = "gemini"
+    # ── Which provider generates the image ─────────────────────────────────
+    #
+    # Phase 6 §N.1 step 5 / §F "Image generation". This was hard-pinned to
+    # "gemini", justified by a comment claiming gemini-3.1-flash-image was
+    # "the only image-capable model on the platform" — stale even when it was
+    # written, since gateway_openai.generate_image() exists and the proxy
+    # already falls back to it. That is exactly the provider hardcode R3
+    # tracks.
+    #
+    # The image-output tier now decides. An administrator assigns a model on
+    # Model Governance > Tiers and its provider family is what runs first;
+    # the proxy's own gemini -> openai fallback is unchanged underneath.
+    #
+    # HONEST LIMIT: the proxy's /llm/imagen contract carries a provider but
+    # not a model id, so the concrete SKU within the family is still chosen
+    # inside services/llm_proxy. Threading it through is a proxy change, and
+    # plan.html scopes proxy work out of this phase (U2). What the tier
+    # controls today is the FAMILY and the audit label; what it does not yet
+    # control is which Gemini image model the proxy picks.
+    from core.tiers import Tier as _ImgTier
+    from core.tier_resolver import NoEligibleModel as _ImgNoEligible
+    from models.model_router import resolve_media_model as _img_resolve
+
+    try:
+        _img_rm = _img_resolve(_ImgTier.IMAGE_OUTPUT)
+    except _ImgNoEligible as _img_exc:
+        logger.error(f"chat_router: image-output unassigned — {_img_exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="No model is assigned to the 'image-output' tier. An "
+                   "administrator must assign one on "
+                   "Model Governance > Tiers.",
+        )
+    provider = _img_rm.family
+    _img_tier_model = _img_rm.model_id
+    if provider not in ("gemini", "openai"):
+        raise HTTPException(
+            status_code=503,
+            detail=f"model {_img_tier_model!r} is assigned to the "
+                   f"'image-output' tier, but its provider family "
+                   f"({provider!r}) has no image-generation gateway on this "
+                   f"platform.",
+        )
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
     user_id = current_user.get("sub") or current_user.get("user_id", "")
@@ -898,8 +934,12 @@ def chat_generate_image(body: dict, current_user: dict = Depends(get_current_use
     # The chat router itself never hardcodes a model id; it just relays
     # what the gateway/proxy reported. Fall back to the registry default
     # only on very old proxy builds that didn't populate the meta dict.
-    from core.model_registry import GEMINI_IMAGE_MODEL as _GEMINI_IMAGE_MODEL
-    _model_label     = _img_meta.get("model")    or _GEMINI_IMAGE_MODEL
+    # The proxy reports the model that ACTUALLY ran (post its own internal
+    # fallback), which is the right thing to bill and audit. Only when it
+    # reports nothing do we fall back — now to the tier's assignment rather
+    # than to GEMINI_IMAGE_MODEL, which would misreport the model on a
+    # deployment whose image-output tier is not Gemini at all.
+    _model_label     = _img_meta.get("model")    or _img_tier_model
     _actual_provider = _img_meta.get("provider") or provider
 
     # Compute cost based on which model ACTUALLY ran:
@@ -1217,17 +1257,72 @@ def chat_generate_video(
         current_user: dict = Depends(get_current_user),
 ):
     """Generate a short Veo 3.1 video. See banner above for gating policy."""
+    # VEO_ENABLED and is_veo_allowed_for_user() stay: one is an ops
+    # kill-switch and the other is per-user access control. Neither is model
+    # selection, so neither is part of the tier migration (§F).
     from core.model_registry import (
-        VEO_ENABLED, VEO_COST_PER_SECOND, is_veo_allowed_for_user, veo_model as _veo_model,
+        VEO_ENABLED, VEO_COST_PER_SECOND, is_veo_allowed_for_user,
     )
     from middleware.client_source_middleware import CLIENT_PLATFORM
 
-    # Resolved once up front (env override → an enabled "gemini" registry model
-    # tagged "video" → "") and reused for the budget check below, the actual
-    # dispatch call, the audit row, and the response payload — previously each
-    # of those independently read the raw VEO_MODEL constant, which is blank on
-    # a deployment configured purely through the admin "LLM Providers" screen.
-    resolved_veo_model = _veo_model()
+    # ── Which model, and which family serves it ────────────────────────────
+    #
+    # Phase 6 §N.1 step 5 / §F "Video generation". Resolved once up front and
+    # reused for the budget check below, the dispatch call, the audit row and
+    # the response payload.
+    #
+    # The video-generation TIER is authoritative: an administrator assigns a
+    # model to it on Model Governance > Tiers, and that is what runs. VEO_MODEL
+    # remains as a deprecated override for one release (§I.3) — note it must be
+    # genuinely unset for the tier to win, which is why its docker-compose
+    # default is now bare rather than a pinned SKU.
+    #
+    # When the tier is unassigned AND there is no override, this fails with a
+    # 503 that names the tier rather than degrading: video-generation is in
+    # _NO_ENV_FALLBACK precisely because every fallback available to it returns
+    # text, and answering a video request with prose is worse than an error.
+    from core.tiers import Tier as _Tier
+    from core.model_registry import VEO_MODEL as _VEO_MODEL_OVERRIDE
+
+    _veo_family = "gemini"
+    _veo_caps: dict = {}
+    if (_VEO_MODEL_OVERRIDE or "").strip():
+        resolved_veo_model = _VEO_MODEL_OVERRIDE.strip()
+        logger.warning(
+            "VEO_MODEL=%r is set, so it overrides the 'video-generation' tier "
+            "assignment. This variable is DEPRECATED — assign a model to "
+            "video-generation on Model Governance > Tiers and unset it.",
+            resolved_veo_model,
+        )
+    else:
+        from core.tier_resolver import NoEligibleModel as _NoEligibleModel
+        from models.model_router import resolve_media_model as _resolve_media
+        try:
+            _veo_rm = _resolve_media(_Tier.VIDEO_GENERATION)
+        except _NoEligibleModel as _veo_exc:
+            logger.error(f"chat_router: video-generation unassigned — {_veo_exc}")
+            raise HTTPException(
+                status_code=503,
+                detail="No model is assigned to the 'video-generation' tier. "
+                       "An administrator must assign one on "
+                       "Model Governance > Tiers.",
+            )
+        resolved_veo_model = _veo_rm.model_id
+        _veo_family = _veo_rm.family
+        _veo_caps = _veo_rm.capabilities or {}
+
+    # Only the gemini family has a video-generation gateway on this platform.
+    # An administrator CAN assign something else to the tier, so refuse here —
+    # up front, before the budget is checked and outside the try/except around
+    # the dispatch, which rewrites every exception into a generic 502.
+    if _veo_family != "gemini":
+        raise HTTPException(
+            status_code=503,
+            detail=f"model {resolved_veo_model!r} is assigned to the "
+                   f"'video-generation' tier, but its provider family "
+                   f"({_veo_family!r}) has no video-generation gateway on "
+                   f"this platform.",
+        )
 
     # Gate 1: chat-UI-only. CLI/IDE that craft this POST directly get 403.
     if getattr(request.state, "client_source", CLIENT_PLATFORM) != CLIENT_PLATFORM:
@@ -1275,10 +1370,21 @@ def chat_generate_video(
     # allocation. Unlike text/image flows, we do NOT fail-open here — if the
     # budget store is unreachable, deny the request. The per-call $ blast radius
     # is too high to allow silent passthrough.
-    # Per-second rate is a flat platform constant, not keyed by which Veo model
-    # variant is actually dispatched — resolved_veo_model (used below for the
-    # dispatch call, audit row, and response payload) is a separate concern.
-    cost_usd = duration_secs * float(VEO_COST_PER_SECOND)
+    # Per-second rate comes from the model's own capabilities where the
+    # registry declares one (§I.4 — a rate is metadata about a model, not
+    # configuration of the platform), falling back to the flat
+    # VEO_COST_PER_SECOND constant. Two Veo variants at different prices used
+    # to bill identically, because the constant could not tell them apart.
+    try:
+        _rate = float(_veo_caps.get("cost_per_second") or VEO_COST_PER_SECOND)
+    except (TypeError, ValueError):
+        logger.warning(
+            "chat_router: model %r declares a non-numeric cost_per_second "
+            "(%r) — using VEO_COST_PER_SECOND",
+            resolved_veo_model, _veo_caps.get("cost_per_second"),
+        )
+        _rate = float(VEO_COST_PER_SECOND)
+    cost_usd = duration_secs * _rate
     try:
         from store.budget_store import (
             check_budget, get_budget, get_usage_total,

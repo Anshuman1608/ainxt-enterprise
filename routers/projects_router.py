@@ -352,8 +352,10 @@ def ask_project(
         except Exception as e:
             logger.warning(f"ProjectAsk: orchestrator failed — falling back to GPT direct: {e}")
             try:
+                from core.tiers import Tier
                 from models.model_router import model_router as _fallback_mr
-                for _token in _fallback_mr.stream(orch_question, model_hint="medium"):
+                for _token in _fallback_mr.stream(orch_question, tier=Tier.MEDIUM,
+                                                  legacy_hint="medium"):
                     # Skip dict sentinel (see model_router.stream docstring)
                     if isinstance(_token, dict):
                         continue

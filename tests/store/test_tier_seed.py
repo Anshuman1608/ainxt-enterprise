@@ -317,6 +317,16 @@ def test_resolved_tiers_match_todays_effective_resolution(db):
     no configured provider — there is nothing to drift from, and the seed's
     registry-default fallback (text tiers) or `unassigned` (modality tiers)
     applies instead. Those cases are covered by the seed tests above.
+
+    ── Scope: SEEDED assignments only ──────────────────────────────────────
+    The guarantee is about an UPGRADE: install the new version, change
+    nothing, and routing is what it was. Once an operator edits a tier on the
+    §J.2 screen, divergence from the .env constants is the feature working,
+    not drift — that is the entire point of Phase 4. `created_by` tells the
+    two apart: the seeder writes `'migration'` or NULL, the admin API writes
+    the acting user's id. An admin-written tier is skipped rather than
+    failed, and `compared > 0` below still makes sure the test cannot quietly
+    skip everything and pass for free.
     """
     import core.model_registry as reg
     from core.tier_resolver import NoEligibleModel, modality_of, resolve_tier
@@ -338,8 +348,18 @@ def test_resolved_tiers_match_todays_effective_resolution(db):
         "WHERE m.enabled = TRUE AND p.enabled = TRUE"
     )).all())
 
-    compared = 0
+    admin_edited = {
+        row[0] for row in db.execute(text(
+            "SELECT DISTINCT tier FROM llm_tier_models "
+            "WHERE created_by IS NOT NULL AND created_by <> 'migration'"
+        )).all()
+    }
+
+    compared = skipped_admin = 0
     for tier, (env_value, family, tag) in legacy.items():
+        if tier.value in admin_edited:
+            skipped_admin += 1
+            continue                       # operator's choice, not drift
         want = (reg._role_model(env_value, family, tag) or "").strip()
         if not want or want not in caps_by_model:
             continue                       # nothing to drift from
@@ -358,6 +378,8 @@ def test_resolved_tiers_match_todays_effective_resolution(db):
         compared += 1
 
     assert compared > 0, (
-        "no tier could be compared — the registry has no model the legacy "
-        "chain resolves to, so this test proved nothing"
+        "no tier could be compared — either the registry has no model the "
+        "legacy chain resolves to, or every tier has been reassigned by an "
+        f"administrator ({skipped_admin} skipped). Either way this test "
+        "proved nothing; re-run it against a freshly seeded database."
     )

@@ -52,9 +52,20 @@ DIGEST_TYPE_HOD     = "hod"
 DIGEST_TYPE_MANAGER = "manager"
 
 # ── Configuration ─────────────────────────────────────────────────────────
-# May be a raw model ID (e.g. "claude-sonnet-4-6", "gpt-5.4") OR a tier alias
-# (e.g. "sonnet", "claude", "medium", "simple"). Both forms are honoured by
-# models.model_router via its _HINT_MAP.
+# May be one of the eight governed TIER names (see core.tiers), a raw model ID
+# (e.g. "claude-sonnet-4-6"), or a legacy router alias.
+#
+# Phase 6 §N.1 step 4 / §F. The "tier alias OR raw id" form was a
+# tier-creation escape hatch: "sonnet" and "claude" are vendor aliases that
+# _HINT_MAP happened to accept, so this variable could name a NINTH tier that
+# exists nowhere else. It now resolves through the eight-name vocabulary when
+# it names a tier, and stays a user-explicit model pick when it names a model
+# — which is the same split the chat model picker uses.
+#
+# BLANK STILL MEANS "no LLM at all": the deterministic fallback runs and no
+# model is billed. That is deliberate and unchanged — turning digest LLM
+# inference on for every deployment that never configured it is exactly the
+# R2 cost surprise this migration is supposed to make visible, not cause.
 HOD_STATEMENT_LLM_MODEL = os.getenv("HOD_STATEMENT_LLM_MODEL", "").strip()
 _IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
@@ -260,10 +271,29 @@ def _call_llm_for_inferences(
         # gateway failure), so we wrap it in a thread+timeout to honour the
         # spec's 30-s hard cap regardless of the gateway's own timeout.
         from models.model_router import model_router
+        from core.tiers import Tier
+
+        # A configured TIER routes through the administrator's assignment; a
+        # configured MODEL ID is a deliberate pin and is passed through
+        # untouched. legacy_hint is the value itself, so governance-off
+        # behaviour is byte-identical to before (D15).
+        #
+        # Only the four TEXT tiers are accepted by name. The modality tiers
+        # cannot serve a text digest, and they have no legacy hint to fall
+        # back to — naming one here should read as a model id and fail
+        # visibly rather than resolve to something that returns an image.
+        _TEXT_TIERS = {t.value: t for t in
+                       (Tier.MINI, Tier.SIMPLE, Tier.MEDIUM, Tier.COMPLEX)}
+        if effective_model in _TEXT_TIERS:
+            _route_kw = {"tier": _TEXT_TIERS[effective_model],
+                         "legacy_hint": effective_model}
+        else:
+            _route_kw = {"model_hint": effective_model}
 
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTE
         with ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(model_router.generate, messages, effective_model)
+            future = ex.submit(
+                lambda: model_router.generate(messages, **_route_kw))
             try:
                 raw = future.result(timeout=_LLM_TIMEOUT_SECS) or ""
             except _FTE:

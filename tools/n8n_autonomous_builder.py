@@ -28,6 +28,7 @@ def generate_workflow_definition(task_description: str) -> dict:
     from a plain-English task description.
     Raises ValueError if the LLM output cannot be parsed as JSON.
     """
+    from core.tiers import Tier
     from models.model_router import model_router
 
     prompt = f"""You are an expert n8n automation engineer.
@@ -47,7 +48,8 @@ Requirements:
 Return ONLY valid JSON — no markdown, no explanation, no code fences.
 """
 
-    response = model_router.generate(prompt, model_hint="complex")
+    response = model_router.generate(prompt, tier=Tier.COMPLEX,
+                                     legacy_hint="complex")
 
     # Strip markdown code fences if present
     text = (response or "").strip()

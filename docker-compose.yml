@@ -62,6 +62,16 @@ x-worker-env: &worker-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
   GEMINI_API_KEY:    ${GEMINI_API_KEY:-}
+  # Tier governance (Phase 5) — see the gateway service for what this does.
+  # The worker pools run agents and SDLC stages through the same ModelRouter,
+  # so a flag set only on the gateway would give one answer in Chat and a
+  # different one in a background job.
+  TIER_GOVERNANCE_ENABLED: ${TIER_GOVERNANCE_ENABLED:-false}
+  # Residency policy for long-lived memory (Phase 6 §D.2 / §M.1). Off by
+  # default: a deployment that never had the constraint does not acquire
+  # one. Lives alongside the governance flag because the same ModelRouter
+  # in the worker pools writes memory too.
+  MEMORY_NO_CLOUD_EGRESS: ${MEMORY_NO_CLOUD_EGRESS:-false}
   OPENAI_BASE_URL:       ${OPENAI_BASE_URL:-https://api.openai.com/v1}
   OPENAI_SIMPLE_MODEL:   ${OPENAI_SIMPLE_MODEL:-gpt-5-mini}
   OPENAI_CODING_MODEL:   ${OPENAI_CODING_MODEL:-gpt-5.4}
@@ -78,7 +88,9 @@ x-worker-env: &worker-env
   GEMINI_IMAGE_MODEL:       ${GEMINI_IMAGE_MODEL:-gemini-3.1-flash-image}
   GEMINI_VISION_MODEL:      ${GEMINI_VISION_MODEL:-gemini-3.5-flash}
   VEO_ENABLED:           ${VEO_ENABLED:-false}
-  VEO_MODEL:             ${VEO_MODEL:-veo-3.1-generate-preview}
+  # DEPRECATED override for the `video-generation` tier (Phase 6
+  # §N.1 step 5). No default, for the same reason as CIL_INTENT_MODEL.
+  VEO_MODEL:             ${VEO_MODEL:-}
   ENABLE_INJECTION_SCAN: ${ENABLE_INJECTION_SCAN:-false}
   INJECTION_SCAN_URL:    ${INJECTION_SCAN_URL:-}
   AINXT_DOC_STORAGE_DIR: /var/lib/ainxt/docs
@@ -280,6 +292,19 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
       GEMINI_API_KEY:    ${GEMINI_API_KEY:-}
+      # Tier governance (Phase 5). OFF: models are chosen by the
+      # OPENAI_*/CLAUDE_*/GEMINI_* constants below, as they always have been.
+      # ON: by the assignments in Admin -> Model Governance -> Tiers, with
+      # those constants as a logged fallback. Must be listed here explicitly —
+      # `environment:` is an allow-list, so setting it in .env alone has no
+      # effect on a Docker deployment and the admin screen would keep
+      # reporting "not yet routing" with no way to change that.
+      TIER_GOVERNANCE_ENABLED: ${TIER_GOVERNANCE_ENABLED:-false}
+      # Residency policy for long-lived memory (Phase 6 §D.2 / §M.1). Off by
+      # default: a deployment that never had the constraint does not acquire
+      # one. Lives alongside the governance flag because the same ModelRouter
+      # in the worker pools writes memory too.
+      MEMORY_NO_CLOUD_EGRESS: ${MEMORY_NO_CLOUD_EGRESS:-false}
       # Model routing is configured in .env, but compose's `environment:` is an
       # explicit allow-list — without these the container silently falls back to
       # the defaults in core/model_registry.py and .env has no effect.
@@ -302,7 +327,9 @@ services:
       GEMINI_IMAGE_MODEL:       ${GEMINI_IMAGE_MODEL:-gemini-3.1-flash-image}
       GEMINI_VISION_MODEL:      ${GEMINI_VISION_MODEL:-gemini-3.5-flash}
       VEO_ENABLED:           ${VEO_ENABLED:-false}
-      VEO_MODEL:             ${VEO_MODEL:-veo-3.1-generate-preview}
+      # DEPRECATED override for the `video-generation` tier (Phase 6
+      # §N.1 step 5). No default, for the same reason as CIL_INTENT_MODEL.
+      VEO_MODEL:             ${VEO_MODEL:-}
       EVAL_ENABLED:          ${EVAL_ENABLED:-true}
       # Claude model ids — same gap as the worker anchor: undeclared here means
       # the gateway's /ainxt/v1/api/models list and core/model_registry.py
@@ -313,7 +340,12 @@ services:
       ENABLE_OPUS:          ${ENABLE_OPUS:-true}
       # cil/intent.py's model hint for the CIL intent classifier — same
       # explicit-allow-list gap as the vars above. Defaults to "local_mini".
-      CIL_INTENT_MODEL:     ${CIL_INTENT_MODEL:-local_mini}
+      # Phase 6 §N.1 step 2 — DEPRECATED override for the
+      # `intent-classification` tier. Deliberately has NO default: `:-`
+      # substitutes on empty as well as unset, so a pinned default here would
+      # beat the administrator's tier assignment on every request and the
+      # Tiers screen would silently control nothing.
+      CIL_INTENT_MODEL:     ${CIL_INTENT_MODEL:-}
       AINXT_DOC_STORAGE_DIR: /var/lib/ainxt/docs
       # Encrypts store/credential_vault.py (LLM provider API keys added via the
       # "LLM Providers" admin screen, OAuth connector tokens, etc.). This block
@@ -514,6 +546,19 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
       GEMINI_API_KEY:    ${GEMINI_API_KEY:-}
+      # Tier governance (Phase 5). OFF: models are chosen by the
+      # OPENAI_*/CLAUDE_*/GEMINI_* constants below, as they always have been.
+      # ON: by the assignments in Admin -> Model Governance -> Tiers, with
+      # those constants as a logged fallback. Must be listed here explicitly —
+      # `environment:` is an allow-list, so setting it in .env alone has no
+      # effect on a Docker deployment and the admin screen would keep
+      # reporting "not yet routing" with no way to change that.
+      TIER_GOVERNANCE_ENABLED: ${TIER_GOVERNANCE_ENABLED:-false}
+      # Residency policy for long-lived memory (Phase 6 §D.2 / §M.1). Off by
+      # default: a deployment that never had the constraint does not acquire
+      # one. Lives alongside the governance flag because the same ModelRouter
+      # in the worker pools writes memory too.
+      MEMORY_NO_CLOUD_EGRESS: ${MEMORY_NO_CLOUD_EGRESS:-false}
       # Model routing is configured in .env, but compose's `environment:` is an
       # explicit allow-list — without these the container silently falls back to
       # the defaults in core/model_registry.py and .env has no effect.
@@ -536,7 +581,9 @@ services:
       GEMINI_IMAGE_MODEL:       ${GEMINI_IMAGE_MODEL:-gemini-3.1-flash-image}
       GEMINI_VISION_MODEL:      ${GEMINI_VISION_MODEL:-gemini-3.5-flash}
       VEO_ENABLED:           ${VEO_ENABLED:-false}
-      VEO_MODEL:             ${VEO_MODEL:-veo-3.1-generate-preview}
+      # DEPRECATED override for the `video-generation` tier (Phase 6
+      # §N.1 step 5). No default, for the same reason as CIL_INTENT_MODEL.
+      VEO_MODEL:             ${VEO_MODEL:-}
       ENABLE_INJECTION_SCAN: ${ENABLE_INJECTION_SCAN:-false}
       INJECTION_SCAN_URL: ${INJECTION_SCAN_URL:-}
       AINXT_DOC_STORAGE_DIR: /var/lib/ainxt/docs

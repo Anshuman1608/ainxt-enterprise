@@ -45,8 +45,16 @@ def classify_intent(question: str) -> str:
             question=question
         )
 
+        # Phase 6 §N.1 step 2 / §D.2 — one label from a two-value
+        # vocabulary, which is what intent-classification names. Grouped with
+        # the CIL classifier so a single admin setting governs the latency and
+        # cost of every classification the platform does. legacy_hint keeps
+        # the pre-migration local routing with governance off (D15).
+        from core.tiers import Tier
         from models.model_router import model_router
-        raw = model_router.generate(prompt, model_hint="simple").strip().upper()
+        raw = model_router.generate(
+            prompt, tier=Tier.INTENT_CLASSIFICATION, legacy_hint="simple",
+        ).strip().upper()
 
         if raw == "CODE":
             intent = "code"

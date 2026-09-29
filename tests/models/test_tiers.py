@@ -46,6 +46,20 @@ from models.model_router import (
     ModelRouter,
 )
 
+
+@pytest.fixture(autouse=True)
+def _governance_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin TIER_GOVERNANCE_ENABLED off for this whole module.
+
+    Everything here describes the coercion layer — what a legacy hint and a
+    `tier=` kwarg mean BEFORE the resolver gets involved. Phase 5 made that
+    conditional on the flag, and a developer whose .env turns governance on
+    would otherwise watch every assertion here fail for a reason that has
+    nothing to do with what the test is about. Same fixture, same reason, as
+    tests/router_policy/test_privacy_floor_live.py.
+    """
+    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
+
 # The eight approved tiers, spelled out rather than derived from the enum, so
 # that a careless edit to core.tiers fails here instead of silently redefining
 # the platform's vocabulary.
@@ -316,24 +330,70 @@ def test_note_legacy_alias_never_raises() -> None:
     note_legacy_alias(None, surface="cli")  # type: ignore[arg-type]
 
 
-def test_no_production_call_site_passes_tier() -> None:
-    """``tier=`` must remain unused outside tests until Phase 6.
+# Tiers with no legacy equivalent, so no legacy_hint to give. Their Phase-1
+# entries in _TIER_TO_LEGACY_HINT are explicitly labelled stubs — image-output
+# and video-generation both map onto "vision", which analyses images and
+# cannot make one. A call site asking for these is new behaviour by
+# definition, not a migrated one, so D15 has nothing to preserve.
+_NO_LEGACY_EQUIVALENT = {"IMAGE_INPUT", "IMAGE_OUTPUT", "VIDEO_GENERATION"}
 
-    The resolver that gives a tier its real meaning does not exist until
-    Phase 3; a call site adopting the vocabulary early would silently get the
-    Phase-1 stub mapping instead.
+
+def test_every_production_tier_call_carries_its_legacy_hint() -> None:
+    """Phase 6 / D15 — migrating a call site must not change what it does.
+
+    This replaces the Phase-1 guard that asserted `tier=` was unused in
+    production code. Phase 6 is the phase that makes it used, so the question
+    changed from "is anyone passing a tier?" to "is anyone passing one
+    WITHOUT saying what it used to do?".
+
+    Why that matters: `_TIER_TO_LEGACY_HINT` is not the inverse of the
+    migration. `Tier.SIMPLE` coerces to "haiku" — cloud Claude Haiku — while
+    the call sites becoming `Tier.SIMPLE` pass model_hint="simple" today,
+    which is the LOCAL model. A migration that forgets `legacy_hint` silently
+    moves that call site local -> cloud on every deployment that has not
+    opted into governance, and TIER_GOVERNANCE_ENABLED=false stops being a
+    rollback. The three modality tiers are exempt: they have no legacy
+    behaviour to preserve.
+
+    AST rather than regex, because these calls span several lines and a
+    keyword can sit anywhere in the argument list.
     """
+    import ast
     import pathlib
-    import re
 
     root = pathlib.Path(__file__).resolve().parents[2]
-    skip = {"tests", "venv", ".git", "node_modules", "AgentStudio"}
-    pattern = re.compile(r"\btier\s*=\s*Tier\.")
+    skip = {"tests", "venv", ".git", "node_modules", "AgentStudio", "build", "dist"}
+    # The router IS the mechanism — it forwards `tier=tier` between its own
+    # entry points, which is plumbing rather than a call site.
+    self_exempt = {"models/model_router.py"}
 
-    offenders = [
-        str(path.relative_to(root))
-        for path in root.rglob("*.py")
-        if not skip & set(path.relative_to(root).parts)
-        and pattern.search(path.read_text(encoding="utf-8", errors="ignore"))
-    ]
-    assert not offenders, f"tier= used in production code before Phase 6: {offenders}"
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
+        if skip & set(rel.parts) or str(rel) in self_exempt:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+        except SyntaxError:                       # pragma: no cover - vendored
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            kw = {k.arg: k.value for k in node.keywords if k.arg}
+            tier_arg = kw.get("tier")
+            # Only a literal `Tier.X` is a migrated call site; `tier=tier` is
+            # a passthrough in a helper and is checked at ITS call sites.
+            if not (isinstance(tier_arg, ast.Attribute)
+                    and isinstance(tier_arg.value, ast.Name)
+                    and tier_arg.value.id == "Tier"):
+                continue
+            if tier_arg.attr in _NO_LEGACY_EQUIVALENT:
+                continue
+            if "legacy_hint" not in kw:
+                offenders.append(f"{rel}:{node.lineno} tier=Tier.{tier_arg.attr}")
+
+    assert not offenders, (
+        "these call sites request a tier without declaring what they did "
+        "before, so turning governance off no longer restores their previous "
+        "model (D15):\n  " + "\n  ".join(offenders)
+    )

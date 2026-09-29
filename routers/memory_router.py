@@ -20,28 +20,37 @@ router = APIRouter(prefix="/memory", tags=["memory"])
 # raw model id always renders as the same display label on every tab. This
 # used to be two independently-maintained near-copies (~200 lines apart)
 # that had already drifted — e.g. only one of them matched "gpt5-mini".
+#
+# Phase 6 §N.1 step 1 (plan.html §Q.3, "Memory — display labels"). The old
+# body was a substring ladder over ~12 vendor SKUs with two defects the
+# registry fixes outright:
+#
+#   * every UNKNOWN model, and every "auto"/"unknown" row, rendered as the
+#     literal "Ollama local (llama3.1)" — so a deployment with no Ollama at
+#     all labelled its analytics after a model it has never run;
+#   * the labels were frozen SKU strings, so a newly-registered model was
+#     reported under whichever older name its id happened to contain
+#     ("claude-sonnet-5" matched the "claude" arm and displayed as "Claude").
+#
+# llm_models.display_name is the field that exists to answer this, and it is
+# what the admin already edits on the Providers screen. The prefix ladder is
+# NOT retained as a fallback the way core/proxy_tool_use.py retains its one:
+# there, a wrong answer is a mispriced call; here it is a label, and the raw
+# id is a more honest label than a confidently wrong SKU name.
 def _norm_model(raw: str) -> str:
     if not raw or raw in ("auto", "unknown", ""):
-        return "Ollama local (llama3.1)"
-    m = raw.lower()
-    if "llama" in m or "ollama" in m or "local" in m:
-        return "Ollama local (llama3.1)"
-    if "gpt-5-mini" in m or "gpt5-mini" in m:
-        return "GPT-5 Mini"
-    if "gpt-5-5" in m:
-        return "GPT-5-5 (Latest)"
-    if "gpt-5.4" in m or "gpt-5" in m or "gpt5" in m:
-        return "GPT-5.4"
-    if "claude" in m and ("opus" in m) and ("4-7" in m or "4.7" in m):
-        return "Claude Opus 4.7"
-    if "claude" in m and ("opus" in m) and ("4-6" in m or "4.6" in m):
-        return "Claude Opus 4.6"
-    if "claude" in m and ("sonnet" in m or "4-6" in m or "4.6" in m):
-        return "Claude Sonnet 4.6"
-    if "claude" in m:
-        return "Claude"
-    if "gemini" in m:
-        return "Gemini 2.5 Flash"
+        return "Unknown"
+    # "local:<id>" is the platform-wide convention for a self-hosted model
+    # (see _HINT_MAP); the registry stores the bare id.
+    bare = raw.split(":", 1)[1] if raw.startswith("local:") else raw
+    try:
+        from core.llm_provider_registry import get_model as _get_model
+        row = _get_model(bare)
+        if row and (row.get("display_name") or "").strip():
+            return row["display_name"].strip()
+    except Exception as exc:                                   # noqa: BLE001
+        # Analytics must never 500 because the registry is unreachable.
+        logger.debug(f"memory_router._norm_model: registry lookup failed ({exc})")
     return raw
 
 # Module-level singleton for cross-chat user memory.

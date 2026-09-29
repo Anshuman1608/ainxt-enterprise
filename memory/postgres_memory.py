@@ -385,8 +385,17 @@ class PostgresMemory:
             "Merged memory:"
         )
         try:
+            # Phase 6 §N.1 step 1 — `simple` is the capability (merge two
+            # summaries without losing facts); MEMORY_NO_CLOUD_EGRESS is the
+            # residency policy, stated separately (§M.1). legacy_hint keeps
+            # the pre-migration local routing when governance is off (D15).
+            from core.config import MEMORY_NO_CLOUD_EGRESS
+            from core.tiers import Tier
             from models.model_router import get_router
-            merged = get_router().generate(_MERGE_PROMPT, model_hint="simple").strip()
+            merged = get_router().generate(
+                _MERGE_PROMPT, tier=Tier.SIMPLE, legacy_hint="simple",
+                no_cloud_egress=MEMORY_NO_CLOUD_EGRESS,
+            ).strip()
             if merged:
                 return merged[:500]
         except Exception as e:

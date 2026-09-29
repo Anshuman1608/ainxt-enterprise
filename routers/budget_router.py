@@ -265,15 +265,25 @@ def _build_model_alias_map() -> dict[str, str]:
     The map is used Python-side after SQL normalisation to merge rows that
     still differ (bare shorthand aliases, date-suffix variants, inline-comment
     artefacts) into a single canonical slice.
+
+    Phase 6 §N.1 step 4 / plan.html §Q.3 "Budget — model-label parsing". The
+    hint -> canonical-id half of this table used to be a hand-maintained THIRD
+    copy of _HINT_MAP, and it had already drifted: "sonnet 4.6" was a key here
+    and nowhere else, while "sonnet", "claude", "coding", "agents" and the
+    gemini aliases the router accepts were missing — so usage rows logged
+    under those names never merged and appeared as separate models on the
+    spend report. Deriving it from hint_to_model_id() means the two cannot
+    disagree again.
+
+    What is NOT derived, and why: the date-suffix normalisation and the
+    inline-comment artefact below are a different concern entirely. They map
+    ids that were WRITTEN INTO HISTORICAL ROWS onto the current canonical id.
+    The router has never emitted them and never will, so there is nothing
+    upstream to derive them from.
     """
     try:
-        from core.model_registry import (
-            OPENAI_SIMPLE_MODEL, OPENAI_CODING_MODEL, OPENAI_LATEST_MODEL,
-            OPENAI_TERA_MODEL, OPENAI_LUNA_MODEL,
-            CLAUDE_PRIMARY_MODEL, CLAUDE_SONNET_5_MODEL,
-            CLAUDE_HAIKU, CLAUDE_OPUS_MODEL,
-            CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL,
-        )
+        from core.model_registry import CLAUDE_HAIKU
+        from models.model_router import _HINT_MAP, hint_to_model_id
     except ImportError:
         return {}
 
@@ -286,20 +296,20 @@ def _build_model_alias_map() -> dict[str, str]:
     except ImportError:
         ws_aliases = {}
 
-    aliases: dict[str, str] = {
-        # ── gateway hint ids → canonical model ids ───────────────────────
-        # Source: gateway.py reference-models list 
-        "mini":     OPENAI_SIMPLE_MODEL,   # gpt-5-mini
-        "deep":     OPENAI_LATEST_MODEL,   # gpt-5.5
-        "tera":     OPENAI_TERA_MODEL,     # gpt-5.6-terra
-        "luna":     OPENAI_LUNA_MODEL,     # gpt-5.6-luna
-        "gpt":      OPENAI_CODING_MODEL,   # gpt-5.4
-        "haiku":    CLAUDE_HAIKU,           # claude-haiku-4-5
-        "sonnet-5": CLAUDE_SONNET_5_MODEL, # claude-sonnet-5
-        "sonnet 4.6": CLAUDE_PRIMARY_MODEL,# claude-sonnet-4-6
-        "opus":     CLAUDE_OPUS_MODEL,     # claude-opus-4-7
-        "opus-4-8": CLAUDE_OPUS_48_MODEL,  # claude-opus-4-8
-        "opus-5":   CLAUDE_OPUS_5_MODEL,   # claude-opus-5
+    # ── every router hint → its canonical model id ───────────────────────
+    # hint_to_model_id() returns None for "simple"/"local" (no concrete cloud
+    # id — those rows are already logged as "local:<id>") and for hints whose
+    # env constant is unset; both are correctly absent from the alias table.
+    aliases: dict[str, str] = {}
+    for _hint in _HINT_MAP:
+        _canonical = hint_to_model_id(_hint)
+        if _canonical and _canonical != _hint.lower():
+            aliases[_hint.lower()] = _canonical
+
+    aliases.update({
+        # A display-string variant that reaches this table from saved
+        # workspace configs, not from the router — hence still hardcoded.
+        "sonnet 4.6": hint_to_model_id("complex") or "",
         # ── auto-select placeholders → single bucket ─────────────────────
         "auto_select": "auto",
         # ── date-suffix variants → base model id ─────────────────────────
@@ -312,7 +322,10 @@ def _build_model_alias_map() -> dict[str, str]:
         "claude-sonnet-4-5-20250929":      "claude-sonnet-4-5",
         # ── inline-comment artefact from "deepseek-v4-flash  # fast (~7s)" ─
         "~7s": "deepseek-v4-flash",
-    }
+    })
+    # An env constant that is unset resolves to "", which would collapse
+    # unrelated rows onto a single empty bucket. Drop those.
+    aliases = {k: v for k, v in aliases.items() if k and v}
 
     # Merge ABStudio alias table last so its entries can override if needed.
     aliases.update(ws_aliases)

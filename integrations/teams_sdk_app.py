@@ -152,13 +152,15 @@ async def _stream_answer(ctx, command: str) -> None:
     Output compliance runs on the full text before the final close; if it
     redacts anything, we replace the rendered text via ctx.stream.update().
     """
+    from core.tiers import Tier
     from models.model_router import model_router
     from services.teams_adapter import teams_metrics
 
     acc: list[str] = []
     pending = 0
     try:
-        for tok in model_router.stream(command, model_hint="complex"):
+        for tok in model_router.stream(command, tier=Tier.COMPLEX,
+                                       legacy_hint="complex"):
             if isinstance(tok, dict):  # __stream_meta__ sentinel — ignore
                 continue
             if not tok:

@@ -32,17 +32,32 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Callable
 
 from core.logger import logger
+from core.tiers import Tier
 
 
 def _advanced_reasoning_enabled() -> bool:
     return os.getenv("ADVANCED_REASONING_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
-def _llm_call(prompt: str, temperature: float = 0.0, model_hint: str = "simple") -> str:
-    """Single LLM call via the model router. Returns "" on failure."""
+def _llm_call(prompt: str, temperature: float = 0.0, *,
+              tier: "Tier" = Tier.SIMPLE, legacy_hint: str = "simple") -> str:
+    """Single LLM call via the model router. Returns "" on failure.
+
+    Phase 6 §N.1 step 3. §D.2 tiers this module PER STEP rather than per
+    module, which is the rule that bites hardest here: the same file both
+    generates candidate reasoning (Tier.COMPLEX) and checks it
+    (Tier.SIMPLE), and collapsing those onto one setting would either
+    overpay for every verification or underpower every generation.
+
+    `legacy_hint` travels with the tier so each call site keeps its
+    pre-migration model when governance is off (D15); the defaults below are
+    the verification pair, which is the majority of the call sites.
+    """
     try:
         from models.model_router import get_router
-        return get_router().generate(prompt, model_hint=model_hint, temperature=temperature).strip()
+        return get_router().generate(
+            prompt, tier=tier, legacy_hint=legacy_hint,
+            temperature=temperature).strip()
     except Exception as e:
         logger.debug(f"advanced_reasoning._llm_call failed: {e}")
         return ""
@@ -84,7 +99,7 @@ class TreeOfThoughts:
         Falls back to a single direct LLM call on any error.
         """
         if not _advanced_reasoning_enabled():
-            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint="complex")
+            return _llm_call(f"{system_prompt}\n\n{goal}", tier=Tier.COMPLEX, legacy_hint="complex")
 
         try:
             logger.info(f"[ToT] starting n_branches={self.n_branches} max_depth={self.max_depth}")
@@ -105,7 +120,11 @@ class TreeOfThoughts:
                     max_workers=min(len(branch_prompts), 6),
                     thread_name_prefix="tot-branch",
                 ) as pool:
-                    futures = [pool.submit(_llm_call, p, 0.7, "complex") for p in branch_prompts]
+                    futures = [
+                        pool.submit(_llm_call, p, 0.7,
+                                    tier=Tier.COMPLEX, legacy_hint="complex")
+                        for p in branch_prompts
+                    ]
                     branches = [f.result() for f in as_completed(futures)]
 
                 branches = [b for b in branches if b.strip()]
@@ -136,13 +155,13 @@ class TreeOfThoughts:
                 f"Original question: {goal}\n\n"
                 f"Final answer:"
             )
-            answer = _llm_call(final_prompt, temperature=0.0, model_hint="complex")
+            answer = _llm_call(final_prompt, temperature=0.0, tier=Tier.COMPLEX, legacy_hint="complex")
             logger.info(f"[ToT] completed, answer length={len(answer)}")
             return answer or best_thought
 
         except Exception as e:
             logger.error(f"[ToT] failed ({e}), falling back to direct call")
-            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint="complex")
+            return _llm_call(f"{system_prompt}\n\n{goal}", tier=Tier.COMPLEX, legacy_hint="complex")
 
     def _score_thought(self, goal: str, thought: str) -> float:
         """Score a thought branch 0.0–1.0 using a lightweight evaluator prompt."""
@@ -156,7 +175,7 @@ class TreeOfThoughts:
             f"Score (0.0-1.0):"
         )
         try:
-            raw = _llm_call(prompt, temperature=0.0, model_hint="simple")
+            raw = _llm_call(prompt, temperature=0.0, tier=Tier.SIMPLE, legacy_hint="simple")
             m = re.search(r"(\d+\.?\d*)", raw)
             if m:
                 score = float(m.group(1))
@@ -191,7 +210,7 @@ class SelfConsistency:
         Falls back to a single direct LLM call on any error.
         """
         if not _advanced_reasoning_enabled():
-            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint="simple")
+            return _llm_call(f"{system_prompt}\n\n{goal}", tier=Tier.SIMPLE, legacy_hint="simple")
 
         try:
             logger.info(f"[SC] starting n_samples={self.n_samples}")
@@ -202,14 +221,15 @@ class SelfConsistency:
                 thread_name_prefix="sc-sample",
             ) as pool:
                 futures = [
-                    pool.submit(_llm_call, prompt, 0.7, "simple")
+                    pool.submit(_llm_call, prompt, 0.7,
+                                tier=Tier.SIMPLE, legacy_hint="simple")
                     for _ in range(self.n_samples)
                 ]
                 samples = [f.result() for f in as_completed(futures)]
 
             samples = [s for s in samples if s.strip()]
             if not samples:
-                return _llm_call(prompt, temperature=0.0, model_hint="simple")
+                return _llm_call(prompt, temperature=0.0, tier=Tier.SIMPLE, legacy_hint="simple")
 
             # Cluster by string similarity (simple overlap)
             best = self._majority_vote(samples)
@@ -218,7 +238,7 @@ class SelfConsistency:
 
         except Exception as e:
             logger.error(f"[SC] failed ({e}), falling back to direct call")
-            return _llm_call(f"{system_prompt}\n\n{goal}", model_hint="simple")
+            return _llm_call(f"{system_prompt}\n\n{goal}", tier=Tier.SIMPLE, legacy_hint="simple")
 
     def _majority_vote(self, samples: List[str]) -> str:
         """Return the sample from the largest similarity cluster."""
@@ -316,7 +336,7 @@ class ChainOfVerification:
                 f"Please provide a corrected answer that removes or fixes the contradicted claims. "
                 f"Keep all verified information. Be concise."
             )
-            corrected = _llm_call(correction_prompt, temperature=0.0, model_hint="complex")
+            corrected = _llm_call(correction_prompt, temperature=0.0, tier=Tier.COMPLEX, legacy_hint="complex")
             if corrected:
                 logger.info(
                     f"[CoVe] regenerated answer after {len(contradicted)} contradiction(s), "
@@ -340,7 +360,7 @@ class ChainOfVerification:
             f"No explanation.\n\nText: {answer[:1500]}"
         )
         try:
-            raw = _llm_call(prompt, temperature=0.0, model_hint="simple")
+            raw = _llm_call(prompt, temperature=0.0, tier=Tier.SIMPLE, legacy_hint="simple")
             m = re.search(r'\[.*?\]', raw, re.DOTALL)
             if m:
                 import json
@@ -392,7 +412,7 @@ class ChainOfVerification:
                 f"Evidence: {rag_text[:800]}\n\n"
                 f"Output ONLY one word: VERIFIED, CONTRADICTED, or UNVERIFIED."
             )
-            result = _llm_call(verify_prompt, temperature=0.0, model_hint="simple").upper().strip()
+            result = _llm_call(verify_prompt, temperature=0.0, tier=Tier.SIMPLE, legacy_hint="simple").upper().strip()
             if "CONTRADICTED" in result:
                 return "CONTRADICTED"
             if "VERIFIED" in result:

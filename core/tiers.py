@@ -135,6 +135,44 @@ MODALITY_REQUIREMENT: Final[dict[Tier, str]] = {
 }
 
 
+def modality_for_model_id(model_id: str) -> list[str]:
+    """Best-guess `capabilities.modality` for a model, from its id alone.
+
+    A SEED, not an authority. The admin API accepts `modality` explicitly and
+    an administrator's value always wins — this only fills a row that has
+    none, so the resolver has something to filter on instead of falling back
+    to "text-only" and hiding a video model from the video tier.
+
+    Lives here, beside MODALITY_REQUIREMENT, because three callers need the
+    same answer and previously only one of them had it:
+
+      * db/migrate.py — the one-time backfill over existing rows;
+      * routers/llm_provider_admin_router.py — model DISCOVERY, which is the
+        gap this closes. Sync-models imported 59 rows with no modality at
+        all, so every Claude was invisible to image-input and both Veo
+        models were invisible to video-generation. The backfill could not
+        help: it had already run.
+      * the manual add-model and ollama-pull paths, for the same reason.
+
+    Deliberately conservative: everything is assumed text-capable and a
+    modality is only ADDED on a positive signal. Over-claiming would let the
+    resolver pick a model that cannot do the job, which is the exact failure
+    this filter exists to prevent — so a false negative (an admin has to set
+    it by hand) is strictly preferable to a false positive.
+    """
+    low = (model_id or "").lower()
+    out = [MODALITY_TEXT]
+    if "veo" in low or "video" in low:
+        out.append(MODALITY_VIDEO_OUT)
+    if "image" in low or "imagen" in low or "dall-e" in low:
+        out.append(MODALITY_IMAGE_OUT)
+    # Frontier chat models are multimodal on input. Keyed on family rather
+    # than an exhaustive id list so a newer version inherits it.
+    if any(k in low for k in ("claude", "gpt-4", "gpt-5", "gemini")):
+        out.append(MODALITY_IMAGE_IN)
+    return out
+
+
 # ── Presentation metadata ────────────────────────────────────────────────────
 # Lives here, beside the vocabulary it describes, so the admin screen cannot
 # invent a ninth tier by inventing a ninth label. Served by

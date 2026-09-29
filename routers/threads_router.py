@@ -215,15 +215,28 @@ def _ainxt_flow(thread_id: str, message_content: str, repo: str, product_id: str
             except Exception:
                 pass
 
-        # Priority classification — GPT-5.2, never Ollama
+        # Priority classification.
+        #
+        # Phase 6 §N.1 step 4, R4 — a RECLASSIFICATION, not a rename: this
+        # asks for one word out of three, which `medium` over-provisions.
+        # §F: "short structured classification; medium over-provisions".
+        #
+        # NOTE also a live defect fixed here: `model_router` was never
+        # imported in this module, so this call raised NameError on every
+        # invocation and the bare `except` below silently pinned every
+        # thread to "Medium". The classification has never actually run.
         priority_prompt = (
             f"Based on this engineering issue, respond with ONLY one word: High, Medium, or Low.\n\n"
             f"Issue: {message_content}\n"
             f"Analysis summary: {fix_analysis}"
         )
         try:
-            priority_raw = model_router.generate(priority_prompt, model_hint="medium").strip()
-        except Exception:
+            from core.tiers import Tier
+            from models.model_router import model_router
+            priority_raw = model_router.generate(
+                priority_prompt, tier=Tier.SIMPLE, legacy_hint="medium").strip()
+        except Exception as _prio_exc:      # noqa: BLE001
+            logger.warning(f"threads_router: priority classification failed ({_prio_exc}) — defaulting to Medium")
             priority_raw = "Medium"
         priority = priority_raw if priority_raw in ("High", "Medium", "Low") else "Medium"
 

@@ -32,11 +32,21 @@ from typing import Optional
 
 from core.logger import logger
 
-try:
-    from core.config import CIL_INTENT_MODEL as _INTENT_MODEL  # optional central config
-except Exception:  # noqa: BLE001
-    import os as _os
-    _INTENT_MODEL = _os.getenv("CIL_INTENT_MODEL", "local_mini")  # local_mini tier — model configured via OPENAI_OSS_MODEL in core/model_registry.py
+# Phase 6 §N.1 step 2 / §D.2 "CIL intent classification".
+#
+# This runs on EVERY Auto turn and decides image-vs-video-vs-doc-vs-chat, so
+# what serves it is the single highest-leverage model choice on the platform
+# — and until now it was decided by an env var defaulting to a tier named
+# after a piece of hardware. The capability wanted is "emit one enum label
+# from a fixed vocabulary, fast, reliably parseable"; that is the
+# intent-classification tier, and an administrator picks what serves it.
+#
+# CIL_INTENT_MODEL survives as a DEPRECATED override (§I.3) for one release.
+# Note it must be genuinely UNSET to let the tier win: a `${VAR:-default}` in
+# docker-compose substitutes on empty as well as unset, which is why the
+# compose default for it is now bare.
+import os as _os
+_INTENT_MODEL = (_os.getenv("CIL_INTENT_MODEL", "") or "").strip()
 
 # ── Classification cache (PERF) ────────────────────────────────────────────
 # classify() previously called the local LLM unconditionally on every turn,
@@ -104,7 +114,22 @@ def _cache_key(text: str, *, rag_mode: str, history_summary: str,
     return "cil:intent:" + hashlib.sha256(raw.encode()).hexdigest()
 
 _VALID_ROUTES = {"chat", "skill", "agent", "analyse"}
-_VALID_COMPLEXITY = {"simple", "medium", "complex", "deep", "solution"}
+# Phase 6 §N.1 step 2 — the classifier's ROUTING vocabulary shrinks to three.
+#
+# "deep" and "solution" were never capability requests: §E deletes both as
+# tiers because "deep" named a specific GPT SKU and "solution" named Opus.
+# Asking a 1B classifier to choose between "complex", "deep" and "solution"
+# is asking it to pick a vendor, which is the exact confusion this migration
+# exists to remove — and the router already sends both to the same place
+# (_LEGACY_TO_GOVERNED maps TIER_DEEP and TIER_SOLUTION onto Tier.COMPLEX).
+_VALID_COMPLEXITY = {"simple", "medium", "complex"}
+
+# Collapse rather than reject. A model that has not seen the new prompt yet —
+# a cached response, a slow-rolling deployment, an operator-pinned override —
+# still emits the old labels, and _enum()'s default would silently DOWNGRADE
+# those turns to "medium". Both retired labels meant "harder than medium", so
+# "complex" is the honest destination and the one the router picks anyway.
+_RETIRED_COMPLEXITY = {"deep": "complex", "solution": "complex"}
 _VALID_FRESHNESS = {"none", "low", "high"}
 _VALID_FORMATS = {"prose", "code", "table", "document", "data"}
 _VALID_TONE = {"formal", "neutral", "casual", "frustrated", "excited"}
@@ -187,7 +212,7 @@ _BASE_SYS = (
     "You are the understanding stage of an enterprise assistant. Read the user's "
     "LATEST turn and classify it. Respond with ONLY a JSON object, no prose.\n"
     "Schema:\n"
-    '{"task_complexity":"simple|medium|complex|deep|solution",'
+    '{"task_complexity":"simple|medium|complex",'
     '"domain":"general|code|finance|hr|legal|data|devops|security",'
     '"is_continuation":true|false,'
     '"output_format":"prose|code|table|document|data",'
@@ -220,8 +245,8 @@ _GUIDANCE = (
     "\n"
     "GUIDANCE:\n"
     "- task_complexity: default 'medium'. Use 'simple' ONLY for greetings, "
-    "small-talk, or one-line trivia. Use 'complex'/'deep'/'solution' for "
-    "multi-step reasoning, architecture, or code spanning several files.\n"
+    "small-talk, or one-line trivia. Use 'complex' for multi-step reasoning, "
+    "architecture, or code spanning several files.\n"
     "- is_continuation: true if the turn depends on the prior conversation "
     "(pronouns like 'it/that', 'also', 'what about', an unfinished thread).\n"
     "- tool_need / retrieval_need: how much the turn needs external tools "
@@ -661,12 +686,17 @@ def classify(text: str, *, rag_mode: str = "off",
         # without needing to reproduce the exact request.
         logger.debug(
             "[cil] SLM input | model=%s user_turn=%r",
-            _INTENT_MODEL, text[:300],
+            _INTENT_MODEL or "tier:intent-classification", text[:300],
         )
         # model_router.generate() already cascades small->cloud on outage; a
         # TOTAL outage yields an 'Error:' sentinel which we treat as failure.
-        raw = (model_router.generate(prompt, model_hint=_INTENT_MODEL,
-                                     return_meta=False) or "").strip()
+        from core.tiers import Tier as _Tier
+        from models.model_router import tier_request as _tier_request
+        raw = (model_router.generate(
+            prompt, return_meta=False,
+            **_tier_request(_Tier.INTENT_CLASSIFICATION, "local_mini",
+                            _INTENT_MODEL, override_name="CIL_INTENT_MODEL"),
+        ) or "").strip()
         # Log the raw SLM response — the single most useful thing for debugging
         # misclassifications (e.g. vid_intent="none" when it should be "generate").
         logger.debug("[cil] SLM raw response | %r", raw[:500] if raw else "")
@@ -744,7 +774,12 @@ def classify(text: str, *, rag_mode: str = "off",
             _vid_conf = 0.0
 
         result = UnifiedIntent(
-            task_complexity=_enum(data.get("task_complexity"), _VALID_COMPLEXITY, "medium"),
+            task_complexity=_enum(
+                _RETIRED_COMPLEXITY.get(
+                    str(data.get("task_complexity") or "").lower().strip(),
+                    data.get("task_complexity"),
+                ),
+                _VALID_COMPLEXITY, "medium"),
             domain=str(data.get("domain") or "general").lower().strip() or "general",
             is_continuation=bool(data.get("is_continuation", False)),
             output_format=_enum(data.get("output_format"), _VALID_FORMATS, "prose"),

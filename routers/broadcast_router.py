@@ -433,8 +433,14 @@ def templates_suggest(
     full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
     try:
+        # Phase 6 §N.1 step 4. model_hint="claude" was a VENDOR ALIAS in
+        # application logic — _HINT_MAP resolved it to TIER_COMPLEX, so the
+        # code was naming Anthropic to ask for "the strong model". Asking for
+        # the tier says the same thing without naming a vendor (R3).
+        from core.tiers import Tier
         from models.model_router import model_router
-        result = model_router.generate(full_prompt, model_hint="claude", return_meta=True)
+        result = model_router.generate(full_prompt, tier=Tier.COMPLEX,
+                                       legacy_hint="claude", return_meta=True)
     except Exception as exc:
         logger.error(f"broadcast_router: model_router.generate failed: {exc}")
         raise HTTPException(502, "Template generation failed")

@@ -43,6 +43,7 @@ from core.security_validation import (
     validate_presenton_generate_request,
     _flatten_errors,
 )
+from core.tiers import Tier
 from models.model_router import model_router
 
 router = APIRouter(tags=["ppt"])
@@ -180,7 +181,18 @@ def generate_outline(req: OutlineRequest, _user=Depends(get_current_user)):
     )
 
     try:
-        raw = model_router.generate(sanitize(prompt), model_hint="complex")
+        # Phase 6 §N.1 step 4 / §F "Presentations". PPT_LLM_MODEL was imported
+        # into this module and then never read — the call below hardcoded
+        # "complex", so the documented override has never done anything.
+        # Routing it through tier_request() makes it work as documented AND
+        # deprecates it in one step; its default is "complex", so a deployment
+        # that never set it sees no change.
+        from models.model_router import tier_request as _tier_request
+        _ppt_override = PPT_LLM_MODEL if PPT_LLM_MODEL.strip() != "complex" else ""
+        raw = model_router.generate(
+            sanitize(prompt),
+            **_tier_request(Tier.COMPLEX, "complex", _ppt_override,
+                            override_name="PPT_LLM_MODEL"))
         raw = (raw or "").strip()
         raw = re.sub(r"^```[a-z]*\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw.strip())

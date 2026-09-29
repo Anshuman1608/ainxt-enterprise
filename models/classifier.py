@@ -3,17 +3,13 @@
 # IMPORTS
 # ============================================================
 
-import json
-import os
 import re
 import hashlib
-
-import httpx
 
 from core.config import RDB_CACHE
 from core.kv import get_kv
 from core.logger import logger
-from core.model_registry import cli_model_for_tier as _cli_model_for_tier
+from core.tiers import Tier
 
 
 # ============================================================
@@ -29,61 +25,47 @@ _LLM_FALLBACK_SYSTEM = (
 
 _VALID_TIERS = {"simple", "medium", "complex"}
 
-# ARCH-F-MISC-010: creating a new httpx.Client on every classify call creates
-# and tears down a TCP connection pool on every invocation. A module-level
-# singleton reuses the connection pool, reducing latency and resource churn.
-_HTTP_CLIENT = httpx.Client(timeout=httpx.Timeout(15.0, connect=3.0))
-
-# Register a shutdown hook so the connection pool is cleanly closed when the
-# process exits — matching the explicit aclose() calls used for the async
-# httpx clients in services/llm_proxy/main.py's _lifespan() shutdown block.
-import atexit as _atexit
-_atexit.register(_HTTP_CLIENT.close)
-
 
 def _llm_classify(question: str) -> str:
-    """
-    Call Claude Haiku via the LLM proxy to classify a query when regex confidence < 0.7.
-    Routes through the LLM proxy server LLM proxy (LLM_PROXY_URL env var) — never calls Anthropic SDK directly.
-    Falls back to "medium" on any error or when proxy is not configured.
-    """
-    proxy_url = os.getenv("LLM_PROXY_URL", "").rstrip("/")
-    if not proxy_url:
-        logger.warning("LLM classifier: LLM_PROXY_URL not set — defaulting to medium")
-        return "medium"
-    logger.info(f"_llm_classify with URL {proxy_url} ")
-    # Prepend system instruction to the prompt so the proxy's single-string
-    # format carries the full context (proxy /llm/generate takes one prompt str).
-    combined_prompt = f"{_LLM_FALLBACK_SYSTEM}\n\nQuery: {question}"
-    try:
-        label_tokens: list[str] = []
-        from core.proxy_tool_use import llm_proxy_headers as _lph
-        with _HTTP_CLIENT.stream(
-            "POST",
-            f"{proxy_url}/llm/generate",
-            json={"provider": "claude", "prompt": combined_prompt, "model": _cli_model_for_tier("haiku")},
-            headers=_lph(),
-        ) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if "t" in obj:
-                    label_tokens.append(obj["t"])
+    """Classify a query with an LLM when regex confidence < 0.7.
 
-        label = "".join(label_tokens).strip().lower()
+    Phase 6 §N.1 step 2. This used to open its own httpx stream to
+    LLM_PROXY_URL with a hardcoded {"provider": "claude"} body and a model
+    from cli_model_for_tier("haiku") — two provider assumptions (R3) in a
+    function whose entire job is to emit one of three enum labels.
+
+    It now asks for the intent-classification tier and lets the router decide
+    the provider, the transport and the failover. Same proxy underneath, so
+    the network path is unchanged; the difference is that an administrator
+    can now see and set what serves it, alongside the CIL classifier that
+    answers the same kind of question on the same turn.
+
+    `legacy_hint="haiku"` keeps the pre-migration model when governance is
+    off (D15). Still falls back to "medium" on any failure — a caller of this
+    function gets a tier or it gets "medium", never an exception.
+    """
+    try:
+        from models.model_router import model_router, tier_request
+
+        raw = model_router.generate(
+            f"{_LLM_FALLBACK_SYSTEM}\n\nQuery: {question}",
+            return_meta=False,
+            **tier_request(Tier.INTENT_CLASSIFICATION, "haiku"),
+        ) or ""
+        # generate() reports runtime failures as a string rather than raising,
+        # so an "Error: ..." body is a failure and must not be parsed as a label.
+        if raw.startswith("Error"):
+            logger.warning(f"LLM classifier unavailable ({raw[:80]!r}) — defaulting to medium")
+            return "medium"
         # The model may return "simple.", "MEDIUM" etc — take first word
+        label = raw.strip().lower()
         label = label.split()[0].rstrip(".,") if label else ""
         if label in _VALID_TIERS:
-            logger.info(f"LLM classifier fallback (proxy) → {label}")
+            logger.info(f"LLM classifier fallback → {label}")
             return label
-        logger.warning(f"LLM classifier (proxy) returned unexpected label '{label}' — defaulting to medium")
-    except Exception as e:
-        logger.warning(f"LLM classifier fallback (proxy) failed ({e}) — defaulting to medium")
+        logger.warning(f"LLM classifier returned unexpected label '{label}' — defaulting to medium")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"LLM classifier fallback failed ({e}) — defaulting to medium")
     return "medium"
 
 

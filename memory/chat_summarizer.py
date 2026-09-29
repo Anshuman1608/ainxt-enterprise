@@ -76,10 +76,26 @@ def _to_plain_english(text: str) -> str:
 
 
 def _call_model(prompt: str) -> str:
-    """Call gpt-5-mini (simple tier) via model_router → Local LLM proxy."""
+    """Summarise a chat on the `simple` tier (Phase 6, §N.1 step 1).
+
+    The capability wanted here is short, faithful summarisation — not "a model
+    that happens to be hosted in-house", which is all the old
+    model_hint="simple" actually said. `legacy_hint` keeps that old routing
+    for any deployment that has not turned governance on (D15).
+
+    no_cloud_egress is the residency requirement stated separately from the
+    capability (§M.1): chat summaries are long-lived and distilled, so a
+    deployment may need them to stay in the estate whatever model serves the
+    tier. Off unless MEMORY_NO_CLOUD_EGRESS says otherwise.
+    """
     try:
+        from core.config import MEMORY_NO_CLOUD_EGRESS
+        from core.tiers import Tier
         from models.model_router import model_router
-        return model_router.generate(prompt, model_hint="simple").strip()
+        return model_router.generate(
+            prompt, tier=Tier.SIMPLE, legacy_hint="simple",
+            no_cloud_egress=MEMORY_NO_CLOUD_EGRESS,
+        ).strip()
     except Exception as e:
         logger.warning(f"chat_summarizer: model call failed: {e}")
         return ""

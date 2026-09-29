@@ -497,6 +497,95 @@ def check_model_literals(cfg) -> list[str]:
     ]
 
 
+# ── Phase 6: the tier migration's exit criterion, enforced per module ─────
+#
+# plan.html's Phase 6 exit criterion is that `grep -rn 'model_hint="'` returns
+# only the inbound API boundary and test fixtures. That is the END state after
+# all eleven §N.1 steps; enforcing it wholesale today would fail on the seven
+# steps still to come. So the check is scoped to the modules already migrated
+# and the list GROWS as each later step lands — a ratchet, not a cliff.
+#
+# What it catches: a new call site added to a migrated module using the old
+# vocabulary, which would quietly opt that feature back out of governance.
+_PHASE6_MIGRATED_MODULES = (
+    # §N.1 step 1 — memory & summarisation
+    "memory/chat_summarizer.py",
+    "memory/postgres_memory.py",
+    "core/context_manager.py",
+    # §N.1 step 2 — classification paths
+    "cil/intent.py",
+    "models/classifier.py",
+    "models/doc_intent.py",
+    "models/query_rewriter.py",
+    "models/router.py",
+    "agents/router_agent.py",
+    # §N.1 step 3 — structured-output agents
+    "agents/review_engine.py",
+    "agents/orchestrator.py",
+    "agents/advanced_reasoning.py",
+    # §N.1 step 4 — leaf feature modules
+    "routers/skills_router.py",
+    "routers/presenton_router.py",
+    "routers/broadcast_router.py",
+    "routers/cowork_tasks_router.py",
+    "routers/threads_router.py",
+    "routers/projects_router.py",
+    "workers/knowledge_graph_worker.py",
+    "connectors/mcp_bridge.py",
+    "integrations/teams_sdk_app.py",
+    "tools/n8n_autonomous_builder.py",
+)
+
+# The eight tier names plus the legacy aliases that MEAN one of them. A raw
+# model id in model_hint= is a user-explicit pick and stays legal forever.
+_PHASE6_TIER_HINTS = (
+    "simple", "local", "local_mini", "mini", "medium", "complex",
+    "haiku", "claude", "sonnet", "gpt", "coding", "agents",
+    "solution", "opus", "deep", "vision",
+)
+
+
+def check_tier_migration(cfg) -> list[str]:
+    """No migrated module may go back to model_hint="<tier>" (plan.html Phase 6).
+
+    Scoped to the modules §N.1 steps 1-5 have already converted; the tuple
+    grows as later steps land. A raw model id is still legal — that is a
+    user-explicit pick, not an application tier request.
+    """
+    # AST, not grep: these modules now CARRY the old hint strings in comments
+    # and docstrings, on purpose — "the old model_hint=\"simple\" said X" is
+    # exactly the explanation a reader needs. A text scan would flag the
+    # documentation of the fix as the defect.
+    bad: list[str] = []
+    for rel in _PHASE6_MIGRATED_MODULES:
+        path = ROOT / rel
+        if not path.exists():
+            bad.append(f"{rel}: listed as migrated but the file is gone — "
+                       f"update _PHASE6_MIGRATED_MODULES")
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError as exc:
+            bad.append(f"{rel}: does not parse ({exc})")
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg != "model_hint":
+                    continue
+                if not (isinstance(kw.value, ast.Constant)
+                        and kw.value.value in _PHASE6_TIER_HINTS):
+                    continue                      # a raw model id, or a variable
+                bad.append(
+                    f"{rel}:{node.lineno}: model_hint={kw.value.value!r} — this "
+                    f"module was migrated in Phase 6; use tier=Tier.X with "
+                    f"legacy_hint={kw.value.value!r} so governance applies and "
+                    f"the flag-off path is unchanged"
+                )
+    return bad
+
+
 CHECKS = {
     "docs-tracked":         check_docs_tracked,
     "readme-links":         check_readme_links,
@@ -510,6 +599,7 @@ CHECKS = {
     "model-literals":       check_model_literals,
     "docs-panel-coverage":  check_docs_panel_coverage,
     "readme-feature-table": check_readme_feature_table,
+    "tier-migration":       check_tier_migration,
 }
 
 

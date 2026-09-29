@@ -72,8 +72,14 @@ class RouterAgent:
             f'{{"agent": "<name or NONE>", "confidence": 0.0, "reason": "<one sentence>"}}'
         )
 
+        # Phase 6 §N.1 step 2 / §F "Review / router / recovery agents" —
+        # router_agent picks one name out of a catalog, so it is
+        # classification, not generation. legacy_hint preserves the
+        # pre-migration local routing when governance is off (D15).
+        from core.tiers import Tier
         from models.model_router import model_router
-        raw = model_router.generate(prompt, model_hint="simple")
+        raw = model_router.generate(
+            prompt, tier=Tier.INTENT_CLASSIFICATION, legacy_hint="simple")
 
         # Extract JSON from response (LLM may wrap in prose)
         m = re.search(r'\{[^{}]+\}', raw, re.DOTALL)

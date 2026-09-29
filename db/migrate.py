@@ -8020,30 +8020,9 @@ def _part_ac1_llm_provider_seed_2026_09_01():
         except Exception:
             return {}
 
-    def _modality_for(model_id: str) -> list:
-        """Best-effort input/output modality list for a seeded model.
-
-        A LIST, not a scalar: real models are multimodal, and the Phase 3
-        resolver filters the three modality tiers on membership. Seeding is a
-        heuristic over the model id because that is the only signal available
-        at migration time — an administrator can correct any row afterwards,
-        which is why the admin API accepts `modality` explicitly.
-
-        Deliberately conservative: everything is assumed text-capable, and a
-        modality is only ADDED on a positive signal. Over-claiming would let
-        the resolver pick a model that cannot do the job.
-        """
-        low = model_id.lower()
-        out = ["text"]
-        if "veo" in low or "video" in low:
-            out.append("video-out")
-        if "image" in low or "imagen" in low or "dall-e" in low:
-            out.append("image-out")
-        # Frontier chat models are multimodal on input. Keyed on family rather
-        # than an exhaustive id list so a newer version inherits it.
-        if any(k in low for k in ("claude", "gpt-4", "gpt-5", "gemini")):
-            out.append("image-in")
-        return out
+    # Shared with Part AC4 and with the admin discovery path — see
+    # core.tiers.modality_for_model_id for why it has one home now.
+    from core.tiers import modality_for_model_id as _modality_for
 
     def _capabilities_for(model_id: str) -> dict:
         low = model_id.lower()
@@ -8330,22 +8309,11 @@ def _part_ac4_capability_backfill_2026_09_25():
         print(f"  (skipped) Part AC4: llm_provider_registry import failed — {exc}")
         return
 
-    def _modality_for(model_id: str) -> list:
-        """Heuristic seed value; admin-correctable afterwards.
-
-        Conservative on purpose: everything is assumed text-capable and a
-        modality is only ADDED on a positive signal, because over-claiming
-        would let the resolver pick a model that cannot do the job.
-        """
-        low = (model_id or "").lower()
-        out = ["text"]
-        if "veo" in low or "video" in low:
-            out.append("video-out")
-        if "image" in low or "imagen" in low or "dall-e" in low:
-            out.append("image-out")
-        if any(k in low for k in ("claude", "gpt-4", "gpt-5", "gemini")):
-            out.append("image-in")
-        return out
+    # One heuristic, three callers — see core.tiers.modality_for_model_id.
+    # It used to live here (twice) and nowhere else, which is why the admin
+    # Sync-models path imported rows with no modality at all and the three
+    # modality tiers silently had nothing to offer.
+    from core.tiers import modality_for_model_id as _modality_for
 
     db = SessionLocal()
     try:

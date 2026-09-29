@@ -297,10 +297,11 @@ APPROVE | REQUEST_CHANGES | REJECT
 """
 
 def run(input: str, model_router=None) -> dict:
+    from core.tiers import Tier
     if model_router is None:
         from models.model_router import model_router
     prompt = SYSTEM_PROMPT + "\\n\\nCode to review:\\n\\n```\\n" + input + "\\n```"
-    output = model_router.generate(prompt, model_hint="complex")
+    output = model_router.generate(prompt, tier=Tier.COMPLEX, legacy_hint="complex")
     return {"output": output, "skill": "code_review"}
 ''',
     },
@@ -346,10 +347,11 @@ Severity: <P0-Critical | P1-High | P2-Medium | P3-Low>
 """
 
 def run(input: str, model_router=None) -> dict:
+    from core.tiers import Tier
     if model_router is None:
         from models.model_router import model_router
     prompt = SYSTEM_PROMPT + "\\n\\nProblem to debug:\\n\\n" + input
-    output = model_router.generate(prompt, model_hint="complex")
+    output = model_router.generate(prompt, tier=Tier.COMPLEX, legacy_hint="complex")
     return {"output": output, "skill": "debugging"}
 ''',
     },
@@ -412,10 +414,11 @@ Always be accurate — only document what the code actually does.
 """
 
 def run(input: str, model_router=None) -> dict:
+    from core.tiers import Tier
     if model_router is None:
         from models.model_router import model_router
     prompt = SYSTEM_PROMPT + "\\n\\nCode to document:\\n\\n```\\n" + input + "\\n```"
-    output = model_router.generate(prompt, model_hint="complex")
+    output = model_router.generate(prompt, tier=Tier.COMPLEX, legacy_hint="complex")
     return {"output": output, "skill": "documentation"}
 ''',
     },
@@ -476,10 +479,11 @@ Suggest 1–3 ADRs for key decisions that should be documented.
 """
 
 def run(input: str, model_router=None) -> dict:
+    from core.tiers import Tier
     if model_router is None:
         from models.model_router import model_router
     prompt = SYSTEM_PROMPT + "\\n\\nArchitecture to analyse:\\n\\n" + input
-    output = model_router.generate(prompt, model_hint="complex")
+    output = model_router.generate(prompt, tier=Tier.COMPLEX, legacy_hint="complex")
     return {"output": output, "skill": "architecture_analysis"}
 ''',
     },

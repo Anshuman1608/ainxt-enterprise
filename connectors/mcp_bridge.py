@@ -909,12 +909,13 @@ def _revise_artifact(user_id: str, args: dict) -> dict:
 
     is_md = fmt == "md"
     kind = "Markdown document" if is_md else f"{fmt} build script"
+    from core.tiers import Tier
     from models.model_router import model_router
     revised = (model_router.generate(
         f"You are editing a {kind} (the current source is below). Apply this change EXACTLY and return "
         f"ONLY the full revised {'markdown' if is_md else 'script'} — no commentary, no code fences.\n\n"
         f"CHANGE REQUESTED: {instruction}\n\nCURRENT SOURCE:\n{source[:60000]}",
-        model_hint="complex") or "").strip()
+        tier=Tier.COMPLEX, legacy_hint="complex") or "").strip()
     # Strip accidental code fences the model may add.
     if revised.startswith("```"):
         revised = revised.split("\n", 1)[-1]

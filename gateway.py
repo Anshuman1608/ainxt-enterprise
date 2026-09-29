@@ -3171,16 +3171,118 @@ from core.kv_cache_hoist import (          # noqa: E402
     MEMORY_INSTRUCTION  as _MEMORY_INSTRUCTION,
     build_local_system_message as _build_local_system_message,
 )
-# CIL complexity → router tier hints. Derive from the router's canonical
-# _HINT_MAP so a future rename there can't silently drift this gate; fall back
-# to the known tier set if the import shape changes.
+# CIL complexity → router tier hints.
+#
+# Phase 6 §N.1 step 2 — sourced from cil.intent._VALID_COMPLEXITY rather than
+# repeated here, because the two must agree by construction: this gate is the
+# ONLY consumer of task_complexity for routing, so a label the classifier can
+# emit and this set does not contain is a turn that silently falls back to
+# the flat "medium" default. Intersecting with the router's canonical
+# _HINT_MAP is kept so a rename there still cannot drift the gate.
+#
+# "deep" and "solution" left the vocabulary with that change; a stale cached
+# UnifiedIntent can still carry them, so they are COLLAPSED onto "complex"
+# below rather than dropped — dropping would downgrade those turns to medium.
+try:
+    from cil.intent import (
+        _VALID_COMPLEXITY as _CIL_COMPLEXITY,
+        _RETIRED_COMPLEXITY as _CIL_RETIRED_COMPLEXITY,
+    )
+except Exception:  # noqa: BLE001
+    _CIL_COMPLEXITY = {"simple", "medium", "complex"}
+    _CIL_RETIRED_COMPLEXITY = {"deep": "complex", "solution": "complex"}
 try:
     from models.model_router import _HINT_MAP as _MR_HINT_MAP
-    _PV2_TIER_HINTS = {"simple", "medium", "complex", "deep", "solution"} & set(_MR_HINT_MAP)
+    _PV2_TIER_HINTS = set(_CIL_COMPLEXITY) & set(_MR_HINT_MAP)
     if not _PV2_TIER_HINTS:  # unexpected shape — use the known-good set
-        _PV2_TIER_HINTS = {"simple", "medium", "complex", "deep", "solution"}
+        _PV2_TIER_HINTS = set(_CIL_COMPLEXITY)
 except Exception:  # noqa: BLE001
-    _PV2_TIER_HINTS = {"simple", "medium", "complex", "deep", "solution"}
+    _PV2_TIER_HINTS = set(_CIL_COMPLEXITY)
+
+# ── Image-vs-video intent tie-break ───────────────────────────────────────
+#
+# img_intent and vid_intent are independent fields on the same CIL result, so
+# nothing stops the classifier setting BOTH to "generate". It does, regularly:
+# "generate a video of a tiger" is a generation request about a moving picture,
+# and a small classifier reading it as an image request too is not obviously
+# wrong from its point of view.
+#
+# Before this, the image gate was simply evaluated first and returned. That is
+# not a tie-break, it is a coin permanently landing the same way: every turn
+# where both fired produced an IMAGE, no matter how the two confidences
+# compared, and a user asking for a video got a picture with no indication why.
+#
+# The rule, in order:
+#   1. only one intent qualifies      -> that one
+#   2. both qualify, confidences differ -> the more confident one
+#   3. both qualify, exact tie        -> the medium the user NAMED
+#   4. both qualify, tie, no keyword  -> image, which is what it did before
+#
+# Step 3 matters most in practice because the tie is the common case: the two
+# confidences come from the same JSON object emitted in one pass, and a
+# hedging model emits the same number for both.
+_MEDIA_TIEBREAK_MIN_CONFIDENCE = 0.5
+
+# Words that name the medium rather than describe the subject. "animate" and
+# "footage" are included because they are requests for motion; "picture" is
+# NOT in the image list because "take a picture of" is idiomatic for a still
+# but "picture" alone is ambiguous enough to be noise.
+_VIDEO_WORDS = ("video", "clip", "animate", "animation", "footage",
+                "movie", "reel", "gif")
+_IMAGE_WORDS = ("image", "photo", "picture", "illustration", "drawing",
+                "logo", "diagram", "poster", "artwork")
+
+
+def _media_intent_winner(conv_state, question: str) -> "str | None":
+    """Return "image", "video" or None for a CIL result. See the block above."""
+    if conv_state is None:
+        return None
+
+    def _fires(intent, conf) -> bool:
+        try:
+            return (intent == "generate"
+                    and float(conf or 0.0) > _MEDIA_TIEBREAK_MIN_CONFIDENCE)
+        except (TypeError, ValueError):
+            return False
+
+    img = _fires(getattr(conv_state, "img_intent", None),
+                 getattr(conv_state, "img_confidence", 0.0))
+    vid = _fires(getattr(conv_state, "vid_intent", None),
+                 getattr(conv_state, "vid_confidence", 0.0))
+    if img and not vid:
+        return "image"
+    if vid and not img:
+        return "video"
+    if not img and not vid:
+        return None
+
+    img_conf = float(getattr(conv_state, "img_confidence", 0.0) or 0.0)
+    vid_conf = float(getattr(conv_state, "vid_confidence", 0.0) or 0.0)
+    if img_conf != vid_conf:
+        winner = "image" if img_conf > vid_conf else "video"
+        logger.info(
+            "[media_intent] both intents fired — %s wins on confidence "
+            "(img=%.2f vid=%.2f)", winner, img_conf, vid_conf,
+        )
+        return winner
+
+    # Exact tie: let the user's own wording decide.
+    q = (question or "").lower()
+    said_video = any(w in q for w in _VIDEO_WORDS)
+    said_image = any(w in q for w in _IMAGE_WORDS)
+    if said_video and not said_image:
+        winner = "video"
+    elif said_image and not said_video:
+        winner = "image"
+    else:
+        winner = "image"          # unchanged from the pre-tie-break behaviour
+    logger.info(
+        "[media_intent] both intents fired at %.2f — %s wins on prompt "
+        "wording (video_word=%s image_word=%s)",
+        img_conf, winner, said_video, said_image,
+    )
+    return winner
+
 
 def cache_key(question, repo_filter, model_hint=None, user_id=None, rag_mode=None):
 
@@ -4819,8 +4921,9 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
             and _PIPELINE_V2
             and _rc is not None
             and _rc.conv_state is not None
-            and _rc.conv_state.img_intent == "generate"
-            and _rc.conv_state.img_confidence > 0.5):
+            # Includes img_intent=="generate" and img_confidence>0.5, plus the
+            # tie-break against vid_intent — see _media_intent_winner.
+            and _media_intent_winner(_rc.conv_state, q.question) == "image"):
         try:
             _img_prompt = (_rc.conv_state.img_prompt or q.question or "").strip()
             _img_scope  = _rc.conv_state.img_source_scope
@@ -5050,8 +5153,7 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
             and _PIPELINE_V2
             and _rc is not None
             and _rc.conv_state is not None
-            and _rc.conv_state.vid_intent == "generate"
-            and _rc.conv_state.vid_confidence > 0.5):
+            and _media_intent_winner(_rc.conv_state, q.question) == "video"):
         try:
             _vid_prompt   = (_rc.conv_state.vid_prompt or q.question or "").strip()
             _vid_scope    = _rc.conv_state.vid_source_scope
@@ -7465,6 +7567,10 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
         if (_PIPELINE_V2 and _PIPELINE_V2_ROUTING and not _is_voice_platform
                 and not _model_hint and _rc is not None and _rc.conv_state is not None):
             _cil_tier = getattr(_rc.conv_state, "task_complexity", None)
+            # A conv_state cached before the vocabulary shrank can still say
+            # "deep"/"solution"; both meant "harder than medium", so collapse
+            # rather than fall through to the flat default.
+            _cil_tier = _CIL_RETIRED_COMPLEXITY.get(_cil_tier, _cil_tier)
             if _cil_tier in _PV2_TIER_HINTS:
                 _fp_hint = _cil_tier
                 _otel.record_event("routing.driven", tier=_cil_tier)
@@ -15305,26 +15411,68 @@ async def ask_with_image(
         text = _gwi_g(question, _img_b64, mime_type=_mime)
         return text, 0, 0, "gemini"
 
+    # ── Which provider analyses the image, in which order ──────────────────
+    #
+    # Phase 6 §N.1 step 5 / §F "Image analysis". PRIMARY_VISION_PROVIDER and
+    # FALLBACK_VISION_PROVIDER named PROVIDERS in application config — two of
+    # the leaks R3 tracks — and hardcoded a chain of exactly two. The
+    # image-input tier expresses the same thing as data: its assignments are
+    # already priority-ordered, and priority IS the primary→fallback order,
+    # for as many entries as an administrator cares to add.
+    #
+    # LOCAL_VISION_MODELS stays for now as the allow-list for a USER'S
+    # explicit pick, which is not a governed decision. Replacing it with
+    # capabilities.modality is Phase 7, where the picker itself is rebuilt.
+    def _vision_provider_chain() -> list:
+        """Ordered provider families to try. Falls back to the env pair."""
+        try:
+            from core.tiers import Tier as _VTier
+            from core.tier_resolver import resolve_tier_candidates as _vcands
+            fams: list[str] = []
+            for _rm in _vcands(_VTier.IMAGE_INPUT):
+                if _rm.family not in fams:
+                    fams.append(_rm.family)
+            if fams:
+                return fams
+        except Exception as _vexc:      # noqa: BLE001
+            # Unlike image-output and video-generation, degrading here is
+            # correct: every candidate returns TEXT ABOUT an image, so the
+            # env pair answers the same question, just without governance.
+            logger.warning(
+                f"ask_with_image: image-input tier unresolved ({_vexc}) — "
+                f"falling back to PRIMARY/FALLBACK_VISION_PROVIDER"
+            )
+        return [p for p in (PRIMARY_VISION_PROVIDER, FALLBACK_VISION_PROVIDER)
+                if p and p.lower() != "none"]
+
     try:
         if _model_hint and _model_hint in LOCAL_VISION_MODELS:
             # User explicitly selected a local vision model (Kimi-k2.5, glm-4.5v, …)
             _answer, _in_tok, _out_tok = _call_local_vision()
             _vision_label = _model_hint
         else:
-            # Configurable internet provider — primary then fallback
-            try:
-                _answer, _in_tok, _out_tok, _actual = _call_internet_vision(PRIMARY_VISION_PROVIDER)
-                _vision_label = _actual  # use what the proxy actually ran, not what we requested
-            except Exception as _primary_err:
-                if FALLBACK_VISION_PROVIDER and FALLBACK_VISION_PROVIDER.lower() != "none":
-                    logger.warning(
-                        f"ask_with_image primary ({PRIMARY_VISION_PROVIDER}) failed: "
-                        f"{_primary_err!r} — trying fallback ({FALLBACK_VISION_PROVIDER})"
-                    )
-                    _answer, _in_tok, _out_tok, _actual = _call_internet_vision(FALLBACK_VISION_PROVIDER)
+            _chain = _vision_provider_chain()
+            if not _chain:
+                raise RuntimeError(
+                    "no provider is available for image analysis — assign a "
+                    "model to the 'image-input' tier on Model Governance > Tiers"
+                )
+            _last_err: Exception = RuntimeError("vision chain empty")
+            for _i, _prov in enumerate(_chain):
+                try:
+                    _answer, _in_tok, _out_tok, _actual = _call_internet_vision(_prov)
+                    # Use what the proxy actually ran, not what we requested.
                     _vision_label = _actual
-                else:
-                    raise
+                    break
+                except Exception as _prov_err:
+                    _last_err = _prov_err
+                    if _i + 1 < len(_chain):
+                        logger.warning(
+                            f"ask_with_image: vision provider {_prov!r} failed "
+                            f"({_prov_err!r}) — trying {_chain[_i + 1]!r}"
+                        )
+            else:
+                raise _last_err
     except Exception as _vision_err:
         logger.error(f"ask_with_image vision failed: {_vision_err}", exc_info=True)
         _answer = "Error processing image. Please try again."

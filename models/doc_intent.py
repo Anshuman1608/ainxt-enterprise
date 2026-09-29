@@ -29,10 +29,19 @@ from typing import Optional
 
 from core.logger import logger
 
-try:
-    from core.config import DOC_INTENT_MODEL as _INTENT_MODEL
-except Exception:  # noqa: BLE001
-    _INTENT_MODEL = "local"
+# Phase 6 §N.1 step 2 / §F "Document intent classification".
+#
+# Read the RAW env var rather than core.config.DOC_INTENT_MODEL, which
+# coalesces blank to "haiku" and so can never be empty — and an override that
+# is always set would permanently beat the tier assignment it is supposed to
+# be deprecated in favour of. Blank here means "no override; ask for the
+# intent-classification tier".
+#
+# The "haiku" default moves to the legacy_hint at the call site below, where
+# it is what it always was: the model this call site used before governance
+# existed, kept for deployments that have not opted in (D15).
+import os as _os
+_INTENT_MODEL = (_os.getenv("DOC_INTENT_MODEL", "") or "").strip()
 
 # Single source of truth for doc-gen intents. "none" = not a document request.
 ACTION_INTENTS = ("generate", "summarize", "convert", "extract", "compare", "revise")
@@ -456,14 +465,18 @@ def classify(text: str, *, has_attachments: bool = False,
         if _turns_block:
             ctx += f"\n{_turns_block}\n"
         prompt = f"{_SYS}{ctx}\nUSER REQUEST:\n{text}\n\nJSON:"
-        # model_router.generate() ALREADY cascades small→cloud internally:
-        # model_hint="local" → TIER_SIMPLE → local model, then GPT-5-mini, then
-        # Claude Sonnet (see models/model_router._try_local_simple). So the
-        # classifier survives a local-model outage automatically. Only a TOTAL
-        # outage (every provider down) yields the "Error: no gateway available"
-        # sentinel below.
-        raw = (model_router.generate(prompt, model_hint=_INTENT_MODEL,
-                                     return_meta=False) or "").strip()
+        # The router cascades internally whichever way this resolves — the
+        # tier's own priority-ordered candidates (§M.5) when governance is on,
+        # the legacy chain when it is not. Either way the classifier survives
+        # one provider being down; only a TOTAL outage yields the "Error: no
+        # gateway available" sentinel handled below.
+        from core.tiers import Tier as _Tier
+        from models.model_router import tier_request as _tier_request
+        raw = (model_router.generate(
+            prompt, return_meta=False,
+            **_tier_request(_Tier.INTENT_CLASSIFICATION, "haiku",
+                            _INTENT_MODEL, override_name="DOC_INTENT_MODEL"),
+        ) or "").strip()
         if not raw or raw.startswith("Error:"):
             raise RuntimeError(f"all models unavailable ({raw[:80]!r})")
         data = _parse_json(raw)

@@ -429,8 +429,10 @@ def cluster_domains_job(payload: dict) -> dict:
     )
     domains = []
     try:
+        from core.tiers import Tier
         from models.model_router import model_router
-        raw = model_router.generate(prompt, model_hint="complex") or ""
+        raw = model_router.generate(
+            prompt, tier=Tier.COMPLEX, legacy_hint="complex") or ""
         m = re.search(r"\[.*\]", raw, re.DOTALL)
         if m:
             domains = json.loads(m.group(0))

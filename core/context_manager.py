@@ -218,8 +218,16 @@ def _rebuild_summary(user_id: str, latest_q: str, latest_a: str) -> None:
                 "Be specific about repos, tickets, and file names."
             )
 
+            # Phase 6 §N.1 step 1. §D.2: the prompt above demands specific
+            # repos, tickets and file names inside a hard 3-sentence bound —
+            # that is instruction-following, so `simple` rather than `mini`.
+            # No residency constraint: unlike memory/, a rolling summary is
+            # regenerated from the live thread rather than persisted as the
+            # record of it.
+            from core.tiers import Tier
             from models.model_router import model_router
-            new_summary = model_router.generate(prompt, model_hint="simple")
+            new_summary = model_router.generate(
+                prompt, tier=Tier.SIMPLE, legacy_hint="simple")
             if new_summary:
                 rec.summary    = new_summary[:1000]
                 rec.updated_at = _now()

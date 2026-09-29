@@ -1635,6 +1635,17 @@ def _env_bool(name: str, default: bool) -> bool:
         pass
     return default
 
+# ── Memory residency policy (Phase 6, §D.2 / §M.1) ────────────────────────────
+# Long-lived memory content — rolling summaries and merged memories — may be
+# the most sensitive text the platform holds, because it is distilled and it
+# persists. §D.2 removed the LOCAL tier that used to keep it in the estate by
+# accident; this keeps it there ON PURPOSE, for deployments whose policy says
+# so. Off by default: a deployment that never had the constraint does not
+# acquire one, and one that did states it.
+#
+# This is posture, not model identity (§I.5 "Keep"), so it survives Phase 8.
+MEMORY_NO_CLOUD_EGRESS = _env_bool("MEMORY_NO_CLOUD_EGRESS", False)
+
 SDLC_HITL_TTL_HOURS            = _env_int("SDLC_HITL_TTL_HOURS", 72)    # feature/bug gates
 SDLC_GOVERNANCE_HITL_TTL_HOURS = _env_int("SDLC_GOVERNANCE_HITL_TTL_HOURS", 168)  # governance = 7d
 
