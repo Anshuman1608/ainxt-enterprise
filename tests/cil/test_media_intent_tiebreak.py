@@ -10,6 +10,15 @@ comparison of the two confidences anywhere.
 So the bug was not "image won", it was "nothing chose". These tests are
 about the choosing.
 
+⚠ THESE TESTS ARE NOT FIELD EVIDENCE. (plan.html Phase 6.5, item 5.)
+On the live deployment the tie-break never fired: once the classifier moved to
+the assigned Haiku it stopped hedging (img=none, vid=0.95), so there was no tie
+to break, and the fix that actually resolved the reported bug was the tier
+migration giving video-generation an eligible model. This helper is correct
+insurance for a weaker classifier — an SLM that returns 0.65 on both, which is
+exactly what llama3.2:1b did — and nothing more than that has been observed.
+Do not read the green ticks below as "the tie-break works in production".
+
 gateway.py writes to /var/lib/ainxt at import time and is not importable
 under pytest, so _media_intent_winner is loaded from source in isolation —
 the same constraint tests/agents/test_gateway_passthrough_logic.py works
