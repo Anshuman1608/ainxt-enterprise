@@ -22,6 +22,18 @@ import {
 import { API_BASE, authFetch } from "../config";
 import { usePermission } from "../hooks/usePermission";
 import { useToast, useConfirm } from "./ui/DialogProvider.jsx";
+// The capability rules live as pure functions so they are tested directly
+// rather than through a rendered component — same arrangement as
+// tierGovernance.js. mergeCapabilities() carries the load-bearing one: the
+// model PUT replaces `capabilities` wholesale, so an edit that submits only
+// the fields it shows deletes everything else on the row.
+import {
+  MODALITY_OPTIONS,
+  asModalityList,
+  billsPerSecond,
+  mergeCapabilities,
+  modalityIsConfirmed,
+} from "../utils/modelCapabilities";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -289,13 +301,13 @@ function TierChips({ tiers }) {
   );
 }
 
-function ModelRow({ model, onToggle, onDelete, onSetDefault, tiers }) {
+function ModelRow({ model, onToggle, onDelete, onSetDefault, onEdit, tiers }) {
   const caps = model.capabilities || {};
   // The fields the tier resolver actually filters on (core/tier_resolver.py),
   // so what the resolver can see is visible here rather than buried in JSON.
-  const modality = Array.isArray(caps.modality)
-    ? caps.modality
-    : caps.modality ? [caps.modality] : [];
+  const modality = asModalityList(caps.modality);
+  const guessed = !modalityIsConfirmed(caps);
+  const perSecond = caps.cost_per_second;
   return (
     <tr className="hover:bg-gray-50">
       <td className="px-3 py-2 font-mono text-xs text-gray-800">{model.model_id}</td>
@@ -303,6 +315,22 @@ function ModelRow({ model, onToggle, onDelete, onSetDefault, tiers }) {
       <td className="px-3 py-2 text-xs text-gray-500">
         {caps.context_window ? `${(caps.context_window / 1000).toFixed(0)}K ctx` : "—"}
         {modality.length > 0 && <span className="text-gray-400"> · {modality.join(", ")}</span>}
+        {guessed && (
+          <span
+            className="ml-1.5 rounded bg-amber-50 px-1 py-0.5 text-[10px] text-amber-700"
+            title="This modality was guessed from the model id, not confirmed. If it is wrong the model silently disappears from the image/video tiers. Edit the model to confirm it."
+          >
+            guessed
+          </span>
+        )}
+        {billsPerSecond(caps) && (
+          <span className="text-gray-400">
+            {" · "}
+            {perSecond != null
+              ? `$${Number(perSecond).toFixed(2)}/s`
+              : <span className="text-amber-700" title="No per-second rate declared — this model bills at the platform default VEO_COST_PER_SECOND, so a cheaper variant costs the same as the full one.">no rate</span>}
+          </span>
+        )}
         {caps.supports_tools !== false && caps.supports_tools !== undefined && (
           <span className="text-gray-400"> · tools</span>
         )}
@@ -331,7 +359,14 @@ function ModelRow({ model, onToggle, onDelete, onSetDefault, tiers }) {
           <Star size={16} fill={model.is_default ? "currentColor" : "none"} />
         </button>
       </td>
-      <td className="px-3 py-2 text-right">
+      <td className="px-3 py-2 text-right whitespace-nowrap">
+        <button
+          onClick={() => onEdit(model)}
+          title="Edit capabilities — modality, context window, and cost"
+          className="p-1 rounded text-gray-400 hover:text-indigo-600 hover:bg-indigo-50"
+        >
+          <Pencil size={14} />
+        </button>
         <button onClick={() => onDelete(model)} className="p-1 rounded text-gray-400 hover:text-red-600 hover:bg-red-50">
           <Trash2 size={14} />
         </button>
@@ -340,19 +375,155 @@ function ModelRow({ model, onToggle, onDelete, onSetDefault, tiers }) {
   );
 }
 
-// Capability vocabulary — must match core/tiers.py and the server-side
-// validation in routers/llm_provider_admin_router.py::_validate_capabilities.
-// These are the fields the tier resolver FILTERS on, which is why they are
-// worth collecting at add-model time rather than leaving for a later edit:
-// a model with no modality cannot be assigned to the image/video tiers, and
-// one with no privacy_class is treated as external (fail-safe) so it will be
-// refused for confidential traffic.
-const MODALITY_OPTIONS = [
-  { value: "text",       label: "Text" },
-  { value: "image-in",   label: "Image input (vision)" },
-  { value: "image-out",  label: "Image output (generation)" },
-  { value: "video-out",  label: "Video output" },
-];
+// Capability vocabulary and the rules over it now live in
+// ../utils/modelCapabilities.js — one copy, imported above. They are the
+// fields the tier resolver FILTERS on, which is why they are worth collecting
+// at add-model time rather than leaving for a later edit: a model with no
+// modality cannot be assigned to the image/video tiers, and one with no
+// privacy_class is treated as external (fail-safe) so it will be refused for
+// confidential traffic.
+
+// ---------------------------------------------------------------------------
+// Edit an EXISTING model's capabilities.
+//
+// Phase 6.5 items 3 and 4 both need an administrator to be able to declare a
+// fact about a model that already exists: a video model's per-second rate, and
+// a confirmation that the guessed modality is right. Until this form existed
+// the screen could add, toggle, star and delete only — so every model imported
+// by "Sync models" was unreachable except by a raw API call, and both items
+// would have shipped as warnings nobody could act on.
+//
+// PUT /llm-providers/models/{id} REPLACES capabilities wholesale (correct PUT
+// semantics), so this submits `{...existing, ...edits}`. Sending only the
+// edited fields would silently drop privacy_class, channels, supports_tools
+// and everything else discovery or the backfill had put there.
+// ---------------------------------------------------------------------------
+
+function EditCapabilitiesForm({ model, onSaved, onCancel, toast }) {
+  const caps = model.capabilities || {};
+
+  const [modality, setModality] = useState(asModalityList(caps.modality));
+  const [contextWindow, setContextWindow] = useState(caps.context_window ?? "");
+  const [privacyClass, setPrivacyClass] = useState(caps.privacy_class ?? "");
+  const [costIn, setCostIn] = useState(caps.cost_per_1m_input ?? "");
+  const [costOut, setCostOut] = useState(caps.cost_per_1m_output ?? "");
+  const [costSec, setCostSec] = useState(caps.cost_per_second ?? "");
+  const [saving, setSaving] = useState(false);
+
+  const isVideo = modality.includes("video-out");
+
+  const toggleModality = (value) =>
+    setModality((cur) =>
+      cur.includes(value) ? cur.filter((v) => v !== value) : [...cur, value]
+    );
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    try {
+      // Merge, never replace — see the note above this component and
+      // mergeCapabilities' own.
+      const next = mergeCapabilities(caps, {
+        modality,
+        context_window: contextWindow,
+        cost_per_1m_input: costIn,
+        cost_per_1m_output: costOut,
+        cost_per_second: costSec,
+        privacy_class: privacyClass,
+      });
+
+      const resp = await authFetch(`${API_BASE}/llm-providers/models/${model.id}`, {
+        method: "PUT",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ capabilities: next }),
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        throw new Error(data.detail || `HTTP ${resp.status}`);
+      }
+      toast.success(`Updated "${model.display_name}".`);
+      onSaved();
+    } catch (err) {
+      toast.error("Failed to update model: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="px-3 py-2 bg-indigo-50/40 space-y-2">
+      <div className="text-[11px] text-gray-500">
+        Editing capabilities for <span className="font-mono text-gray-700">{model.model_id}</span>.
+        {" "}These are the fields the tier resolver filters on — saving a modality
+        marks it as confirmed rather than guessed.
+      </div>
+
+      <div className="flex items-center gap-3 flex-wrap">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] text-gray-500 font-medium">Modality</span>
+          {MODALITY_OPTIONS.map((opt) => (
+            <label key={opt.value} className="flex items-center gap-1 text-[11px] text-gray-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={modality.includes(opt.value)}
+                onChange={() => toggleModality(opt.value)}
+                className="w-3 h-3"
+              />
+              {opt.label}
+            </label>
+          ))}
+        </div>
+
+        <input
+          type="number" value={contextWindow} onChange={(e) => setContextWindow(e.target.value)}
+          placeholder="context window"
+          className="w-32 px-2 py-1 border border-gray-200 rounded text-[11px]"
+        />
+
+        <select
+          value={privacyClass} onChange={(e) => setPrivacyClass(e.target.value)}
+          className="px-2 py-1 border border-gray-200 rounded text-[11px] bg-white"
+          title="Blank = derive from the provider. Only override when the derivation is wrong — typically a self-hosted OpenAI-compatible endpoint."
+        >
+          <option value="">privacy: auto-derive</option>
+          <option value="deployment_local">deployment-local (no egress)</option>
+          <option value="external">external</option>
+        </select>
+
+        <input
+          type="number" step="0.01" min="0" value={costIn} onChange={(e) => setCostIn(e.target.value)}
+          placeholder="$/1M in"
+          className="w-24 px-2 py-1 border border-gray-200 rounded text-[11px]"
+        />
+        <input
+          type="number" step="0.01" min="0" value={costOut} onChange={(e) => setCostOut(e.target.value)}
+          placeholder="$/1M out"
+          className="w-24 px-2 py-1 border border-gray-200 rounded text-[11px]"
+        />
+        {/* Video models are billed by output duration, not tokens, so the
+            per-token fields above do not price them. Shown only for video-out
+            because the field is meaningless anywhere else. */}
+        {isVideo && (
+          <input
+            type="number" step="0.01" min="0" value={costSec} onChange={(e) => setCostSec(e.target.value)}
+            placeholder="$/second"
+            title="Per-second rate for this video model. Without it the platform bills every video model at the flat VEO_COST_PER_SECOND, so a cheaper 'fast' variant costs the same as the full one."
+            className="w-24 px-2 py-1 border border-amber-300 rounded text-[11px]"
+          />
+        )}
+      </div>
+
+      <div className="flex items-center gap-2 justify-end">
+        <button type="submit" disabled={saving} className="p-1.5 rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50">
+          <Check size={14} />
+        </button>
+        <button type="button" onClick={onCancel} className="p-1.5 rounded text-gray-400 hover:text-gray-600">
+          <X size={14} />
+        </button>
+      </div>
+    </form>
+  );
+}
 
 function AddModelForm({ providerId, onAdded, onCancel, toast }) {
   const [modelId, setModelId] = useState("");
@@ -366,7 +537,12 @@ function AddModelForm({ providerId, onAdded, onCancel, toast }) {
   const [privacyClass, setPrivacyClass] = useState("");
   const [costIn, setCostIn] = useState("");
   const [costOut, setCostOut] = useState("");
+  // Video models bill per output second, not per token, so the two fields
+  // above do not price them at all (Phase 6.5 item 3).
+  const [costSec, setCostSec] = useState("");
   const [saving, setSaving] = useState(false);
+
+  const isVideo = modality.includes("video-out");
 
   const toggleModality = (value) =>
     setModality((cur) =>
@@ -385,6 +561,7 @@ function AddModelForm({ providerId, onAdded, onCancel, toast }) {
       if (privacyClass) capabilities.privacy_class = privacyClass;
       if (costIn !== "") capabilities.cost_per_1m_input = parseFloat(costIn);
       if (costOut !== "") capabilities.cost_per_1m_output = parseFloat(costOut);
+      if (isVideo && costSec !== "") capabilities.cost_per_second = parseFloat(costSec);
       const resp = await authFetch(`${API_BASE}/llm-providers/${providerId}/models`, {
         method: "POST",
         headers: JSON_HEADERS,
@@ -396,6 +573,7 @@ function AddModelForm({ providerId, onAdded, onCancel, toast }) {
       }
       setModelId(""); setDisplayName(""); setContextWindow("");
       setModality(["text"]); setPrivacyClass(""); setCostIn(""); setCostOut("");
+      setCostSec("");
       onAdded();
     } catch (err) {
       toast.error("Failed to add model: " + err.message);
@@ -464,6 +642,14 @@ function AddModelForm({ providerId, onAdded, onCancel, toast }) {
           placeholder="$/1M out"
           className="w-24 px-2 py-1 border border-gray-200 rounded text-[11px]"
         />
+        {isVideo && (
+          <input
+            type="number" step="0.01" min="0" value={costSec} onChange={(e) => setCostSec(e.target.value)}
+            placeholder="$/second"
+            title="Per-second rate for this video model. Without it the platform bills every video model at the flat VEO_COST_PER_SECOND."
+            className="w-24 px-2 py-1 border border-amber-300 rounded text-[11px]"
+          />
+        )}
       </div>
 
       <div className="flex items-center gap-2 justify-end">
@@ -672,6 +858,10 @@ function ProviderModels({ provider, toast, confirm, tierUsage }) {
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  // Row id whose capability editor is open, or null. One at a time: the form
+  // sits inside the table as an extra row, so two open at once would make the
+  // relationship between a form and its model ambiguous.
+  const [editingId, setEditingId] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -815,8 +1005,24 @@ function ProviderModels({ provider, toast, confirm, tierUsage }) {
               <tr><td colSpan={8} className="text-center py-6 text-gray-400 text-xs">No models yet — add one below.</td></tr>
             )}
             {models.map((m) => (
-              <ModelRow key={m.id} model={m} onToggle={handleToggle} onDelete={handleDelete}
-                onSetDefault={handleSetDefault} tiers={tierUsage?.byModel?.get(m.id)} />
+              <Fragment key={m.id}>
+                <ModelRow model={m} onToggle={handleToggle} onDelete={handleDelete}
+                  onSetDefault={handleSetDefault}
+                  onEdit={(row) => setEditingId((cur) => (cur === row.id ? null : row.id))}
+                  tiers={tierUsage?.byModel?.get(m.id)} />
+                {editingId === m.id && (
+                  <tr>
+                    <td colSpan={8} className="p-0">
+                      <EditCapabilitiesForm
+                        model={m}
+                        toast={toast}
+                        onCancel={() => setEditingId(null)}
+                        onSaved={() => { setEditingId(null); load(); }}
+                      />
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
             ))}
           </tbody>
         </table>
