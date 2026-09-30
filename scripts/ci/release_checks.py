@@ -547,6 +547,14 @@ _PHASE6_MIGRATED_MODULES = (
     "models/hybrid_retriever.py",
     "sandbox/self_healing_engine.py",
     "workers/secure_code_gate_worker.py",
+    # §N.1 step 8 — the document pipeline, plus the last two consumers of
+    # core/model_registry.py's SDLC CLI helpers that were not themselves SDLC.
+    "workers/doc_worker.py",
+    "workers/doc_worker_agent.py",
+    "agents/doc_generator_agent.py",
+    "services/doc_reviser.py",
+    "services/feedback_processor.py",
+    "routers/coach_router.py",
 )
 
 # The eight tier names plus the legacy aliases that MEAN one of them. A raw
@@ -572,6 +580,14 @@ _ROUTER_ENTRY_POINTS = frozenset({
 })
 
 
+def _tier_hint_message(rel: str, lineno: int, hint: str) -> str:
+    return (
+        f"{rel}:{lineno}: model_hint={hint!r} — this module was migrated in "
+        f"Phase 6; use tier=Tier.X with legacy_hint={hint!r} so governance "
+        f"applies and the flag-off path is unchanged"
+    )
+
+
 def check_tier_migration(cfg) -> list[str]:
     """No migrated module may go back to model_hint="<tier>" (plan.html Phase 6).
 
@@ -595,6 +611,30 @@ def check_tier_migration(cfg) -> list[str]:
         except SyntaxError as exc:
             bad.append(f"{rel}: does not parse ({exc})")
             continue
+        # ── The splat idiom ──────────────────────────────────────────────
+        #
+        # Step 6 introduced `_route = {"model_hint": ...}` / `generate(**_route)`
+        # because "resolve a tier" and "use this hint" cannot both be a
+        # string. The call scan below is blind to it — it reads keywords, and
+        # a splatted local is not one — so the ratchet reported ZERO hits in
+        # agents/tools.py, the single most important file §N.1 step 9 changes.
+        # A check that cannot see the idiom the migration is written in is not
+        # ratcheting anything.
+        #
+        # Flagged wherever the dict LITERAL appears rather than only at the
+        # call, because following the variable would need dataflow and the
+        # pair is indefensible anywhere in a migrated module. Comments and
+        # docstrings that quote the old hint are untouched: they are not Dict
+        # nodes, which is the same reason this check parses instead of greps.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            for k, v in zip(node.keys, node.values):
+                if (isinstance(k, ast.Constant) and k.value == "model_hint"
+                        and isinstance(v, ast.Constant)
+                        and v.value in _PHASE6_TIER_HINTS):
+                    bad.append(_tier_hint_message(rel, node.lineno, v.value))
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -607,17 +647,13 @@ def check_tier_migration(cfg) -> list[str]:
             if callee not in _ROUTER_ENTRY_POINTS:
                 continue
             for kw in node.keywords:
-                if kw.arg != "model_hint":
-                    continue
-                if not (isinstance(kw.value, ast.Constant)
-                        and kw.value.value in _PHASE6_TIER_HINTS):
-                    continue                      # a raw model id, or a variable
-                bad.append(
-                    f"{rel}:{node.lineno}: model_hint={kw.value.value!r} — this "
-                    f"module was migrated in Phase 6; use tier=Tier.X with "
-                    f"legacy_hint={kw.value.value!r} so governance applies and "
-                    f"the flag-off path is unchanged"
-                )
+                # keyword form: generate(..., model_hint="complex")
+                if kw.arg == "model_hint":
+                    if (isinstance(kw.value, ast.Constant)
+                            and kw.value.value in _PHASE6_TIER_HINTS):
+                        bad.append(_tier_hint_message(rel, node.lineno,
+                                                      kw.value.value))
+                    continue                  # a raw model id, or a variable
     return bad
 
 

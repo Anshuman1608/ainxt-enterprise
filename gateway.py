@@ -2881,7 +2881,12 @@ from core.config import (
     AINXT_API_URL     as _AINXT_API_URL,
     AINXT_API_BEARER  as _AINXT_API_KEY,
     AINXT_SESSION_TTL as _AINXT_SESS_TTL_CFG,
-    AINXT_TIER_MAP    as _AINXT_TIER_MAP_CFG,
+    # §N.1 step 11: AINXT_TIER_MAP, a second tier system, became a resolver
+    # over the governed eight. A function rather than a dict because
+    # resolving a tier is a live database read and core.config is imported
+    # before the database exists.
+    AINXT_TIER_ALIASES as _AINXT_TIER_ALIASES,
+    ainxt_model_for    as _ainxt_model_for,
 )
 # Minimum CIL doc-intent confidence required to commit a turn to document
 # generation without re-classifying. Deliberately the SAME env var and default
@@ -8251,14 +8256,14 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 #
                 # Tier-alias values ("claude"/"gpt"/"auto"/tier names) are only
                 # ever produced now by the "auto" path (CIL tier) or legacy
-                # clients; they resolve through _AINXT_TIER_MAP_CFG. A concrete
+                # clients; they resolve through the governed tiers. A concrete
                 # model ID passes through unchanged.
                 _AUTO_MODEL_VALUES = {"", "auto", "default", None}
                 _raw_model = (q.model or "").strip()
                 if _local_model:
                     _ainxt_model = _local_model
                 elif _raw_model and _raw_model.lower() not in _AUTO_MODEL_VALUES \
-                        and _raw_model.lower() not in _AINXT_TIER_MAP_CFG:
+                        and _raw_model.lower() not in _AINXT_TIER_ALIASES:
                     # A concrete, non-alias model ID → use exactly what the user picked.
                     _ainxt_model = _raw_model
                 else:
@@ -8266,10 +8271,7 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                     # _fp_hint was already set from conv_state.task_complexity above
                     # (Phase 3 router driving); fall back to a tier alias or default.
                     _tier = (_fp_hint or _raw_model or "auto").lower().strip()
-                    _ainxt_model = (
-                        _AINXT_TIER_MAP_CFG.get(_tier)
-                        or _AINXT_TIER_MAP_CFG.get("default", "")
-                    )
+                    _ainxt_model = _ainxt_model_for(_tier) or _ainxt_model_for("default")
                 logger.info(
                     f"[ainxt-api] model resolved: user_pick={q.model!r} "
                     f"local={_local_model!r} cil_tier={_fp_hint!r} → {_ainxt_model!r}"

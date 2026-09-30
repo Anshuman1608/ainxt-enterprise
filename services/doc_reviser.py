@@ -22,6 +22,7 @@ import uuid as _uuid
 from typing import Optional
 
 from core.logger import logger
+from core.tiers import Tier
 
 
 def _strip_fences(text: str) -> str:
@@ -82,7 +83,7 @@ def revise(
     # LLM call and reports 0 tokens for the revise turn.
     edit_meta: dict = {}
     try:
-        from models.model_router import model_router
+        from models.model_router import model_router, tier_request
         _res = model_router.generate(
             "You are an expert editor revising an existing document. The document's "
             "current Markdown source is below. Apply the requested change faithfully and "
@@ -90,7 +91,10 @@ def revise(
             "Preserve everything the user did not ask to change.\n\n"
             f"CHANGE REQUESTED: {instruction}\n\n"
             f"CURRENT DOCUMENT (\"{ref.title}\"):\n{source[:80000]}",
-            model_hint="complex",   # cloud authoring model — quality
+            # §N.1 step 8: was model_hint="complex". Document revision is
+            # authoring, so it asks for the authoring tier and an administrator
+            # decides which model that is.
+            **tier_request(Tier.COMPLEX, "complex"),
             return_meta=True,
         )
         if isinstance(_res, dict):

@@ -448,24 +448,133 @@ AINXT_MODEL_COMPLEX   = os.getenv("AINXT_MODEL_COMPLEX",   "") or AINXT_MODEL_DE
 AINXT_MODEL_LOCAL     = os.getenv("AINXT_MODEL_LOCAL",     "") or AINXT_MODEL_DEFAULT
 AINXT_MODEL_LOCAL_MINI = os.getenv("AINXT_MODEL_LOCAL_MINI", "") or AINXT_MODEL_DEFAULT
 
-# Built tier map — imported by gateway.py instead of hardcoding inline.
-AINXT_TIER_MAP: dict = {
-    "simple":     AINXT_MODEL_SIMPLE,
-    "medium":     AINXT_MODEL_MEDIUM,
-    "complex":    AINXT_MODEL_COMPLEX,
-    "local":      AINXT_MODEL_LOCAL,
-    "local_mini": AINXT_MODEL_LOCAL_MINI,
-    "auto":       AINXT_MODEL_DEFAULT,
-    "default":    AINXT_MODEL_DEFAULT,
-    # Provider aliases: map to the appropriate tier model so the CLI session
-    # is created with the right model when the user picks a cloud provider.
-    # Previously these all mapped to AINXT_MODEL_DEFAULT (a local model),
-    # which meant switching to Claude/GPT in the UI had no effect on the CLI.
-    "claude":     AINXT_MODEL_COMPLEX,   # Claude → complex tier (claude-sonnet-4-6)
-    "sonnet":     AINXT_MODEL_COMPLEX,
-    "gpt":        AINXT_MODEL_MEDIUM,    # GPT → medium tier (gpt-5.4)
-    "gemini":     AINXT_MODEL_DEFAULT,   # Gemini → default (no dedicated tier yet)
+# Per-tier operator overrides for ainxt-api, highest precedence. This used to
+# be a dict, AINXT_TIER_MAP — §N.1 step 11's whole subject, because it was a
+# SECOND tier system: its own vocabulary (including `local` and `local_mini`,
+# two deployment topologies the governed eight deliberately do not have), its
+# own vendor aliases, and its own env vars, none of which the Tiers screen
+# could see. The header above called these "in-house vLLM model ID"s while the
+# alias comments named claude-sonnet-4-6 — a map whose own documentation
+# disagreed with itself is what an unowned second source of truth looks like.
+_AINXT_TIER_OVERRIDES: dict = {
+    # Both AINXT_MODEL_LOCAL and AINXT_MODEL_LOCAL_MINI fed tiers that now
+    # resolve through `mini`, so both are still honoured. Dropping the first
+    # would silently ignore a pin a deployment had already set, which is the
+    # one thing a migration billed as a no-op must not do.
+    "mini":    ("AINXT_MODEL_LOCAL_MINI",
+                AINXT_MODEL_LOCAL_MINI or AINXT_MODEL_LOCAL),
+    "simple":  ("AINXT_MODEL_SIMPLE",     AINXT_MODEL_SIMPLE),
+    "medium":  ("AINXT_MODEL_MEDIUM",     AINXT_MODEL_MEDIUM),
+    "complex": ("AINXT_MODEL_COMPLEX",    AINXT_MODEL_COMPLEX),
 }
+
+
+def ainxt_model_for(tier_or_alias: str) -> str:
+    """Resolve an ainxt-api session model from a tier name or a legacy alias.
+
+    Replaces AINXT_TIER_MAP. It has to be a function, not a dict: resolving a
+    tier needs a live database read, this module is imported before the
+    database exists, and everything imports this module. Hence the lazy
+    imports in the body — the idiom core/model_registry.py::_role_model
+    already uses for the same reason.
+
+    Precedence:
+      1. AINXT_MODEL_<TIER> — an operator naming a model explicitly. Kept
+         because ainxt-api may be fronting an in-house vLLM deployment whose
+         model ids the platform registry does not carry.
+      2. The administrator's tier assignment.
+      3. AINXT_MODEL_DEFAULT.
+
+    Never raises. An unassigned tier degrades to AINXT_MODEL_DEFAULT: this
+    sits on a chat turn, and a 500 because nobody filled in a Tiers row is a
+    worse answer than the deployment's default model.
+    """
+    from core.logger import logger
+    from core.tiers import Tier, resolve_legacy_alias, note_legacy_alias
+
+    raw = (tier_or_alias or "").strip()
+    key = raw.lower()
+
+    # `local` and `local_mini` named hardware, not a capability. The governed
+    # vocabulary has no equivalent, and LEGACY_INBOUND_ALIASES sends
+    # `local_mini` to intent-classification — correct for its one consumer in
+    # §E (the CIL classifier) but wrong here, because this picks the model for
+    # a whole interactive session rather than for a classification. `mini` is
+    # the honest target for both.
+    if key in ("local", "local_mini"):
+        tier = Tier.MINI
+    elif key in ("", "auto", "default"):
+        # "the CIL offered nothing". gateway.py's own flat default for that
+        # case is "medium" (_fp_hint), so the two now agree.
+        tier = Tier.MEDIUM
+    elif key == "gemini":
+        # A VENDOR name, not a model. resolve_legacy_alias calls it
+        # EXPLICIT_MODEL, which is right for a chat picker — "the user named
+        # this" — but useless here: handing ainxt-api the string "gemini" as a
+        # model id would fail. It resolved to AINXT_MODEL_DEFAULT before and it
+        # still does. Offering a vendor where a model is required is a gap in
+        # the selector; this resolver cannot invent the missing answer, and
+        # guessing a family default would silently pick for the user.
+        note_legacy_alias(key, "ainxt-api")
+        return AINXT_MODEL_DEFAULT
+    else:
+        # Boundary translation. These values reach here only from the auto
+        # path or from legacy clients, which is resolve_legacy_alias's
+        # documented use; note_legacy_alias feeds the counter whose reading
+        # zero is what lets the shim be removed in Phase 10.
+        resolved = resolve_legacy_alias(key)
+        if not isinstance(resolved, Tier):
+            # Either EXPLICIT_MODEL (a concrete SKU such as "claude-opus-5")
+            # or not an alias at all (an in-house id such as
+            # "qwen-3.6-35B-A3B"). Both mean a human named a specific model,
+            # so return it UNCHANGED — including its casing, because model ids
+            # are case-sensitive. Same thing gateway.py's own "concrete,
+            # non-alias model ID" branch does.
+            if resolved is not None:
+                note_legacy_alias(key, "ainxt-api")
+            return raw
+        note_legacy_alias(key, "ainxt-api")
+        tier = resolved
+
+    env_name, env_value = _AINXT_TIER_OVERRIDES.get(tier.value, ("", ""))
+    if env_value:
+        if env_name and env_name not in _AINXT_OVERRIDE_WARNED:
+            _AINXT_OVERRIDE_WARNED.add(env_name)
+            logger.warning(
+                "%s=%r is set, so it overrides the %r tier assignment for "
+                "ainxt-api. This variable is DEPRECATED — assign a model to "
+                "%r on Model Governance > Tiers and unset it.",
+                env_name, env_value, tier.value, tier.value,
+            )
+        return env_value
+
+    try:
+        from core.tier_resolver import resolve_tier
+        return resolve_tier(tier).model_id
+    except Exception as exc:  # noqa: BLE001 — incl. NoEligibleModel
+        logger.warning(
+            "[ainxt-api] tier %r has no eligible model (%s) — using "
+            "AINXT_MODEL_DEFAULT=%r. Assign one on Model Governance > Tiers.",
+            tier.value, exc, AINXT_MODEL_DEFAULT,
+        )
+        return AINXT_MODEL_DEFAULT
+
+
+# Warned-once set, mirroring models/model_router.py::_TIER_OVERRIDE_WARNED.
+_AINXT_OVERRIDE_WARNED: set = set()
+
+
+# Which values ainxt_model_for() treats as a tier request rather than as a
+# model id the user named. gateway.py needs this to tell the two apart before
+# it calls, and duplicating the list there is how the two would drift.
+AINXT_TIER_ALIASES: frozenset = frozenset({
+    "mini", "simple", "medium", "complex",
+    "local", "local_mini", "auto", "default",
+    # Vendor aliases. "gemini" is here because it was a key of the old map and
+    # removing it would change routing: the gateway would stop treating it as
+    # an alias and forward the bare word as a model id.
+    "claude", "sonnet", "gpt", "gemini", "haiku", "deep", "solution", "opus",
+})
 
 
 # ── Generated image storage ──────────────────────────────────

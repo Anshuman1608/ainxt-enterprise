@@ -973,9 +973,14 @@ def _anthropic_to_gemini_tool(tools: list):
 gemini_gateway = GeminiGateway()
 
 
-def generate_image_gemini(prompt: str) -> bytes | None:
-    """Module-level helper — generates image via Gemini Imagen 3 through the gateway."""
-    return gemini_gateway.generate_imagen(prompt)
+def generate_image_gemini(prompt: str, model: str = "") -> bytes | None:
+    """Module-level helper — generates image via Gemini Imagen through the gateway.
+
+    `model` is the SKU an `image-output` tier assignment resolved to (§N.1
+    step 8). Blank means the deployment default, which is what every caller
+    sent before the document pipeline learned to ask the tier.
+    """
+    return gemini_gateway.generate_imagen(prompt, model=(model or "").strip())
 
 
 def generate_with_image(

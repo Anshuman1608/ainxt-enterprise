@@ -35,6 +35,10 @@ import uuid as _uuid_mod
 from core.config import RDB_STREAM, DOC_STORAGE_DIR, user_doc_dir
 from core.kv import get_kv
 from core.logger import logger
+# §N.1 step 8. core.tiers is a stdlib-only leaf, so importing it at module
+# scope cannot create the cycle that keeps every model_router import in this
+# file function-local.
+from core.tiers import Tier
 
 # PERF: hoisted from the 3 function-local imports this module used to have
 # (_safe_log, the question-mode compliance gate, the MD-session compliance
@@ -77,7 +81,16 @@ def _safe_log(value, limit: int = 120) -> str:
 # Persistent storage (see core.config.DOC_STORAGE_DIR). NOT /tmp — files must
 # survive container restart so refresh-then-download keeps working.
 DOC_DIR    = DOC_STORAGE_DIR
-os.makedirs(DOC_DIR, exist_ok=True)
+try:
+    os.makedirs(DOC_DIR, exist_ok=True)
+except OSError as _mkdir_err:
+    # Same treatment core/config.py:403 already gives the same directory:
+    # surface at first USE rather than crash at import. Every writer here
+    # does its own makedirs, so a module that only reads routing config (or a
+    # test that only imports one function) must not be unable to load because
+    # the persistent volume is not mounted. Before this guard, importing any
+    # of these four modules outside a container raised PermissionError.
+    logger.warning(f"doc storage dir {DOC_DIR!r} not creatable at import: {_mkdir_err}")
 RESULT_TTL = 86400  # 24 h — Redis result TTL only; binary lives forever in DOC_DIR/Postgres
 
 # ── Image provider config ─────────────────────────────────────────────────────
@@ -835,8 +848,9 @@ def _skill_generate(
         if llm_caller is not None:
             # Injected caller (tests) — no meta available; nothing to accumulate.
             return (llm_caller(prompt) or "").strip()
-        from models.model_router import model_router
-        result = model_router.generate(prompt, model_hint="complex", return_meta=True)
+        from models.model_router import model_router, tier_request
+        result = model_router.generate(prompt, return_meta=True,
+                                       **tier_request(Tier.COMPLEX, "complex"))
         # model_router.generate(return_meta=True) returns {"text": ..., "meta":
         # {model,in_tok,out_tok,tokens,cost_usd,latency}} — the usage lives under
         # "meta" (see model_router.generate). Accumulate across every call.
@@ -1524,20 +1538,78 @@ def _image_eligible_slide_types() -> set[str]:
     return {"title"}
 
 
+# ── Which model draws the pictures ───────────────────────────────────────
+#
+# §N.1 step 8. This used to be three independent guesses — _resolve_image_provider
+# sniffed GOOGLE_API_KEY then OPENAI_API_KEY, _sandbox_image_provider sniffed
+# the same two in the other order, and sandbox/doc_executor.py defaulted to
+# "openai" — none of which asked the `image-output` tier that
+# routers/chat_router.py has consulted since Phase 6.5.
+#
+# Sniffing env keys is not merely untidy, it was WRONG: the check was for
+# GOOGLE_API_KEY, and the variable this platform actually sets (and that
+# gateway_gemini.py:81 reads) is GEMINI_API_KEY. So document and PPTX image
+# generation reported "disabled" on a deployment that had a working Gemini
+# key, an `image-output` assignment, and working image generation in chat.
+# There was no error anywhere: a missing image just becomes a geometric slide.
+#
+# Now there is one decision, and the administrator makes it on
+# Model Governance > Tiers.
+
+# Registry family → the provider vocabulary the image paths speak. NOT the same
+# vocabulary: the resolver deals in llm_providers.family (anthropic|gemini|
+# ollama|openai), the proxy and the doc sandbox deal in gemini|dalle|openai.
+# Keeping the two apart is the whole reason this map is written down.
+_FAMILY_TO_IMAGE_PROVIDER = {
+    "gemini": "gemini",
+    "openai": "dalle",
+}
+
+
+def _image_target() -> tuple[str, str]:
+    """(provider, model_id) for document image generation.
+
+    provider is "gemini" | "dalle" | "disabled"; model_id is the concrete SKU
+    the `image-output` tier resolved to, or "" when the deployment's default
+    should be used.
+
+    PPT_IMAGE_PROVIDER still overrides — including PPT_IMAGE_PROVIDER=disabled,
+    which stays the explicit way to turn document images off. An unassigned or
+    unusable tier degrades to "disabled" rather than raising: a missing image
+    means a geometric slide, and no document has ever failed over one.
+    """
+    forced = _PPT_IMG_PROVIDER.lower().strip()
+    if forced and forced != "auto":
+        return (forced, "")
+
+    try:
+        from core.tier_resolver import NoEligibleModel
+        from models.model_router import resolve_media_model
+        rm = resolve_media_model(Tier.IMAGE_OUTPUT)
+    except Exception as exc:  # noqa: BLE001 — incl. NoEligibleModel
+        logger.info(
+            f"doc_worker: image-output tier unavailable ({exc}) — document "
+            f"images disabled. Assign an image model on "
+            f"Model Governance > Tiers to enable them."
+        )
+        return ("disabled", "")
+
+    provider = _FAMILY_TO_IMAGE_PROVIDER.get(rm.family)
+    if not provider:
+        logger.warning(
+            f"doc_worker: {rm.model_id!r} is assigned to the 'image-output' "
+            f"tier but its provider family ({rm.family!r}) has no "
+            f"image-generation gateway on this platform — document images "
+            f"disabled."
+        )
+        return ("disabled", "")
+    return (provider, rm.model_id)
+
+
 def _resolve_image_provider() -> str:
-    p = _PPT_IMG_PROVIDER.lower().strip()
-    if p != "auto":
-        return p
-    # When LLM_PROXY_URL is set (production), the proxy holds all API keys —
-    # always enable image generation and let the proxy decide the provider.
-    if os.getenv("LLM_PROXY_URL"):
-        return "gemini"   # proxy will auto-fallback to dalle if gemini unavailable
-    # Local dev: check direct API keys
-    if os.getenv("GOOGLE_API_KEY"):
-        return "gemini"
-    if os.getenv("OPENAI_API_KEY"):
-        return "dalle"
-    return "disabled"
+    """Just the provider half of _image_target. Kept as its own name because
+    two call sites branch on it and neither needs the model id."""
+    return _image_target()[0]
 
 
 # ── Sandbox PPTX path (uses sandbox.doc_executor.build) ─────────────────────
@@ -1560,57 +1632,120 @@ def _should_use_sandbox_pptx(fmt: str) -> bool:
 
 def _sandbox_image_provider() -> tuple[str, str]:
     """
-    Pick (provider, prompt-suffix) for sandbox.doc_executor image generation.
-    Order: OpenAI → Gemini-2.5-Flash-Image. _resolve_image_provider() returns
-    "gemini" | "dalle" | "disabled"; map to executor's "gemini"/"openai" vocab.
+    Pick (provider, model_id) for sandbox.doc_executor image generation.
+
+    Same decision as _image_target, translated into the executor's vocabulary
+    ("gemini" | "openai" | "disabled"). It used to sniff OPENAI_API_KEY and
+    LLM_PROXY_URL and prefer OpenAI — a second, differently-ordered guess at
+    the question _image_target now answers once.
+
+    The second element used to be an unused prompt-suffix and is now the model
+    id, so the executor can name the SKU the tier resolved rather than running
+    whichever model its own env happens to point at.
     """
-    p = _resolve_image_provider()
-    if p == "disabled":
+    provider, model_id = _image_target()
+    if provider == "disabled":
         return ("disabled", "")
-    if p == "dalle":
-        return ("openai", "")
-    # Prefer OpenAI when both are available; fall back to Gemini Flash Image.
-    if os.getenv("OPENAI_API_KEY") or os.getenv("LLM_PROXY_URL"):
-        return ("openai", "")
-    return ("gemini", "")  # proxy/executor selects gemini-2.5-flash-image
+    return ("openai" if provider == "dalle" else "gemini", model_id)
 
 
-# ── Doc-generation model hint resolver ───────────────────────────────────────
+# ── Doc-generation model routing ─────────────────────────────────────────────
 #
-# Resolution order (per product requirement):
+# Resolution order (per product requirement, unchanged):
 #   1. The user's explicit chat-model selection (e.g. "openai-deep",
-#      "claude-opus48", "local:Kimi-k2.5") — user agency wins.
-#   2. Only when the user is on "auto", consult DOC_MODEL_PROVIDER env var
-#      so admins can pin doc generation to a specific tier without touching
-#      the user's chat-model preference.
-#   3. Final fallback: "complex" → Claude Sonnet, which is what the system
-#      did before this knob existed.
+#      "claude-opus48", "local:Kimi-k2.5") — user agency wins. §G of the tier
+#      migration lists this as a hard requirement: `user_model_hint` rides a
+#      Kafka payload from routers/doc_download_router.py to here and must
+#      survive byte-for-byte.
+#   2. Only when the user is on "auto", consult DOC_MODEL_PROVIDER so admins
+#      can pin doc generation without touching the user's preference.
+#   3. Final fallback: the `complex` TIER — whichever model an administrator
+#      assigned to it on Model Governance > Tiers.
 #
-# The returned string is a model_router tier hint ("complex" | "fast" |
-# "openai-deep" | "claude-opus48" | "claude-opus46" | "local" | …) — see
-# models/model_router.py for the canonical list.
+# §N.1 step 8. What changed is only (3): it used to be the literal hint
+# "complex", which resolved through _HINT_MAP to CLAUDE_PRIMARY_MODEL. It is
+# now a capability request, so the Tiers screen governs document generation.
+#
+# DOC_MODEL_PROVIDER now splits by the KIND of value it holds (D28):
+#   * one of the eight governed tier names → resolved through the tier table,
+#     because an operator writing `complex` is naming a capability and that is
+#     exactly what the Tiers screen is for;
+#   * anything else (a vendor alias like "openai-deep", or a concrete model id)
+#     → honoured verbatim and warned once per process, because that is a
+#     deliberate bypass and it should be visible and countable rather than
+#     silent. See models/model_router.py::tier_request.
 
 _DEFAULT_DOC_MODEL_HINT = "complex"
+
+# The tier names DOC_MODEL_PROVIDER may govern. The four TEXT tiers only, and
+# only because each is also a _HINT_MAP key — which is what lets the flag-off
+# legacy hint be the same word. The four modality tiers are not text
+# generators, so naming one here is operator error and takes the
+# honoured-and-warned branch, where the router reports an unknown model rather
+# than silently producing prose for an image request.
+_DOC_GOVERNED_TIERS = frozenset({
+    Tier.MINI.value, Tier.SIMPLE.value, Tier.MEDIUM.value, Tier.COMPLEX.value,
+})
 
 # After the first draft, run a self-critique + refine pass to deepen thin
 # sections and improve flow. On by default; set DOCGEN_REFINE=0 to disable.
 _DOCGEN_REFINE_ENABLED = (os.getenv("DOCGEN_REFINE", "1").strip() not in ("0", "false", "no", ""))
 
 
-def _resolve_doc_model_hint(user_model_hint: str | None) -> str:
-    """Pick the model_router hint for doc-generation LLM calls.
+def _resolve_doc_route(user_model_hint: str | None) -> dict:
+    """Routing kwargs for a doc-generation LLM call, to splat into generate().
 
-    See module-level comment for the order. ``"local:..."`` strings are
-    normalised to ``"local"`` because that's the tier name; the specific
-    local model name is forwarded separately when callers need it.
+    Returns EITHER ``{"model_hint": "<pin>"}`` when a human named a model, OR
+    ``{"tier": Tier.COMPLEX, "legacy_hint": "complex"}`` when nobody did.
+
+    A dict rather than a string because "no pin — use the tier" has no string
+    that expresses it: ModelRouter._coerce_tier raises on a legacy_hint that is
+    not a _HINT_MAP key, and falsy hints are stripped, so there is no hint
+    meaning "no hint". Threading the kwargs keeps the distinction intact all
+    the way to the router instead of flattening it at the first hop.
     """
+    # NOTE the .lower(): this is what the user path has always done and it is
+    # left exactly as it was. It is lossy for a mixed-case model id, but the
+    # user path is §G's hard requirement and changing how a dropdown pick is
+    # normalised is a routing change for every existing deployment — not
+    # something to fold into a tier migration. The env path below does NOT
+    # lower, because D28 makes a concrete id a first-class value there.
     user_choice = (user_model_hint or "").strip().lower()
     if user_choice and user_choice != "auto":
-        return "local" if user_choice.startswith("local:") else user_choice
-    env_choice = (os.getenv("DOC_MODEL_PROVIDER", "") or "").strip().lower()
-    if env_choice:
-        return env_choice
-    return _DEFAULT_DOC_MODEL_HINT
+        # ``local:<id>`` normalises to "local" because that is the hint name;
+        # the specific local model is forwarded separately when callers need it.
+        return {"model_hint": "local" if user_choice.startswith("local:") else user_choice}
+
+    from models.model_router import tier_request
+
+    env_choice = (os.getenv("DOC_MODEL_PROVIDER", "") or "").strip()
+    if not env_choice:
+        return tier_request(Tier.COMPLEX, _DEFAULT_DOC_MODEL_HINT)
+    if env_choice.lower() in _DOC_GOVERNED_TIERS:
+        # An operator naming a capability. The legacy hint is the SAME word, not
+        # the module default: with governance off, DOC_MODEL_PROVIDER=medium has
+        # always meant model_hint="medium", and it still must.
+        return tier_request(Tier(env_choice.lower()), env_choice.lower())
+    # A concrete model id or a vendor alias — honoured verbatim, warned, counted.
+    # Verbatim matters: model ids are case-sensitive, and the old code
+    # lower()ed this value, so DOC_MODEL_PROVIDER=Qwen-3.6-35B reached the
+    # registry as "qwen-3.6-35b" and missed.
+    return tier_request(Tier.COMPLEX, _DEFAULT_DOC_MODEL_HINT, env_choice,
+                        override_name="DOC_MODEL_PROVIDER")
+
+
+def _resolve_doc_model_hint(user_model_hint: str | None) -> str:
+    """The human-readable form of _resolve_doc_route, for log lines.
+
+    Kept because four existing log lines print it and workers/doc_worker_agent
+    imports it. Returns the tier name when nothing is pinned, which is what a
+    reader of the log wants to see — but callers must route with
+    _resolve_doc_route, not with this, or they lose the tier/hint distinction.
+    """
+    route = _resolve_doc_route(user_model_hint)
+    if "model_hint" in route:
+        return str(route["model_hint"])
+    return str(route["tier"].value)
 
 
 def _author_pptxgenjs_code(title: str, slides: list,
@@ -1624,7 +1759,7 @@ def _author_pptxgenjs_code(title: str, slides: list,
     materialise into the work dir BEFORE the build (so the JS can embed
     them via slide.addImage({path: "<filename>"})).
     """
-    provider, _ = _sandbox_image_provider()
+    provider, _img_model = _sandbox_image_provider()
     eligible = _image_eligible_slide_types()
     logger.info(
         f"[docgen] worker pptxgenjs image gate | all_slides={_PPT_IMAGES_ALL_SLIDES} "
@@ -1645,6 +1780,10 @@ def _author_pptxgenjs_code(title: str, slides: list,
                 "prompt": img_prompt,
                 "aspect_ratio": "16:9",
                 "provider": provider,
+                # The SKU the image-output tier resolved to. Absent/blank means
+                # "the deployment's configured default", which is what every
+                # caller sent before §N.1 step 8.
+                "model": _img_model,
             })
         else:
             # Drop any stale image_file so non-eligible slides render purely
@@ -1688,10 +1827,11 @@ def _author_pptxgenjs_code(title: str, slides: list,
         f"DECK SCHEMA:\n{schema_json}\n"
     )
 
-    from models.model_router import model_router
+    from models.model_router import model_router, tier_request
     # return_meta=True so the (dominant) PPTX code-authoring cost is captured
     # for budget accounting instead of being dropped.
-    result = model_router.generate(prompt, model_hint="complex", return_meta=True)
+    result = model_router.generate(prompt, return_meta=True,
+                                   **tier_request(Tier.COMPLEX, "complex"))
     if isinstance(result, dict):
         raw = result.get("text") or ""
         # Usage lives under "meta" (see model_router.generate return contract).
@@ -1809,10 +1949,10 @@ def _generate_pptx_via_sandbox(
         _publish_progress(job_id, 4, 6, "Generating File",
                           f"Polishing layout (visual review {_qa_rev + 1})…")
         try:
-            from models.model_router import model_router as _mr_qa
+            from models.model_router import model_router as _mr_qa, tier_request
             _repaired = doc_critic.strip_code_fence(
                 _mr_qa.generate(doc_critic.build_repair_prompt("pptx", code, _crit.issues),
-                                model_hint="complex") or ""
+                                **tier_request(Tier.COMPLEX, "complex")) or ""
             )
         except Exception as _re:
             logger.warning(f"[docgen] worker PPTX visual-QA repair gen failed (shipping) | job={job_id}: {_re}")
@@ -3559,16 +3699,38 @@ def _sanitize_llm_title(llm_title: str, question: str) -> str:
     return t
 
 
-# Env knob: which local model names the document. Defaults to the local tier;
-# forward-ready for kimi-k2.7 / glm-5.2 (set DOC_INTENT_MODEL=local:<model-id>).
-_TITLE_MODEL_HINT = (os.getenv("DOC_INTENT_MODEL", "") or "local").strip() or "local"
+# ── Which model names the document ───────────────────────────────────────
+#
+# §N.1 step 8. Titling asks for the `simple` TIER: a 3-9 word title is short
+# bounded output that still has to follow instructions, which is what `simple`
+# names (core/tiers.py). It used to be the literal hint "local", i.e. a
+# deployment topology standing in for a capability.
+#
+# The override is DOC_TITLE_MODEL, which is new. Titling used to read
+# DOC_INTENT_MODEL — the SAME variable models/doc_intent.py reads for document
+# INTENT CLASSIFICATION, with a different default ("local" here, "haiku"
+# there). One variable, two unrelated consumers: setting it to steer intent
+# classification silently moved titling too, and vice versa. DOC_INTENT_MODEL
+# is still honoured here as a deprecated fallback so nothing changes on
+# upgrade for a deployment that set it.
+_TITLE_MODEL_OVERRIDE = (
+    (os.getenv("DOC_TITLE_MODEL", "") or "").strip()
+    or (os.getenv("DOC_INTENT_MODEL", "") or "").strip()
+)
+
+
+def _title_route() -> dict:
+    """Routing kwargs for the titling call. See _TITLE_MODEL_OVERRIDE."""
+    from models.model_router import tier_request
+    return tier_request(Tier.SIMPLE, "haiku", _TITLE_MODEL_OVERRIDE,
+                        override_name="DOC_TITLE_MODEL")
 
 
 def _title_from_content(question: str, sections: list | None = None,
                          content_md: str = "", heuristic: str | None = None) -> str:
     """
-    AUTHORITATIVE title: name the document from its ACTUAL CONTENT using the fast
-    in-house local model — the way Claude/GPT title a document. Regex heuristics
+    AUTHORITATIVE title: name the document from its ACTUAL CONTENT using the
+    `simple` tier's model — the way Claude/GPT title a document. Regex heuristics
     (`_derive_title_from_question`) are only a fail-open fallback because they
     cannot handle typos ("summarizr") or vague prompts ("summarize this doc").
 
@@ -3607,8 +3769,8 @@ def _title_from_content(question: str, sections: list | None = None,
             f"User request (context only): {(question or '').strip()[:300]}\n\n"
             f"Document content:\n{snapshot}\n\nTITLE:"
         )
-        raw = (model_router.generate(prompt, model_hint=_TITLE_MODEL_HINT,
-                                     return_meta=False) or "").strip()
+        raw = (model_router.generate(prompt, return_meta=False,
+                                     **_title_route()) or "").strip()
         # Take first line, strip quotes/fences/trailing punctuation.
         raw = raw.splitlines()[0].strip() if raw else ""
         raw = raw.strip('`"\'' ).strip()
@@ -4601,13 +4763,21 @@ def _llm_call(
         prompt: str,
         job_id: str = "",
         system_prompt: str | None = None,
-        model_hint: str = _DEFAULT_DOC_MODEL_HINT,
+        route: dict | None = None,
 ) -> tuple:
     """
     Call model_router.generate and return (raw_text, llm_meta).
     Raises on failure.
+
+    `route` is the kwargs mapping from _resolve_doc_route — either a user's
+    model pin or a tier request. ``None`` means "nobody pinned anything", which
+    resolves the default tier; it never means "no routing", so a caller that
+    forgets to thread it degrades to the documented default rather than to
+    whatever the router guesses.
     """
     from models.model_router import model_router
+    route = route if route is not None else _resolve_doc_route(None)
+    model_hint = route.get("model_hint") or str(route.get("tier").value)
     full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
     # Guard: warn when prompt is very large. Claude Sonnet = 200K tokens ≈ 150K chars.
     # Model router auto-promotes to Gemini (1M tokens) above 80% of tier window,
@@ -4623,7 +4793,7 @@ def _llm_call(
         f"[docgen] worker calling model_router.generate | job={job_id} "
         f"prompt_len={_prompt_len} model_hint={model_hint!r}"
     )
-    result   = model_router.generate(full_prompt, model_hint=model_hint, return_meta=True)
+    result   = model_router.generate(full_prompt, return_meta=True, **route)
     raw      = (result.get("text") or "").strip()
     llm_meta = result.get("meta") or {}
     if not raw:
@@ -4639,7 +4809,7 @@ def _llm_call(
 
 
 def _refine_sections(job_id: str, fmt: str, question: str, title: str,
-                     sections: list, model_hint: str) -> list:
+                     sections: list, route: dict | None = None) -> list:
     """Self-critique + refine pass over the first-draft sections.
 
     Takes the first-draft sections and asks the authoring model to critique and
@@ -4675,7 +4845,7 @@ def _refine_sections(job_id: str, fmt: str, question: str, title: str,
         f"DRAFT:\n{draft_json}\n\nIMPROVED JSON:"
     )
     logger.info(f"[docgen] worker refine pass START | job={job_id} sections={len(sections)}")
-    raw, _meta = _llm_call(critique_prompt, job_id=job_id, model_hint=model_hint)
+    raw, _meta = _llm_call(critique_prompt, job_id=job_id, route=route)
     refined = _parse_llm_json(raw, job_id=job_id)
     new_sections = refined.get("sections") if isinstance(refined, dict) else None
     if isinstance(new_sections, list) and len(new_sections) >= max(1, len(sections) - 1):
@@ -4852,6 +5022,7 @@ def _llm_structure(job_id: str, fmt: str, question: str, override_prompt: str | 
                 f"- Do NOT wrap the JSON in ```json``` or any other fence"
             )
 
+    _route = _resolve_doc_route(user_model_hint)
     model_hint = _resolve_doc_model_hint(user_model_hint)
     logger.info(
         f"[docgen] worker _llm_structure model resolution | job={job_id} "
@@ -4866,12 +5037,12 @@ def _llm_structure(job_id: str, fmt: str, question: str, override_prompt: str | 
             raw, llm_meta = _stream(
                 struct_prompt, context=f"doc:{job_id}",
                 on_section=on_section, on_title=on_title,
-                model_hint=model_hint,
+                route=_route,
             )
             if raw.startswith("Error"):
                 raise RuntimeError(f"LLM call failed: {raw}")
         else:
-            raw, llm_meta = _llm_call(struct_prompt, job_id=job_id, model_hint=model_hint)
+            raw, llm_meta = _llm_call(struct_prompt, job_id=job_id, route=_route)
 
         struct = _parse_llm_json(raw, job_id=job_id)
 
@@ -4936,7 +5107,7 @@ def _llm_structure(job_id: str, fmt: str, question: str, override_prompt: str | 
                         f"falling back to narrative xlsx prompt | job={job_id}"
                     )
                     raw2, llm_meta2 = _llm_call(
-                        _build_xlsx_prompt(question), job_id=job_id, model_hint=model_hint)
+                        _build_xlsx_prompt(question), job_id=job_id, route=_route)
                     struct = _parse_llm_json(raw2, job_id=job_id)
                     # Merge cost/meta from the fallback call. The probe call's
                     # tokens/cost are real spend and must be ACCUMULATED, not
@@ -4990,7 +5161,7 @@ def _llm_structure(job_id: str, fmt: str, question: str, override_prompt: str | 
             if _refine_ok:
                 try:
                     sections = _refine_sections(job_id, fmt, question, llm_title,
-                                                sections, model_hint)
+                                                sections, _route)
                 except Exception as _rerr:  # noqa: BLE001
                     logger.warning(f"[docgen] worker refine pass failed (using draft): {_rerr}")
             logger.info(f"[docgen] worker _llm_structure DONE | job={job_id} sections={len(sections)} domain={domain!r}")
@@ -5086,6 +5257,7 @@ def _llm_structure_split(job_id: str, fmt: str, question: str, requested_count: 
 
     # Resolve the model hint once for every pass — same precedence rules
     # as the single-pass path (_llm_structure → _resolve_doc_model_hint).
+    _split_route = _resolve_doc_route(user_model_hint)
     _split_model_hint = _resolve_doc_model_hint(user_model_hint)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -5110,7 +5282,7 @@ def _llm_structure_split(job_id: str, fmt: str, question: str, requested_count: 
         f"LLM pass 1/{num_passes} — generating sections 1–{chunk_1_size}…",
     )
     try:
-        raw, pass_meta = _llm_call(full_prompt_1, job_id=job_id, model_hint=_split_model_hint)
+        raw, pass_meta = _llm_call(full_prompt_1, job_id=job_id, route=_split_route)
         struct = _parse_llm_json(raw, job_id=job_id)
         title  = (struct.get("title") or "").strip() or title
         domain = (struct.get("domain") or "").strip().lower() or None
@@ -5172,7 +5344,7 @@ def _llm_structure_split(job_id: str, fmt: str, question: str, requested_count: 
         """Execute a single continuation pass. Returns (pass_idx, sections, meta, error)."""
         p_idx, prompt, c_size = args
         try:
-            raw_text, p_meta = _llm_call(prompt, job_id=job_id, model_hint=_split_model_hint)
+            raw_text, p_meta = _llm_call(prompt, job_id=job_id, route=_split_route)
             p_struct = _parse_llm_json(raw_text, job_id=job_id)
             sections = p_struct.get("sections") or []
             logger.info(f"[docgen] worker Pass {p_idx}/{num_passes} done (parallel) | "
@@ -5223,7 +5395,7 @@ def _enrich_with_images(slides: list) -> list:
     This prevents a slow proxy from hanging the work-horse long enough for the OS
     to kill it with "Work-horse terminated unexpectedly; waitpid returned None".
     """
-    provider = _resolve_image_provider()
+    provider, _tier_img_model = _image_target()
     if provider == "disabled":
         return slides
 
@@ -5251,7 +5423,8 @@ def _enrich_with_images(slides: list) -> list:
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
                 if provider == "gemini":
-                    fut = _pool.submit(_fetch_gemini_image, image_prompt)
+                    fut = _pool.submit(_fetch_gemini_image, image_prompt,
+                                       _tier_img_model)
                 else:
                     fut = _pool.submit(_fetch_dalle_image, image_prompt)
                 try:
@@ -5293,7 +5466,8 @@ def _enrich_with_images(slides: list) -> list:
     return slides
 
 
-def _fetch_ppt_image_via_proxy(prompt: str, provider: str = "auto") -> bytes | None:
+def _fetch_ppt_image_via_proxy(prompt: str, provider: str = "auto",
+                               model: str = "") -> bytes | None:
     """
     Generate a PPT slide image by calling the LLM proxy's /llm/generate-ppt-image endpoint.
     The proxy (the LLM proxy server) holds GEMINI_API_KEY / OPENAI_API_KEY and handles compliance + circuit breaking.
@@ -5312,7 +5486,8 @@ def _fetch_ppt_image_via_proxy(prompt: str, provider: str = "auto") -> bytes | N
         _img_req_timeout = float(os.getenv("PPT_IMAGE_TIMEOUT_SEC", "40"))
         resp = httpx.post(
             f"{proxy_url}/llm/generate-ppt-image",
-            json={"provider": provider, "prompt": prompt},
+            json={"provider": provider, "prompt": prompt,
+                  **({"model": model} if (model or "").strip() else {})},
             timeout=_img_req_timeout,
         )
         resp.raise_for_status()
@@ -5325,20 +5500,24 @@ def _fetch_ppt_image_via_proxy(prompt: str, provider: str = "auto") -> bytes | N
     return None
 
 
-def _fetch_gemini_image(prompt: str) -> bytes | None:
+def _fetch_gemini_image(prompt: str, model: str = "") -> bytes | None:
     """
-    Generate image via Gemini Imagen 3.
+    Generate image via Gemini Imagen.
     Routes through LLM proxy (the LLM proxy server) when LLM_PROXY_URL is set (production).
     Falls back to direct gateway call in local dev (no proxy configured).
+
+    `model` is the SKU the `image-output` tier resolved to. Blank keeps the
+    deployment default, which is what this always did — so the parameter can
+    only make the tier MORE authoritative, never less.
     """
     # Production path: proxy holds the API key — always use it
     proxy_url = os.getenv("LLM_PROXY_URL", "").rstrip("/")
     if proxy_url:
-        return _fetch_ppt_image_via_proxy(prompt, provider="gemini")
+        return _fetch_ppt_image_via_proxy(prompt, provider="gemini", model=model)
     # Local dev fallback: call gateway directly
     try:
         from gateway_gemini import generate_image_gemini
-        return generate_image_gemini(prompt)
+        return generate_image_gemini(prompt, model=model)
     except Exception as exc:
         logger.warning(f"doc_worker: Gemini image direct call failed: {exc}")
     return None

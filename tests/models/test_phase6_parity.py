@@ -88,6 +88,32 @@ MIGRATED: list[tuple[Tier, str, str]] = [
      "models/hybrid_retriever.py — query expansion + multi-query decomposition"),
     (Tier.COMPLEX, "solution", "sandbox/self_healing_engine.py:339"),
     (Tier.COMPLEX, "complex",  "workers/secure_code_gate_worker.py:126"),
+
+    # ── step 8: the document pipeline
+    # The body pairs are unremarkable — "complex" meant the same destination
+    # before and after, which is the point.
+    (Tier.COMPLEX, "complex",
+     "workers/doc_worker.py:843,1750,1871 + _resolve_doc_route default; "
+     "services/doc_reviser.py; agents/doc_generator_agent.py::_llm_call"),
+    # DOC_MODEL_PROVIDER naming a governed tier (D28). Each of the four text
+    # tiers carries ITS OWN word as the legacy hint rather than the module
+    # default, because with governance off DOC_MODEL_PROVIDER=medium has
+    # always meant model_hint="medium" — carrying "complex" here would
+    # silently upgrade every flag-off deployment that set it.
+    (Tier.MINI,    "mini",    "workers/doc_worker.py DOC_MODEL_PROVIDER=mini"),
+    (Tier.SIMPLE,  "simple",  "workers/doc_worker.py DOC_MODEL_PROVIDER=simple"),
+    (Tier.MEDIUM,  "medium",  "workers/doc_worker.py DOC_MODEL_PROVIDER=medium"),
+    # Titling and the ≤5-bullet cosmetic summary: both were vendor SKU names
+    # ("local" and "haiku") standing in for "short output, still has to follow
+    # instructions".
+    (Tier.SIMPLE,  "haiku",
+     "workers/doc_worker.py::_title_route; agents/doc_generator_agent.py:778"),
+    # step 8f — the two homeless sites. coach_router's hint is "mini" and not
+    # "haiku" because its pre-migration destination was OPENAI_SIMPLE_MODEL
+    # (gpt-5-mini) via a direct OpenAIGateway, and D15 is about reproducing
+    # where a call site WENT, not about matching the tier's name.
+    (Tier.SIMPLE,  "haiku",   "services/feedback_processor.py:337"),
+    (Tier.SIMPLE,  "mini",    "routers/coach_router.py:972 — was openai_model_for_tier"),
 ]
 
 _IDS = [f"{t.value}<-{h}" for t, h, _ in MIGRATED]

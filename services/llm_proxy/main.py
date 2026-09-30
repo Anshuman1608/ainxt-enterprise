@@ -465,9 +465,22 @@ class GenerateImageRequest(BaseModel):
 
 
 class PptImageRequest(BaseModel):
-    """Text → image generation for PPT slides. Routed through Gemini Imagen or DALL-E 3."""
+    """Text → image generation for PPT slides. Routed through Gemini Imagen or DALL-E 3.
+
+    ── `model` (§N.1 step 8) ────────────────────────────────────────────────
+    The SKU the caller's `image-output` tier resolved to. Same reasoning as
+    ImagenRequest.model below and added for the same reason: without it this
+    contract carries a provider but no model, so an administrator assigning a
+    particular Gemini image model gets the right family and whatever
+    GEMINI_IMAGE_MODEL names — silently, because the request still succeeds.
+
+    Optional, and must STAY optional: `auto` is the default provider and a
+    caller that has no tier assignment (or has PPT_IMAGE_PROVIDER pinned) sends
+    none, which has to keep meaning "the deployment's configured default".
+    """
     provider:   str = "auto"           # auto | gemini | dalle
     prompt:     str                    # image description from LLM
+    model:      Optional[str] = None   # concrete SKU from the image-output tier
     request_id: Optional[str] = None
     chat_id:    Optional[str] = None
 
@@ -3068,6 +3081,12 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
     _in_tok          = 0
     _out_tok         = 0
 
+    # The SKU the caller's image-output tier resolved to, honoured ONLY on the
+    # Gemini leg. "which family" and "which SKU within it" are separate facts:
+    # handing a Gemini id to the DALL-E fallback would turn a working fallback
+    # into a hard 400. Same gate ImagenRequest.model uses.
+    _want_ppt_model = (req.model or "").strip()
+
     # ── Try Gemini Imagen first (unless explicitly 'dalle') ────
     if provider in ("auto", "gemini") and _gemini_gw is not None:
         # Read the gateway's captured token/model metadata INSIDE the worker
@@ -3079,7 +3098,10 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
             _sri(req_id)
             if (upstream_chat_id or "-") != "-":
                 _scc("-", upstream_chat_id)
-            _bytes = _gemini_gw.generate_imagen(req.prompt)
+            _bytes = _gemini_gw.generate_imagen(
+                req.prompt,
+                **({"model": _want_ppt_model} if _want_ppt_model else {}),
+            )
             return (
                 _bytes,
                 getattr(_gemini_gw, "_last_imagen_model", None) or "",

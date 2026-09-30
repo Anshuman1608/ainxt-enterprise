@@ -45,7 +45,16 @@ _R = get_kv(RDB_STREAM, decode_responses=True)
 # Persistent storage (see core.config.DOC_STORAGE_DIR). NOT /tmp — files must
 # survive container restart so refresh-then-download keeps working.
 DOC_DIR        = DOC_STORAGE_DIR
-os.makedirs(DOC_DIR, exist_ok=True)
+try:
+    os.makedirs(DOC_DIR, exist_ok=True)
+except OSError as _mkdir_err:
+    # Same treatment core/config.py:403 already gives the same directory:
+    # surface at first USE rather than crash at import. Every writer here
+    # does its own makedirs, so a module that only reads routing config (or a
+    # test that only imports one function) must not be unable to load because
+    # the persistent volume is not mounted. Before this guard, importing any
+    # of these four modules outside a container raised PermissionError.
+    logger.warning(f"doc storage dir {DOC_DIR!r} not creatable at import: {_mkdir_err}")
 RESULT_TTL     = 86400   # 24 h — matches doc:result:* TTL (binary lives forever)
 SESSION_TTL    = 86400   # 24 h — session context
 PROGRESS_TTL   = 600     # 10 min — progress key
@@ -282,8 +291,9 @@ def _generate_md_job_impl(payload: dict) -> None:
 
         # Resolve the model hint the same way the binary doc path does:
         # explicit user choice > DOC_MODEL_PROVIDER env > "complex".
-        from workers.doc_worker import _resolve_doc_model_hint
+        from workers.doc_worker import _resolve_doc_model_hint, _resolve_doc_route
         _model_hint = _resolve_doc_model_hint(payload.get("user_model_hint"))
+        _route = _resolve_doc_route(payload.get("user_model_hint"))
         logger.info(
             f"[docgen] worker kind=md model resolution | job={job_id} "
             f"user_choice={payload.get('user_model_hint')!r} → effective={_model_hint!r}"
@@ -325,7 +335,7 @@ def _generate_md_job_impl(payload: dict) -> None:
             result = generate_md_doc(
                 prompt=question,
                 chat_id=chat_id,
-                model_hint=_model_hint,
+                route=_route,
                 user_id=user_id,
                 on_section=_on_section,
                 on_title=_on_title,
@@ -462,8 +472,9 @@ def _generate_md_job_impl(payload: dict) -> None:
 
         # Same model resolution as the generate branch so edits honour the
         # user's selected model / DOC_MODEL_PROVIDER override.
-        from workers.doc_worker import _resolve_doc_model_hint
+        from workers.doc_worker import _resolve_doc_model_hint, _resolve_doc_route
         _edit_model_hint = _resolve_doc_model_hint(payload.get("user_model_hint"))
+        _edit_route = _resolve_doc_route(payload.get("user_model_hint"))
         try:
             result = edit_md_doc(
                 edit_request=question,
@@ -475,7 +486,7 @@ def _generate_md_job_impl(payload: dict) -> None:
                 title=title,
                 domain=domain,
                 output_path=md_write_path,  # sidecar when original is binary; canonical when .md
-                model_hint=_edit_model_hint,
+                route=_edit_route,
             )
         except Exception as exc:
             logger.error(f"[docgen] worker kind=md edit_md_doc FAILED | job={job_id} error={exc}",

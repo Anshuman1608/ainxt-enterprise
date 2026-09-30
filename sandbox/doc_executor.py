@@ -44,6 +44,12 @@ MAX_PREVIEW_PAGES = int(os.getenv("AINXT_DOC_PREVIEW_PAGES", "20"))
 _LLM_PROXY_URL = os.getenv("LLM_PROXY_URL", "")
 DOC_IMAGE_TIMEOUT_S = int(os.getenv("AINXT_DOC_IMAGE_TIMEOUT_S", "120"))
 MAX_DOC_IMAGES = int(os.getenv("AINXT_DOC_MAX_IMAGES", "8"))
+# Last-resort provider when the caller names none. §N.1 step 8 made
+# workers/doc_worker.py resolve this from the `image-output` tier and send it
+# on every image request, so this is now reached only by a caller that
+# predates that or has no tier assignment. It defaulted to "openai" while
+# doc_worker's own default resolved to "gemini" — two defaults for one
+# decision, which is the disagreement the tier removes.
 _IMG_PROVIDER = os.getenv("AINXT_DOC_IMAGE_PROVIDER", "openai")  # gemini|openai
 
 
@@ -56,15 +62,27 @@ def _safe_image_name(name: str, idx: int) -> str:
     return base[:64]
 
 
-def _generate_doc_image(prompt: str, aspect_ratio: str, provider: str) -> bytes:
+def _generate_doc_image(prompt: str, aspect_ratio: str, provider: str,
+                        model: str = "") -> bytes:
     """Generate one image via the approved-provider imagen endpoint. Returns raw
-    bytes (PNG/JPEG). Raises on failure so the caller can skip just that image."""
+    bytes (PNG/JPEG). Raises on failure so the caller can skip just that image.
+
+    `provider` is a PROXY provider name ("gemini"|"openai"), NOT a registry
+    provider family ("anthropic"|"gemini"|"ollama"). The two vocabularies
+    overlap on one word and the caller does the translation
+    (workers/doc_worker.py::_FAMILY_TO_IMAGE_PROVIDER); sending a family here
+    would be rejected by the endpoint.
+
+    `model` is the SKU the `image-output` tier resolved to, and is omitted when
+    blank so an absent model keeps meaning "the deployment's default".
+    """
     import httpx
     payload = {
         "provider": provider if provider in ("gemini", "openai") else _IMG_PROVIDER,
         "prompt": prompt,
         "aspect_ratio": aspect_ratio or "16:9",
         "number_of_images": 1,
+        **({"model": model.strip()} if (model or "").strip() else {}),
     }
     with httpx.Client(timeout=DOC_IMAGE_TIMEOUT_S) as client:
         resp = client.post(f"{_LLM_PROXY_URL}/llm/imagen", json=payload)
@@ -180,7 +198,8 @@ def build(code: str, fmt: str, images: list | None = None) -> DocBuildResult:
                     continue
                 name = _safe_image_name(img.get("name"), idx)
                 data = _generate_doc_image(prompt, str(img.get("aspect_ratio") or "16:9"),
-                                           str(img.get("provider") or _IMG_PROVIDER))
+                                           str(img.get("provider") or _IMG_PROVIDER),
+                                           str(img.get("model") or ""))
                 img_path = os.path.join(workdir, name)
                 with open(img_path, "wb") as ifh:
                     ifh.write(data)

@@ -39,7 +39,16 @@ _R = get_kv(RDB_STREAM, decode_responses=True)
 # Persistent storage volume (NOT /tmp) — survives container restart and OS
 # cleanup so generated docs remain downloadable after the user refreshes.
 DOC_DIR = DOC_STORAGE_DIR
-os.makedirs(DOC_DIR, exist_ok=True)
+try:
+    os.makedirs(DOC_DIR, exist_ok=True)
+except OSError as _mkdir_err:
+    # Same treatment core/config.py:403 already gives the same directory:
+    # surface at first USE rather than crash at import. Every writer here
+    # does its own makedirs, so a module that only reads routing config (or a
+    # test that only imports one function) must not be unable to load because
+    # the persistent volume is not mounted. Before this guard, importing any
+    # of these four modules outside a container raised PermissionError.
+    logger.warning(f"doc storage dir {DOC_DIR!r} not creatable at import: {_mkdir_err}")
 
 
 # ── Pydantic schemas ──────────────────────────────────────────

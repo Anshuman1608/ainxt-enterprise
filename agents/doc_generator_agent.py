@@ -44,6 +44,8 @@ from datetime import date as _date
 
 from core.config import DOC_STORAGE_DIR, user_doc_dir
 from core.logger import logger
+# §N.1 step 8. Stdlib-only leaf module, so no cycle with models/.
+from core.tiers import Tier
 
 # ── Direct imports (safe — no Redis/DB at module level) ──────
 from tools.doc_generator import (
@@ -55,7 +57,16 @@ from tools.doc_generator import (
 
 # Persistent storage (see core.config.DOC_STORAGE_DIR). NOT /tmp.
 DOC_DIR = DOC_STORAGE_DIR
-os.makedirs(DOC_DIR, exist_ok=True)
+try:
+    os.makedirs(DOC_DIR, exist_ok=True)
+except OSError as _mkdir_err:
+    # Same treatment core/config.py:403 already gives the same directory:
+    # surface at first USE rather than crash at import. Every writer here
+    # does its own makedirs, so a module that only reads routing config (or a
+    # test that only imports one function) must not be unable to load because
+    # the persistent volume is not mounted. Before this guard, importing any
+    # of these four modules outside a container raised PermissionError.
+    logger.warning(f"doc storage dir {DOC_DIR!r} not creatable at import: {_mkdir_err}")
 
 # ── Session TTL (24 h — matches doc:result:* TTL) ────────────
 SESSION_TTL = 86400
@@ -230,17 +241,49 @@ def extract_sections_partial(raw: str) -> tuple[str, str, list[dict]]:
 # LLM CALL WRAPPER
 # ══════════════════════════════════════════════════════════════
 
-def _llm_call(prompt: str, context: str = "", model_hint: str = "complex") -> tuple:
+# §N.1 step 8 threads ROUTING KWARGS rather than a hint string, because "no
+# pin — resolve the tier" has no string that expresses it: ModelRouter's
+# _coerce_tier raises on a legacy_hint outside _HINT_MAP, and falsy hints are
+# stripped. The two helpers below are the whole cost of that change.
+
+
+def _route_label(route: dict) -> str:
+    """One word for a log line: the pinned model, or the tier asked for."""
+    return str(route.get("model_hint") or getattr(route.get("tier"), "value", "?"))
+
+
+def _coerce_route(route: dict | None, model_hint: str | None) -> dict:
+    """Reconcile the new `route` argument with the deprecated `model_hint`.
+
+    `route` wins. A bare hint still works so no caller breaks on upgrade. With
+    neither, the `complex` tier decides — the same destination the old
+    model_hint="complex" default reached, now chosen by an administrator.
+    """
+    if route:
+        return route
+    if model_hint:
+        return {"model_hint": model_hint}
+    from models.model_router import tier_request
+    return tier_request(Tier.COMPLEX, "complex")
+
+
+def _llm_call(prompt: str, context: str = "", route: dict | None = None) -> tuple:
     """
     Call model_router.generate and return (raw_text, llm_meta).
     Raises on failure.
+
+    `route` is the routing kwargs mapping produced by
+    workers.doc_worker._resolve_doc_route — a user's model pin, or a tier
+    request. ``None`` means nobody pinned anything and the `complex` tier
+    decides (§N.1 step 8).
     """
-    from models.model_router import model_router
+    from models.model_router import model_router, tier_request
+    route = route if route is not None else tier_request(Tier.COMPLEX, "complex")
     logger.info(
         f"[md_agent] calling model_router.generate | context={context!r} "
-        f"prompt_len={len(prompt)} model_hint={model_hint!r}"
+        f"prompt_len={len(prompt)} route={_route_label(route)!r}"
     )
-    result   = model_router.generate(prompt, model_hint=model_hint, return_meta=True)
+    result   = model_router.generate(prompt, return_meta=True, **route)
     raw      = (result.get("text") or "").strip()
     llm_meta = result.get("meta") or {}
     logger.info(f"[md_agent] LLM response | context={context!r} raw_len={len(raw)} "
@@ -254,7 +297,7 @@ def _llm_call_stream(
         on_section=None,
         on_title=None,
         rate_limit_sec: float = 0.4,
-        model_hint: str = "complex",
+        route: dict | None = None,
 ) -> tuple:
     """Stream tokens from model_router.stream() and fire on_section(section)
     each time a new fully-formed section appears in the accumulated JSON.
@@ -263,18 +306,21 @@ def _llm_call_stream(
                 section, in document order.
     on_title:   callable(title, domain) — invoked when title/domain are
                 first recovered (and again if they change).
-    model_hint: model_router tier ("complex" | "fast" | "openai-deep" | ...).
-                Defaults to "complex" (Claude Sonnet) to preserve the old
-                behaviour when callers don't pass anything explicit.
+    route:      routing kwargs from workers.doc_worker._resolve_doc_route.
+                None means nobody pinned a model and the `complex` tier
+                decides — the same destination the old model_hint="complex"
+                default had, now chosen by an administrator rather than by
+                this line.
 
     Returns (final_raw_text, llm_meta) after the __stream_meta__ sentinel.
     """
     import time
-    from models.model_router import model_router
+    from models.model_router import model_router, tier_request
 
+    route = route if route is not None else tier_request(Tier.COMPLEX, "complex")
     logger.info(
         f"[md_agent] calling model_router.stream | context={context!r} "
-        f"prompt_len={len(prompt)} model_hint={model_hint!r}"
+        f"prompt_len={len(prompt)} route={_route_label(route)!r}"
     )
 
     parts: list[str] = []
@@ -306,7 +352,7 @@ def _llm_call_stream(
                     logger.warning(f"[md_agent] on_section callback failed: {exc}")
             last_section_count = len(sections)
 
-    for chunk in model_router.stream(prompt, model_hint=model_hint):
+    for chunk in model_router.stream(prompt, **route):
         if isinstance(chunk, dict) and "__stream_meta__" in chunk:
             llm_meta = chunk["__stream_meta__"] or {}
             break
@@ -713,15 +759,14 @@ def build_summary_and_preview(
                          model, latency, source} — `source` is "llm" or
                          "fallback".
 
-    Uses a lightweight model (model_hint="haiku") — this is a cosmetic ≤5
-    bullet summary of content the structuring step already authored, not new
-    authoring, so it does not need the full Sonnet 4.6 model used for
-    structuring. (Previously used model_hint="complex"/Sonnet, adding several
-    seconds of blocking latency between the file being ready and the result
-    being published — see doc_worker.py's `_attach_summary_preview` call
-    site.) On any LLM/parse error the function falls back to a deterministic
-    per-section summary and never raises — callers can publish results
-    safely.
+    Asks for the `simple` TIER — this is a cosmetic ≤5 bullet summary of
+    content the structuring step already authored, not new authoring, so it
+    does not need the full model used for structuring. (Previously
+    model_hint="complex"/Sonnet, adding several seconds of blocking latency
+    between the file being ready and the result being published — see
+    doc_worker.py's `_attach_summary_preview` call site.) On any LLM/parse
+    error the function falls back to a deterministic per-section summary and
+    never raises — callers can publish results safely.
     """
     ctx = f"summary:{chat_id or 'no-chat'}"
     preview = _build_preview(title, sections)
@@ -739,15 +784,17 @@ def build_summary_and_preview(
         return [], preview, summary_meta
 
     # ── Try LLM summarisation ──────────────────────────────────
-    # Uses model_hint="haiku" → Claude Haiku (lightweight/fast). See
-    # models/model_router.py routing table for the haiku tier's fallback chain.
+    # §N.1 step 8: was model_hint="haiku", a vendor SKU name standing in for
+    # "cheap and fast". `simple` is the capability; the administrator picks
+    # which model provides it.
     try:
-        from models.model_router import model_router
+        from models.model_router import model_router, tier_request
         prompt_text = _build_summary_prompt(title, sections, prompt or "")
         logger.info(f"[md_agent] summary LLM call | context={ctx!r} "
                     f"prompt_len={len(prompt_text)}")
         result = model_router.generate(
-            prompt_text, model_hint="haiku", return_meta=True
+            prompt_text, return_meta=True,
+            **tier_request(Tier.SIMPLE, "haiku"),
         )
         raw = (result.get("text") or "").strip()
         meta = result.get("meta") or {}
@@ -1055,8 +1102,9 @@ def generate_md_doc(
     prompt: str,
     output_path: str | None = None,
     chat_id: str | None = None,
-    model_hint: str = "complex",
+    model_hint: str | None = None,
     user_id: str | None = None,
+    route: dict | None = None,
     on_section=None,
     on_title=None,
     chat_context: str = "",
@@ -1069,7 +1117,12 @@ def generate_md_doc(
         output_path: Optional absolute path for the output .md file.
                      If None, auto-generated in DOC_DIR using smart_filename.
         chat_id:     Chat session ID for context persistence (optional).
-        model_hint:  LLM routing hint (default: "complex" → Claude Sonnet).
+        model_hint:  DEPRECATED — a bare router hint. Prefer `route`, which
+                     can also express "resolve the complex tier". Kept for
+                     any caller that still passes a hint string; when both
+                     are given, `route` wins.
+        route:       Routing kwargs from workers.doc_worker._resolve_doc_route.
+                     None with no model_hint means the `complex` tier decides.
         chat_context: This chat's conversation history, passed ONLY when the
                      caller determined the document's source is the chat itself
                      (e.g. "summarize this chat into a document"). Strictly this
@@ -1109,21 +1162,22 @@ def generate_md_doc(
     # When on_section is provided we stream so the chat UI can paint
     # sections live; otherwise we use the non-streaming path for callers
     # that don't care about progressive output (CLI, tests, batch jobs).
-    # `model_hint` is honoured in both branches so callers can route the
-    # MD generation through any model_router tier (defaults to "complex").
+    # The route is honoured in both branches so callers can route the MD
+    # generation through any tier or any explicit model.
+    _route = _coerce_route(route, model_hint)
     if on_section is not None or on_title is not None:
         raw, llm_meta = _llm_call_stream(
             struct_prompt,
             context=f"generate:{chat_id or 'no-chat'}",
             on_section=on_section,
             on_title=on_title,
-            model_hint=model_hint,
+            route=_route,
         )
     else:
         raw, llm_meta = _llm_call(
             struct_prompt,
             context=f"generate:{chat_id or 'no-chat'}",
-            model_hint=model_hint,
+            route=_route,
         )
 
     if not raw:
@@ -1199,7 +1253,8 @@ def edit_md_doc(
     title: str,
     domain: str | None = None,
     output_path: str | None = None,
-    model_hint: str = "complex",
+    model_hint: str | None = None,
+    route: dict | None = None,
 ) -> dict:
     """
     Apply an edit to an existing Markdown document.
@@ -1214,7 +1269,8 @@ def edit_md_doc(
         title:                Current document title
         domain:               Current document domain
         output_path:          Path to write the updated .md file
-        model_hint:           LLM routing hint
+        model_hint:           DEPRECATED — see generate_md_doc.
+        route:                Routing kwargs; wins over model_hint.
 
     Returns:
         {
@@ -1268,7 +1324,13 @@ def edit_md_doc(
         sections=current_sections,
         conversation_summary=conversation_summary,
     )
-    raw, llm_meta = _llm_call(edit_prompt, context=f"edit:{chat_id}")
+    # Found while threading the route (§N.1 step 8): this call passed NO
+    # routing at all, so edit_md_doc's `model_hint` parameter had never done
+    # anything — workers/doc_worker_agent.py resolved the user's pick, passed
+    # it in, and it was dropped here. Document EDITS were routed by
+    # auto-classification while document GENERATION honoured the choice.
+    raw, llm_meta = _llm_call(edit_prompt, context=f"edit:{chat_id}",
+                              route=_coerce_route(route, model_hint))
 
     if not raw:
         raise RuntimeError("LLM returned empty response for edit")

@@ -125,7 +125,10 @@ def _recommendation_for(prompt_redacted: str, used_model: Optional[str]) -> Opti
         elif used_cost is not None and rec_cost is not None:
             if used_cost > rec_cost + 0.01 and rec_tier in ("simple", "medium"):
                 verdict = "over_spent"
-                hint = (f"This looks {type(rec_tier).__name__}; a cheaper model would do. "
+                # Was `{type(rec_tier).__name__}` — the literal "str". Coach
+                # has been telling users "This looks str; a cheaper model
+                # would do." Same defect as _llm_rewrite's, same origin.
+                hint = (f"This looks {rec_tier}; a cheaper model would do. "
                         f"You used a model that costs ${used_cost:.2f}/1M out vs ${rec_cost:.2f}.")
             elif used_cost + 0.01 < rec_cost and rec_tier == "complex":
                 verdict = "under_spent"
@@ -140,7 +143,7 @@ def _recommendation_for(prompt_redacted: str, used_model: Optional[str]) -> Opti
         "tier": rec_tier,
         "verdict": verdict,
         "confidence": None,
-        "reason": f"Auto-router selected '{type(rec_tier).__name__}' for this prompt (complexity: {decision.complexity}).",
+        "reason": f"Auto-router selected '{rec_tier}' for this prompt (complexity: {decision.complexity}).",
         "hint": hint,
     }
 
@@ -945,13 +948,30 @@ def coach_suggest(body: SuggestIn, current_user: dict = Depends(get_current_user
 
 
 def _llm_rewrite(prompt: str, issues: List[str]) -> tuple[str, str]:
-    """Ask the platform LLM gateway to rewrite a prompt. Raises on unavailability.
+    """Ask the platform LLM router to rewrite a prompt. Raises on unavailability.
 
-    Uses the existing OpenAIGateway.generate() streaming API (never calls the
-    provider SDK directly) and a fast/cheap model. Returns (rewritten, why).
+    Returns (rewritten, why).
+
+    §N.1 step 8. This used to construct an OpenAIGateway() directly and take
+    its model from core.model_registry.openai_model_for_tier("simple") — an
+    SDLC helper that exists only because the SDLC manifest cross-validator
+    speaks the OpenAI wire format. Coach does not. Two consequences:
+
+      * the family was pinned, so a deployment with no OpenAI provider could
+        not use this feature at all no matter what it configured; and
+      * it resolved to OPENAI_SIMPLE_MODEL ("gpt-5-mini"), which on this
+        deployment has no llm_models row and no enabled provider — so the
+        Coach rewrite has been failing and falling through to
+        _fallback_rewrite's deterministic scaffold.
+
+    The router knows every family, so asking it removes both. `simple` is the
+    tier: one line of JSON with two keys is "short bounded generation that
+    still needs reliable instruction-following" (core/tiers.py). The legacy
+    hint is "mini" rather than "haiku" because with governance OFF this must
+    land where it landed before, and that was gpt-5-mini.
     """
-    from gateway_openai import OpenAIGateway
-    from core.model_registry import openai_model_for_tier
+    from models.model_router import model_router, tier_request
+    from core.tiers import Tier
 
     system = (
         "You are AiNxt Coach. Rewrite the user's AI prompt to be clearer, more "
@@ -960,18 +980,21 @@ def _llm_rewrite(prompt: str, issues: List[str]) -> tuple[str, str]:
         "when missing. Respond ONLY as compact JSON on a single line: "
         '{"rewritten": "...", "why": "one short sentence"}.'
     )
-    user = f"Issues to fix: {', '.join(issues)}.\n\nPrompt:\n{type(prompt).__name__}"
+    # Was `{type(prompt).__name__}`, which interpolates the literal "str" —
+    # so Coach asked the model to rewrite the word "str" rather than the
+    # user's prompt. Present since the initial commit and invisible because
+    # the call above it was already failing. Not part of the tier migration,
+    # but fixing the routing without fixing this would just have made a
+    # working call produce nonsense.
+    user = f"Issues to fix: {', '.join(issues)}.\n\nPrompt:\n{prompt}"
 
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
 
-    gw = OpenAIGateway()
-    chunks: List[str] = []
-    for tok in gw.generate(messages, model=openai_model_for_tier("simple")[0]):
-        chunks.append(tok)
-    raw = "".join(chunks).strip()
+    raw = (model_router.generate(
+        messages, **tier_request(Tier.SIMPLE, "mini")) or "").strip()
     if not raw:
         raise RuntimeError("empty LLM response")
 
@@ -990,7 +1013,10 @@ def _fallback_rewrite(prompt: str, issues: List[str]) -> tuple[str, str]:
     """Deterministic, no-LLM rewrite: wrap the prompt with a structured scaffold."""
     p = prompt.strip().rstrip(".")
     scaffold = (
-        f"{type(p).__name__}.\n\n"
+        # Same defect as _llm_rewrite's: this emitted the literal "str"
+        # instead of the prompt, so the no-LLM fallback returned a scaffold
+        # with the user's text missing.
+        f"{p}.\n\n"
         "Please include:\n"
         "- Goal: <what success looks like>\n"
         "- Target: <file / function / module>\n"

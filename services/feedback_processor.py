@@ -18,6 +18,7 @@ import os
 from typing import Optional
 
 from core.logger import logger
+from core.tiers import Tier
 
 
 # Minimum feedback entries before applying chunk quality penalty (cold-start guard)
@@ -324,27 +325,37 @@ class FeedbackProcessor:
                 f"Output ONLY the suggested text — no explanation, no XML."
             )
 
-            proxy_url = os.getenv("LLM_PROXY_URL", "").rstrip("/")
-            if not proxy_url:
-                return None
-
-            import httpx
-            from core.model_registry import cli_model_for_tier
-            from core.proxy_tool_use import llm_proxy_headers as _lph
-            with httpx.Client(timeout=httpx.Timeout(20.0, connect=3.0)) as hc:
-                resp = hc.post(
-                    f"{proxy_url}/llm/generate",
-                    json={"provider": "claude", "prompt": prompt, "model": cli_model_for_tier("haiku")},
-                    headers=_lph(),
+            # §N.1 step 8. This used to post
+            #     {"provider": "claude", "model": cli_model_for_tier("haiku")}
+            # straight at the proxy — two defects in one line, and the same
+            # two step 6 removed from models/hybrid_retriever.py. It pinned a
+            # vendor, and it took its model from an SDLC CLI helper, which
+            # quietly coupled feedback processing to SDLC_TIER_SIMPLE_MODEL and
+            # ENABLE_OPUS. This is not an SDLC path.
+            #
+            # Routing through the router instead of translating the family
+            # deletes the special case rather than patching it: the proxy's
+            # /llm/generate accepts only claude|openai|gemini while the
+            # registry holds anthropic|gemini|ollama, so any family name
+            # resolved here would have to be mapped to a third vocabulary.
+            # Suggesting a 1-3 sentence prompt addition is short bounded
+            # output — the `simple` tier.
+            #
+            # The `if not proxy_url: return None` guard goes with the httpx
+            # call it protected; the router needs no proxy. That cannot switch
+            # on dormant traffic here the way it could have in hybrid_retriever
+            # (which is why THAT one got QUERY_EXPANSION_ENABLED): this method
+            # has no caller anywhere in the repository. A human still has to
+            # approve any suggestion through P10 prompt versioning.
+            from models.model_router import model_router, tier_request
+            suggestion = (model_router.generate(
+                prompt, **tier_request(Tier.SIMPLE, "haiku")) or "").strip()
+            if suggestion:
+                logger.info(
+                    f"FeedbackProcessor: prompt improvement suggestion for "
+                    f"issue={issue_category!r}: {suggestion[:100]}"
                 )
-                resp.raise_for_status()
-                suggestion = (resp.json().get("text") or "").strip()
-                if suggestion:
-                    logger.info(
-                        f"FeedbackProcessor: prompt improvement suggestion for "
-                        f"issue={issue_category!r}: {suggestion[:100]}"
-                    )
-                    return suggestion
+                return suggestion
         except Exception as e:
             logger.error(f"FeedbackProcessor.generate_prompt_improvement failed: {e}")
         return None
