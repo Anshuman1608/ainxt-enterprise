@@ -476,6 +476,7 @@ def generate_answer_tool(state, llm) -> Generator[str, None, None]:
                 "TOOL generate_answer_tool → using model_router"
             )
 
+            from models.model_router import chat_complexity_route as _chat_complexity_route
             from models.model_router import model_router
             from models.classifier import classify_query_complexity
 
@@ -525,18 +526,17 @@ def generate_answer_tool(state, llm) -> Generator[str, None, None]:
             #                    workers/cowork_task_worker.py). Resolved
             #                    through the administrator's tier assignments,
             #                    with legacy_hint as D15's flag-off fallback.
-            #   3. _complexity — the classifier guessed. This branch is
-            #                    UNCHANGED from before Phase 6.5 on purpose:
-            #                    migrating the Chat Auto complexity mapping is
-            #                    §N.1 step 9, not this item.
+            #   3. _complexity — the classifier guessed. §N.1 step 9 migrated
+            #                    this branch onto the tier vocabulary; see
+            #                    _chat_complexity_route below for why the
+            #                    empty case is not a tier request.
             if getattr(state, "model_hint", None):
                 _route_kwargs = {"model_hint": state.model_hint}
             elif getattr(state, "tier", None) is not None:
                 _route_kwargs = {"tier": state.tier,
                                  "legacy_hint": getattr(state, "legacy_hint", None)}
             else:
-                # Route: Local LLM (simple/general) → GPT-5.2 (medium/code) → Claude (complex)
-                _route_kwargs = {"model_hint": _complexity}
+                _route_kwargs = _chat_complexity_route(_complexity)
 
             # Build proper multi-turn messages list when conversation history exists.
             # This ensures local and cloud models both get real conversation turns

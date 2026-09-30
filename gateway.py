@@ -3204,6 +3204,22 @@ try:
 except Exception:  # noqa: BLE001
     _PV2_TIER_HINTS = set(_CIL_COMPLEXITY)
 
+# ── §N.1 step 9 — the tier vocabulary, at module scope ─────────────────────
+# core.tiers is a stdlib-only leaf, and models.model_router is already
+# imported here (line above) for _HINT_MAP, so neither widens this module's
+# import graph. Aliased with a leading underscore to match the convention the
+# rest of gateway.py's ~16k lines use for imported names.
+from core.tiers import Tier as _Tier
+from models.model_router import (
+    chat_complexity_route    as _chat_complexity_route,
+    fully_blocked_candidates as _fp_fully_blocked,
+    is_deployment_local      as _is_deployment_local,
+    is_local_route           as _mr_is_local_route,
+    resolve_pick_to_model_id as _gov_resolve_picked_model,
+    tier_request             as _tier_request,
+    ModelsBlockedByPolicy    as _ModelsBlockedByPolicy,
+)
+
 # ── Image-vs-video intent tie-break ───────────────────────────────────────
 #
 # img_intent and vid_intent are independent fields on the same CIL result, so
@@ -3345,6 +3361,15 @@ def _enhance_core(prompt: str, include_followups: bool = True) -> dict:
    _allowed_hints = {"simple", "mini", "medium", "complex", "haiku", "gemini", "deep", "solution"}
    _hint = os.getenv("ENHANCE_MODEL_HINT", "mini").strip().lower()
    _hint = _hint if _hint in _allowed_hints else "mini"
+   # §N.1 step 9 / §F "Prompt enhancement … → mini". The allowlist above
+   # already stops a raw model id reaching here, so D28's two branches reduce
+   # to: the default asks the tier, and anything an operator deliberately set
+   # is honoured verbatim and warned once — which is what it does today.
+   _enhance_route = _tier_request(
+       _Tier.MINI, "mini",
+       _hint if _hint != "mini" else "",
+       override_name="ENHANCE_MODEL_HINT",
+   )
    if include_followups:
        _system = (
             "You are a prompt quality assistant for an enterprise AI platform serving "
@@ -3433,7 +3458,7 @@ def _enhance_core(prompt: str, include_followups: bool = True) -> dict:
                   )
        _full = f"{_system}\n\nUser query:\n{_safe}"
        try:
-           result = _mr_enhance.generate(_full, model_hint=_hint,
+           result = _mr_enhance.generate(_full, **_enhance_route,
                                          precleared=True, precleared_findings=_precleared_findings)
            # e.g. ```json\n{...}\n``` — strip it before parsing.
            _result_clean = result.strip() if isinstance(result, str) else ""
@@ -3460,7 +3485,7 @@ def _enhance_core(prompt: str, include_followups: bool = True) -> dict:
        )
        _full = f"{_system}\n\nPrompt:\n{_safe}"
        try:
-           result = _mr_enhance.generate(_full, model_hint=_hint,
+           result = _mr_enhance.generate(_full, **_enhance_route,
                                          precleared=True, precleared_findings=_precleared_findings)
            return {"enhanced": result.strip() if isinstance(result, str) else prompt, "followups": []}
        except Exception:
@@ -3559,7 +3584,10 @@ def continue_generation(
                 try:
                     for _tok in _mr_cont.stream(
                             [{"role": "user", "content": _continue_prompt}],
-                            model_hint="medium",
+                            # §D lists this under `medium` — resuming a cut-off
+                            # answer is the same everyday generation the turn
+                            # it continues was.
+                            **_tier_request(_Tier.MEDIUM, "medium"),
                     ):
                         if isinstance(_tok, dict):
                             _sm = _tok.get("__stream_meta__")
@@ -3669,7 +3697,10 @@ async def chat_followups(body: _FollowupReq, authorization: Optional[str] = _Hea
         # at a real proxy service, or when API keys are configured for direct calls).
         if not _raw:
             from models.model_router import model_router as _mr_fu
-            _raw = _mr_fu.generate(_prompt, model_hint="haiku")
+            # §F: "Follow-up suggestions … → simple". "haiku" was the vendor
+            # SKU standing in for "three short questions, still has to follow
+            # the JSON-array instruction".
+            _raw = _mr_fu.generate(_prompt, **_tier_request(_Tier.SIMPLE, "haiku"))
         # Guard against error strings — model_router.generate returns "Error: …" on failure.
         if _raw and isinstance(_raw, str) and _raw.strip().lower().startswith("error"):
             _raw = ""
@@ -5711,15 +5742,21 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
     if _model_hint:
         try:
             from routers.model_governance_router import filter_allowed_models as _gov_filter
-            from models.model_router import hint_to_model_id as _gov_hint_to_model
 
-            # hint_to_model_id resolves any hint string → concrete model ID
-            # using _HINT_MAP + model_registry constants (all .env-driven).
-            # Returns None for "simple"/"local" (local LLM), "local:<id>" as-is.
-            _gov_model = _gov_hint_to_model(_model_hint)
+            # §N.1 step 9 (D37). This used hint_to_model_id(), the pre-registry
+            # hint → .env-constant map, and the mismatch made the check silently
+            # optional: it answers '' for "claude-sonnet-5" (because
+            # CLAUDE_SONNET_5_MODEL is unset) and None for
+            # "claude-haiku-4-5-20251001" / "claude-sonnet-5-5" (not _HINT_MAP
+            # keys at all) — and `if _gov_model:` below skips the whole block on
+            # a falsy value. Five of the eight tier heads on this deployment,
+            # including both models in `complex`, could therefore not be blocked
+            # from the admin screen. The registry knows every one of them, which
+            # is why the lookup moves there.
+            _gov_model = _gov_resolve_picked_model(_model_hint)
 
             # "local" / "simple" hint — the actual model name is in q.local_model
-            if _gov_model is None and q.local_model:
+            if not _gov_model and q.local_model:
                 _gov_model = f"local:{q.local_model}"
 
             if _gov_model:
@@ -7561,14 +7598,28 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
         # Voice platform always uses "complex" (Claude) for best natural language quality.
         _fp_hint = "complex" if _is_voice_platform else (_model_hint or "medium")
 
-        # ── Phase 3 router DRIVING (PIPELINE_V2_ROUTING, default OFF) ─────────
+        # ── §N.1 step 9 — the same decision, as a tier request ───────────────
+        # _fp_hint STAYS a str. It has five non-dispatch readers below — two
+        # log lines, the SSE local-route note, and gateway.py:8273's
+        # _ainxt_model_for() lookup, which §N.1 step 11 landed. Replacing it
+        # with a Tier would break that block, so the tier travels beside it.
+        _fp_tier: "object | None" = None
+        if _is_voice_platform:
+            _fp_tier = _Tier.COMPLEX
+        elif not _model_hint:
+            _fp_tier = _Tier.MEDIUM
+
+        # ── Phase 3 router DRIVING (PIPELINE_V2_ROUTING, default ON) ──────────
         # When the user did NOT force a model (_model_hint is None → the flat
         # "medium" default above) and this is not a voice turn, let the CIL's
-        # task_complexity pick the router tier instead of always "medium". The
-        # CIL vocabulary (simple|medium|complex|deep|solution) is identical to
-        # the router's _HINT_MAP, so we pass it straight through. This only
+        # task_complexity pick the tier instead of always "medium". This only
         # applies when the user chose "auto" — an explicit model is never
         # overridden. Flag OFF / forced-model / no conv_state → unchanged.
+        #
+        # The vocabulary used to be passed straight through as a router hint
+        # because the two happened to coincide. It is mapped explicitly now
+        # (chat_complexity_route), so a change to either vocabulary is a
+        # visible failure rather than a silent mis-route.
         if (_PIPELINE_V2 and _PIPELINE_V2_ROUTING and not _is_voice_platform
                 and not _model_hint and _rc is not None and _rc.conv_state is not None):
             _cil_tier = getattr(_rc.conv_state, "task_complexity", None)
@@ -7578,154 +7629,64 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
             _cil_tier = _CIL_RETIRED_COMPLEXITY.get(_cil_tier, _cil_tier)
             if _cil_tier in _PV2_TIER_HINTS:
                 _fp_hint = _cil_tier
+                _fp_tier = _chat_complexity_route(_cil_tier).get("tier")
                 _otel.record_event("routing.driven", tier=_cil_tier)
 
+        # The kwargs the dispatch actually uses. A user's pick keeps riding as
+        # a plain hint (§G) — governance never second-guesses it.
+        _fp_route = (_tier_request(_fp_tier, _fp_hint) if _fp_tier is not None
+                     else {"model_hint": _fp_hint})
+
         # ── AUTO-ROUTING GOVERNANCE FILTER ───────────────────────────────────
-        # When the user chose Auto (_model_hint is None), the router has now
-        # resolved _fp_hint to a tier (e.g. "medium" → gpt-5.4, "complex" →
-        # claude-sonnet-4-6).  Check whether that resolved model is allowed for
-        # this user/dept.  If it is blocked, walk down a fallback chain to the
-        # next allowed model instead of hard-blocking (the user asked for "Auto",
-        # not for a specific model, so a silent fallback is the right UX).
+        # When the user chose Auto, the department/user ACL still applies — but
+        # to the models the TIER will actually try, in the administrator's
+        # priority order. That is ModelRouter's acl_filter (§N.1 step 9 D36),
+        # and it replaces 116 lines here that walked CHAT_FALLBACK_CHAIN.
         #
-        # When ALL cloud models are blocked the chain ends at "simple" (local).
-        # In that case _gov_local_only is set to True so that if the local model
-        # is also unavailable we return a clear error instead of silently
-        # escaping to a governance-blocked cloud provider.
-        # Fails open on any DB / import error — governance never takes down chat.
-        _gov_local_only = False   # set True when all cloud models are blocked
+        # What was wrong with those 116 lines, all measured on this deployment:
+        #
+        #   1. The ACL was checked against hint_to_model_id(_fp_hint) — the
+        #      pre-registry hint → .env-constant map. For the "medium" default
+        #      that is 'gpt-5.4', which has no llm_models row and no provider
+        #      here, while the turn dispatched claude-sonnet-4-6.
+        #      filter_allowed_models treats an absent rule as ALLOWED, so the
+        #      check passed unconditionally and a rule on the real model did
+        #      nothing.
+        #   2. CHAT_FALLBACK_CHAIN is empty by default, so the walk's `for`
+        #      loop never ran and any block became a hard 403 — the opposite
+        #      of the "silent fallback is the right UX" this block documented.
+        #   3. _gov_local_only was set BOTH where a local fallback had been
+        #      found and where nothing had, and the 403 below fired on it
+        #      either way. Finding a working model still returned 403.
+        #
+        # Fails open on any DB / import error — governance never takes down
+        # chat — which is now acl_filter_for()'s and _apply_acl()'s behaviour
+        # rather than a try/except wrapped around a hundred lines.
+        _fp_acl = None
         if not _model_hint:
             try:
-                from routers.model_governance_router import filter_allowed_models as _gov_filter_auto
-                from db.database import SessionLocal as _GovSessionLocal
-                from models.model_router import hint_to_model_id as _auto_hint_to_model
-                from core.model_registry import CHAT_FALLBACK_CHAIN as _AUTO_FALLBACK_CHAIN
-
-                # Helper: get all local model IDs available on this server
-                def _get_local_model_ids():
-                    try:
-                        from gateway_local_llm import get_local_gateway as _glg
-                        _lgw = _glg()
-                        return [f"local:{m}" for m in (_lgw.list_models() or [])]
-                    except Exception:
-                        return []
-
-                _auto_model = _auto_hint_to_model(_fp_hint)
-                # For "simple"/"local" tier _auto_model is None — resolve local IDs now
-                if _auto_model is None and _fp_hint in ("simple", "local"):
-                    _local_ids = _get_local_model_ids()
-                    if _local_ids:
-                        _loc_db = _GovSessionLocal()
-                        try:
-                            _loc_allowed = _gov_filter_auto(
-                                _local_ids, _user_id, _user_dept, _loc_db
-                            )
-                        finally:
-                            _loc_db.close()
-                        if not _loc_allowed:
-                            # All local models also blocked — hard block
-                            _gov_local_only = True
-                            _auto_model = "__all_local_blocked__"  # sentinel to trigger error below
-                        # else: at least one local model allowed — proceed normally
-                    # If no local models configured, proceed (local gateway unavailable)
-
-                if _auto_model and _auto_model != "__all_local_blocked__":
-                    _auto_db = _GovSessionLocal()
-                    try:
-                        _auto_allowed = _gov_filter_auto(
-                            [_auto_model], _user_id, _user_dept, _auto_db
-                        )
-                    finally:
-                        _auto_db.close()
-
-                    if not _auto_allowed:
-                        logger.warning(
-                            f"[governance/auto] auto-picked model blocked | "
-                            f"user={_user_id} dept={_user_dept!r} "
-                            f"tier={_fp_hint!r} model={_auto_model!r} "
-                            f"— trying fallback chain"
-                        )
-                        _fallback_found = False
-                        for _fb_tier in _AUTO_FALLBACK_CHAIN:
-                            if _fb_tier == _fp_hint:
-                                continue  # skip the already-blocked tier
-                            _fb_model = _auto_hint_to_model(_fb_tier)
-                            if _fb_model is None:
-                                # "simple" tier — check local models against governance
-                                _local_ids = _get_local_model_ids()
-                                if _local_ids:
-                                    _fb_loc_db = _GovSessionLocal()
-                                    try:
-                                        _fb_loc_allowed = _gov_filter_auto(
-                                            _local_ids, _user_id, _user_dept, _fb_loc_db
-                                        )
-                                    finally:
-                                        _fb_loc_db.close()
-                                    if _fb_loc_allowed:
-                                        # At least one local model is allowed
-                                        _fp_hint = _fb_tier
-                                        _gov_local_only = True  # cloud exhausted, local only
-                                        _fallback_found = True
-                                        logger.warning(
-                                            f"[governance/auto] all cloud models blocked for "
-                                            f"user={_user_id} dept={_user_dept!r} "
-                                            f"— falling back to local (fail-closed if local down)"
-                                        )
-                                        break
-                                    else:
-                                        # All local models also blocked
-                                        logger.warning(
-                                            f"[governance/auto] all cloud AND local models blocked | "
-                                            f"user={_user_id} dept={_user_dept!r}"
-                                        )
-                                        _gov_local_only = True
-                                        # _fallback_found stays False → error returned below
-                                        break
-                                else:
-                                    # No local models configured — treat as allowed (local gateway absent)
-                                    _fp_hint = _fb_tier
-                                    _gov_local_only = True
-                                    _fallback_found = True
-                                    break
-                            else:
-                                _fb_db = _GovSessionLocal()
-                                try:
-                                    _fb_allowed = _gov_filter_auto(
-                                        [_fb_model], _user_id, _user_dept, _fb_db
-                                    )
-                                finally:
-                                    _fb_db.close()
-                                if _fb_allowed:
-                                    _fp_hint = _fb_tier
-                                    _fallback_found = True
-                                    logger.info(
-                                        f"[governance/auto] fallback → "
-                                        f"tier={_fb_tier!r} model={_fb_model!r}"
-                                    )
-                                    break
-
-                        if not _fallback_found:
-                            _gov_local_only = True  # signal error block below
-
-                # Sentinel: all local models were blocked before even entering fallback chain
-                if _auto_model == "__all_local_blocked__":
-                    _gov_local_only = True
-
+                from routers.model_governance_router import acl_filter_for as _acl_for
+                _fp_acl = _acl_for(_user_id, _user_dept)
             except Exception as _gov_auto_err:
                 logger.warning(
-                    f"[governance/auto] check error (fail-open): {_gov_auto_err}"
+                    f"[governance/auto] ACL filter unavailable (fail-open): {_gov_auto_err}"
                 )
 
-        # When _gov_local_only=True all cloud models were exhausted by the
-        # fallback chain AND all local models are also governance-blocked.
-        # Return a clear 403 immediately — do NOT let the request reach the LLM.
-        # Note: _fp_hint may still be "medium"/"complex"/etc. here (it is only
-        # updated to "simple" when a cloud fallback succeeds), so we must NOT
-        # gate this block on _fp_hint value.
-        if _gov_local_only:
+        # Pre-flight so a governance denial is a 403 with a reason, rather than
+        # an exception raised into an SSE body the client has already started
+        # rendering. acl_filter above stays authoritative — this only decides
+        # whether to begin. The 403 now fires on the honest condition: every
+        # model the tier would try is denied to this user. Previously it fired
+        # whenever CHAT_FALLBACK_CHAIN failed to produce an alternative, which
+        # with the empty default meant "always".
+        _fp_blocked = (_fp_tier is not None
+                       and _fp_fully_blocked(_fp_tier, _fp_acl))
+        if _fp_blocked:
             logger.warning(
-                f"[governance/auto] all models blocked (cloud + local) | "
-                f"user={_user_id} dept={_user_dept!r} — returning 403"
+                f"[governance/auto] every candidate for tier "
+                f"{getattr(_fp_tier, 'value', _fp_tier)!r} is blocked | "
+                f"user={_user_id} dept={_user_dept!r} "
+                f"models={_fp_blocked} — returning 403"
             )
             from fastapi.responses import JSONResponse as _GovLocalJSONResponse
             return _GovLocalJSONResponse(
@@ -7853,7 +7814,14 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
             # Grounding checks and PCI/PII redaction still run post-stream on
             # _full for history persistence — they no longer gate the live stream.
             _effective_preflush_gate = False
-            _is_local_route = bool(_local_model or _fp_hint in ("local", "simple"))
+            # §N.1 step 9: ask the resolved model, not the hint string. This
+            # was `_fp_hint in ("local", "simple")`, which was true by
+            # construction while "simple" meant the in-house model. Now that
+            # Tier.SIMPLE holds whatever an administrator assigned, the old
+            # test calls a paid Claude turn local — which hoists a local-only
+            # system message onto it (below) AND hides its budget chip, so the
+            # user is billed and the budget bar stops moving.
+            _is_local_route = _mr_is_local_route(_local_model, _fp_route)
             logger.info(
                 "[SSE] live-stream mode active for all models "
                 "(local_route=%s fp_hint=%s local_model=%s) — "
@@ -8590,10 +8558,11 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                     # Uses async_stream (UAT) with ReasoningMarker support.
                     async for _tok in _mr.async_stream(
                         _fp_messages,
-                        model_hint=_fp_hint,
                         local_model=_local_model,
                         precleared=True,
                         precleared_findings=_ask_chk.get("findings", []),
+                        acl_filter=_fp_acl,
+                        **_fp_route,
                     ):
                         if isinstance(_tok, dict):
                             _sm = _tok.get("__stream_meta__")
@@ -8762,7 +8731,17 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 # context window. Give the user an actionable next step instead
                 # of a bare "Error generating response".
                 _err_s = repr(_ge).lower()
-                if any(k in _err_s for k in (
+                if isinstance(_ge, _ModelsBlockedByPolicy):
+                    # §N.1 step 9. The pre-flight above answers this case with
+                    # a 403 before streaming starts; reaching here means a rule
+                    # was written in between. The status is already 200, so the
+                    # denial has to be a message — but a specific one, not
+                    # "Error generating response".
+                    yield "data: " + json.dumps({"t":
+                        "\nAll AI models have been restricted for your department. "
+                        "Please contact your administrator."
+                    }) + "\n\n"
+                elif any(k in _err_s for k in (
                     "context_length", "context length", "maximum context",
                     "too many tokens", "context window", "reduce the length",
                     "prompt is too long", "string too long",
@@ -8956,7 +8935,12 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 # Attach live budget state to __meta__ so Chat.jsx updates the bar
                 # — but ONLY for cloud models. Local models are free and have no
                 # budget allocation, so showing budget chips is misleading.
-                if not _is_local_route:
+                #
+                # §N.1 step 9: the model that actually served the turn, not the
+                # pre-dispatch prediction _is_local_route holds. By here it is
+                # knowable, and "was this billable" is the only question that
+                # matters — getting it wrong hides a real charge.
+                if not _is_deployment_local(_gmeta.get("model")):
                     _bu_usage  = _bu_gut(_user_id)
                     _bu_limits = _bu_gb(_user_id)
                     _gmeta["budget"] = {

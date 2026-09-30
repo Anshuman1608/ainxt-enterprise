@@ -43,7 +43,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from core.logger import logger
 from core.proxy_tool_use import llm_proxy_headers as _llm_proxy_headers
@@ -998,6 +998,51 @@ def _warn_env_fallback(legacy_tier: str, reason: object) -> None:
     )
 
 
+class ModelsBlockedByPolicy(Exception):
+    """Every model eligible for this tier is denied to this user (§N.1 step 9).
+
+    Deliberately NOT a NoEligibleModel. The two failures look alike and must
+    be handled in opposite ways:
+
+      NoEligibleModel      the DEPLOYMENT cannot serve the tier — nothing is
+                           assigned, or every candidate fails a constraint.
+                           _resolve_governed returns None and the legacy .env
+                           chain serves the request, which is D15's whole
+                           point.
+
+      ModelsBlockedByPolicy
+                           the deployment can serve it and an ADMINISTRATOR
+                           said this user may not. Falling back to the .env
+                           constants here would dispatch an ungoverned cloud
+                           model in response to a governance rule — the exact
+                           escape the pre-migration comment at gateway.py:7591
+                           was written to prevent, and the reason this is a
+                           distinct type rather than a flag on the other one.
+
+    So this propagates to the caller, which turns it into the 403 the Chat
+    Auto path already returns. `blocked` is the ordered candidate list that
+    was refused, so the log line can name what the rule actually hit.
+    """
+
+    def __init__(self, tier, blocked: list):
+        self.tier = tier
+        self.blocked = list(blocked)
+        name = getattr(tier, "value", tier)
+        super().__init__(
+            f"every model eligible for tier {name!r} is blocked for this "
+            f"user ({', '.join(self.blocked) or 'no candidates'})"
+        )
+
+
+# The shape a caller passes to apply its own access-control list to a tier's
+# candidates. Mirrors routers.model_governance_router.filter_allowed_models,
+# minus the identity and session it closes over: given model ids, return the
+# permitted subset. A callable rather than a precomputed set because the
+# candidate ids are not known until the tier resolves — a set would mean
+# resolving twice and the second resolution could disagree with the first.
+AclFilter = Callable[[List[str]], List[str]]
+
+
 # ============================================================
 # MIGRATED CALL SITES  (Phase 6)
 # ============================================================
@@ -1049,6 +1094,246 @@ def tier_request(tier: Tier, legacy_hint: str,
             )
         return {"model_hint": value}
     return {"tier": tier, "legacy_hint": legacy_hint}
+
+
+# The complexity classifier's output vocabulary → the tier that serves it
+# (§N.1 step 9, targets from plan.html §D/§F). models.classifier._VALID_TIERS
+# and cil.intent._VALID_COMPLEXITY are both exactly these three keys, and
+# cil.intent._RETIRED_COMPLEXITY has already collapsed deep/solution into
+# "complex" by the time any caller gets here.
+#
+# Note what "simple" does: it used to dispatch the in-house local model, and
+# Tier.SIMPLE is whatever the administrator assigned. That is the intended
+# change (§D.2 — a task's tier expresses the capability it needs, not the fact
+# that the old implementation happened to run locally) and it is the one entry
+# in this map that can move a turn off the machine.
+_CHAT_COMPLEXITY_TIERS: dict = {
+    "simple":  Tier.SIMPLE,
+    "medium":  Tier.MEDIUM,
+    "complex": Tier.COMPLEX,
+}
+
+
+def chat_complexity_route(complexity: Optional[str]) -> dict:
+    """Routing kwargs for a classifier verdict, shared by all four chat paths.
+
+    Lives here rather than in each caller because gateway.py, kb_ask_router,
+    chat_worker and agents/tools all map the same three words, and four copies
+    of a routing table is how the pre-migration code ended up with two.
+
+    An unrecognised or EMPTY verdict returns ``{"model_hint": <value>}``
+    unchanged, which is not an oversight:
+
+      - route() gates its hint branch on ``if model_hint:``, so an empty hint
+        means "classify this prompt yourself" — there is no tier that says
+        that, and there is no _HINT_MAP key for it either.
+      - _coerce_tier RAISES on a legacy_hint that is not a _HINT_MAP key, and
+        strips falsy ones, so ``tier_request(X, "")`` cannot express it.
+
+    agents/tools.py reaches the empty case by default: its no-repo-context
+    downgrade assigns ``os.getenv("DOWNGRADE_MODEL", "")``. Coercing that to a
+    tier would have raised on the first such turn — the same assumption that
+    bit §N.1 step 6 on ENRICH_MODEL.
+    """
+    key = (complexity or "").strip().lower()
+    if not key:
+        # Normalised, not passed through: "   " is falsy to a human and TRUTHY
+        # to route()'s `if model_hint:`, so forwarding it verbatim would take
+        # the hint branch with a blank hint instead of classifying.
+        return {"model_hint": ""}
+    tier = _CHAT_COMPLEXITY_TIERS.get(key)
+    if tier is None:
+        # Unrecognised: forward the ORIGINAL, not `key`. Lowercasing here
+        # would mangle a case-sensitive model id, which is the defect step 8
+        # hit on DOC_MODEL_PROVIDER.
+        return {"model_hint": complexity}
+    # legacy_hint is the verdict's own word, not the tier's name: with
+    # governance off, model_hint="simple" must keep meaning what it meant.
+    return tier_request(tier, key)
+
+
+def fully_blocked_candidates(tier, acl_filter: Optional[AclFilter]) -> Optional[List[str]]:
+    """The tier's candidate ids when the ACL denies ALL of them, else None.
+
+    A pre-flight for callers that must reject before they start streaming.
+    ``route(acl_filter=…)`` remains the authoritative filter — this only
+    answers "is it worth starting", so that a governance denial is an HTTP 403
+    with a reason rather than an exception halfway through an SSE body the
+    client has already begun rendering.
+
+    Returns None — meaning "go ahead" — for every other outcome, including a
+    deployment with nothing assigned: that is NoEligibleModel's territory and
+    it degrades to the legacy chain, which is not this function's business.
+    """
+    if acl_filter is None or not _governance_enabled():
+        return None
+    try:
+        from core.tier_resolver import resolve_tier_candidates
+        ids = [rm.model_id for rm in resolve_tier_candidates(Tier(tier))]
+        if ids and not set(acl_filter(ids)):
+            return ids
+    except Exception as exc:  # noqa: BLE001 — a pre-flight never blocks a turn
+        logger.debug("fully_blocked_candidates(%r): %s", tier, exc)
+    return None
+
+
+def resolve_pick_to_model_id(hint: Optional[str]) -> str:
+    """The model id a USER-SUPPLIED pick will actually dispatch to (§N.1 step 9).
+
+    The honest replacement for hint_to_model_id() on the access-control path.
+    hint_to_model_id maps a hint to an .env CONSTANT, which stopped being the
+    same thing as "the model that runs" when the registry arrived: it answers
+    'gpt-5.4' for "medium" on a deployment that dispatches claude-sonnet-4-6,
+    and '' for "claude-sonnet-5" — a model that is in llm_models and is the
+    head of the complex tier — because CLAUDE_SONNET_5_MODEL is unset.
+
+    Resolution order mirrors route()'s own, so the id an ACL is checked
+    against is the id that gets called:
+
+      1. ``local:<id>``      — an exact in-house model, by address.
+      2. a registry model id — route() takes its TIER_REGISTRY branch and
+                               dispatches this exact id. Checked BEFORE the
+                               alias table because several registry ids are
+                               also alias keys (claude-sonnet-5, claude-opus-5)
+                               and the table's answer for those is the empty
+                               env constant.
+      3. a legacy alias      — with governance on, route() resolves the tier it
+                               means, so the ACL target is that tier's head.
+      4. otherwise           — hint_to_model_id's legacy answer, which is
+                               correct precisely when governance is off.
+
+    Returns "" when nothing resolves, so a caller can fall through to its own
+    fallback rather than distinguishing None from ''.
+    """
+    key = (hint or "").strip()
+    if not key:
+        return ""
+    # "auto" means "the platform chooses", so there is no pick to check. It
+    # needs saying because core.tiers.LEGACY_INBOUND_ALIASES maps "auto" to
+    # Tier.SIMPLE — reasonable for an inbound CLI hint, wrong as an answer to
+    # "which model did the user name". gateway.py normalises these to None
+    # before calling, but this is a public helper and the next caller may not.
+    if key.lower() in ("auto", "default", "none"):
+        return ""
+    if key.lower().startswith("local:"):
+        return key
+
+    try:
+        from core.llm_provider_registry import get_enabled_models
+        for m in get_enabled_models():
+            if m["model_id"] == key:
+                return key
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("resolve_pick_to_model_id(%r): registry unavailable (%s)", key, exc)
+
+    if _governance_enabled():
+        try:
+            from core.tiers import (
+                EXPLICIT_MODEL, note_legacy_alias, resolve_legacy_alias,
+            )
+            alias = resolve_legacy_alias(key)
+            if isinstance(alias, Tier):
+                # Feeds the same counter that gates the shim's removal in
+                # Phase 10, exactly as §N.1 step 11's boundary does.
+                note_legacy_alias(key, "chat-pick")
+                from core.tier_resolver import resolve_tier
+                return resolve_tier(alias).model_id
+            if alias == EXPLICIT_MODEL:
+                note_legacy_alias(key, "chat-pick")
+                # The client named a vendor, not a model. There is nothing
+                # concrete to check; fall through to the legacy answer.
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("resolve_pick_to_model_id(%r): tier lookup failed (%s)", key, exc)
+
+    return hint_to_model_id(key) or ""
+
+
+# Hints that named the in-house model directly, pre-migration. Retained only
+# as the governance-OFF answer for is_local_route(): with the flag off there
+# is no resolution to inspect, so the string is all there is.
+_LEGACY_LOCAL_HINTS = ("local", "simple", "inhouse", "in-house")
+
+
+def is_deployment_local(model_id: Optional[str]) -> bool:
+    """True when `model_id` runs inside the estate (§N.1 step 9).
+
+    Reads ``capabilities.privacy_class``, the same field ``no_cloud_egress``
+    filters on (core/tier_resolver.py:275), so "is this local" has one answer
+    across the platform instead of one per caller.
+
+    It replaces ``hint in ("local", "simple")``, which two chat paths used to
+    decide both the KV-cache hoist and whether to show the budget chip. Once
+    Tier.SIMPLE can hold a cloud model — which is the point of letting an
+    administrator assign it — that test starts calling a paid Claude turn
+    "local" and suppressing its budget chip: the user is billed and the budget
+    bar silently stops moving.
+
+    A union of two sources rather than a replacement for either, because they
+    answer different questions and a model can be in one and not the other:
+
+      capabilities.privacy_class      registry POLICY — the administrator
+                                      declared this model deployment-local.
+      gateway_local_llm.is_local_model  live DISPATCH — the Local LLM proxy's
+                                      /v1/models catalog serves it. Already
+                                      what _estimate_cost consults to bill
+                                      in-house models at $0, so dropping it
+                                      would make this disagree with the cost
+                                      the same turn is charged.
+
+    Fails CLOSED (returns False → "treat as billable") on any lookup problem.
+    Showing a budget chip for a free turn is cosmetic; hiding one for a paid
+    turn loses money silently.
+    """
+    mid = (model_id or "").strip()
+    if not mid:
+        return False
+    if mid.lower().startswith("local:"):
+        return True
+    try:
+        from core.llm_provider_registry import get_enabled_models
+        for m in get_enabled_models():
+            if m["model_id"] == mid:
+                caps = m.get("capabilities") or {}
+                if caps.get("privacy_class") == "deployment_local":
+                    return True
+                break
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("is_deployment_local(%r): registry unavailable (%s)", mid, exc)
+    try:
+        from gateway_local_llm import is_local_model as _proxy_serves
+        return bool(_proxy_serves(mid))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("is_deployment_local(%r): local catalog unavailable (%s)", mid, exc)
+    return False
+
+
+def is_local_route(local_model: Optional[str], route_kwargs: Optional[dict] = None) -> bool:
+    """Best-effort "will this turn stay in the estate", BEFORE dispatch.
+
+    Needed because the KV-cache hoist shapes the prompt and therefore has to
+    decide before the model is known. A wrong answer here costs a slightly
+    different system message, nothing more — so this peeks at the tier's head
+    rather than plumbing the resolution out of route().
+
+    The post-dispatch decisions (the budget chip) must NOT use this. They have
+    the real model and should ask is_deployment_local() about it.
+    """
+    if local_model:
+        return True
+    kw = route_kwargs or {}
+    tier = kw.get("tier")
+    if tier is not None:
+        try:
+            from core.tier_resolver import resolve_tier
+            return is_deployment_local(resolve_tier(Tier(tier)).model_id)
+        except Exception:  # noqa: BLE001 — a peek must never raise into a turn
+            return False
+    hint = (kw.get("model_hint") or "").strip().lower()
+    if hint.startswith("local:"):
+        return True
+    # Governance off, or an explicit pick: the hint is all we have. For a
+    # concrete model id the registry still knows the answer.
+    return hint in _LEGACY_LOCAL_HINTS or is_deployment_local(kw.get("model_hint"))
 
 
 # Hints that resolve to a specific Gemini model ID. Covers both the well-known
@@ -2343,9 +2628,59 @@ class ModelRouter:
             )
         return [_attempt(rm) for rm in resolved]
 
+    @staticmethod
+    def _apply_acl(governed_tier, candidates: list, acl_filter: AclFilter) -> list:
+        """The permitted subset of `candidates`, in the admin's priority order.
+
+        One call with the whole id list, not one per candidate: `acl_filter`
+        wraps a database round-trip, and the ACL query is a single UNION ALL
+        over both rule tables.
+
+        The result is re-derived by membership rather than taken from the
+        filter's return order, because the filter answers "may they use
+        these", not "in what order" — and §M.5's priority ordering is the
+        administrator's, not the ACL's.
+        """
+        ids = [rm.model_id for rm in candidates]
+        if not ids:
+            # Nothing to permit or refuse. resolve_tier_candidates raises
+            # rather than returning [], so this is unreachable through
+            # _resolve_governed — but "the deployment has nothing assigned"
+            # and "the administrator denied you" are the two failures this
+            # class exists to keep apart, and conflating them here would
+            # report an unconfigured tier as an access denial.
+            return []
+        try:
+            allowed = set(acl_filter(ids))
+        except Exception as exc:  # noqa: BLE001
+            # Fail OPEN, matching the pre-migration behaviour this replaces
+            # (gateway.py's walk wrapped the whole block in "check error
+            # (fail-open)"). A governance lookup that is down must not take
+            # chat down with it; it is logged loudly instead.
+            logger.warning(
+                "ModelRouter: ACL filter for tier %r raised %s — allowing all "
+                "%d candidate(s) for this request (fail-open).",
+                getattr(governed_tier, "value", governed_tier), exc, len(ids))
+            return candidates
+
+        kept = [rm for rm in candidates if rm.model_id in allowed]
+        if not kept:
+            raise ModelsBlockedByPolicy(governed_tier, ids)
+        if len(kept) != len(candidates):
+            logger.info(
+                "ModelRouter: ACL dropped %d of %d candidate(s) for tier %r "
+                "(blocked: %s) — serving %s",
+                len(candidates) - len(kept), len(candidates),
+                getattr(governed_tier, "value", governed_tier),
+                ", ".join(i for i in ids if i not in allowed),
+                kept[0].model_id,
+            )
+        return kept
+
     def _resolve_governed(self, governed_tier, extra: dict, *, legacy_tier: str,
                           complexity: str, is_vision: bool, hint,
-                          constraints_kw: dict, channel):
+                          constraints_kw: dict, channel,
+                          acl_filter: Optional[AclFilter] = None):
         """Resolve one tier through the admin's assignments, or None to fall back.
 
         Returns None — meaning "run the legacy chain" — when the tier has
@@ -2355,6 +2690,29 @@ class ModelRouter:
         re-raises so the caller can surface an explicit failure rather than
         quietly sending confidential data to whichever cloud model the env
         constants happen to name.
+
+        `acl_filter` (§N.1 step 9) narrows the resolved candidates to the ones
+        this user is permitted to use. It runs HERE, on the resolved list,
+        rather than in the caller, for three reasons:
+
+          - the ids are the real ones. The Chat Auto path used to ACL-check
+            hint_to_model_id(hint) — the pre-registry hint → .env map — which
+            on this deployment answered "gpt-5.4" for a request that
+            dispatched claude-sonnet-4-6. filter_allowed_models treats an
+            absent rule as allowed, so the check passed for a model that was
+            never called.
+          - "candidate 1 is blocked, try candidate 2" is already what
+            _attempts_from_resolved does with the list. Filtering the list is
+            therefore the whole of the fallback behaviour that
+            CHAT_FALLBACK_CHAIN was hand-rolling in 116 lines of gateway.py.
+          - the admin's priority order survives. A caller that picked a
+            permitted model itself and pinned it would flatten the ordering
+            and report selection_mode='explicit' for a turn the user asked
+            Auto for.
+
+        None (the default) means no ACL, which is what every application-tier
+        caller passes — §M.4: the department ACL governs the user's own turns,
+        not the platform's internal classification and summarisation calls.
         """
         from core.tier_resolver import (
             Constraints, NoEligibleModel, resolve_tier_candidates,
@@ -2362,6 +2720,13 @@ class ModelRouter:
         c = Constraints(**{**constraints_kw, **extra})
         try:
             candidates = resolve_tier_candidates(governed_tier, c, channel=channel)
+            if acl_filter is not None:
+                candidates = self._apply_acl(governed_tier, candidates, acl_filter)
+        except ModelsBlockedByPolicy:
+            # Before the two handlers below, which both degrade to the .env
+            # chain. A governance rule must never be answered by dispatching
+            # an ungoverned model — see the class docstring.
+            raise
         except NoEligibleModel as exc:
             if c.no_cloud_egress or governed_tier in _NO_ENV_FALLBACK:
                 raise
@@ -2403,7 +2768,8 @@ class ModelRouter:
               budget_state: Optional[str] = None,
               needs_tools: bool = False,
               needs_streaming: bool = False,
-              channel: Optional[str] = None) -> RoutingDecision:
+              channel: Optional[str] = None,
+              acl_filter: Optional[AclFilter] = None) -> RoutingDecision:
         """Return the RoutingDecision for this prompt.
         prompt: str OR list[dict] (multi-turn messages array).
         tier: OPTIONAL approved application tier (core.tiers.Tier). Keyword-only
@@ -2439,9 +2805,20 @@ class ModelRouter:
             Phase 6. They exist now so that wiring is a one-line change at the
             call site rather than a signature change here.
 
+        acl_filter: OPTIONAL (§N.1 step 9) the user's access-control list, as
+            a callable taking model ids and returning the permitted subset —
+            the shape of filter_allowed_models. Applied to the tier's resolved
+            candidates, so a blocked candidate 1 serves from candidate 2 in
+            the administrator's priority order and only an entirely blocked
+            tier fails. Raises ModelsBlockedByPolicy in that case, which does
+            NOT degrade to the legacy chain. Passed by the user-facing chat
+            entry points only; §M.4 keeps application tiers unfiltered.
+
         Raises NoEligibleModel only under no_cloud_egress, where falling back
         is the one outcome the constraint exists to prevent. Every other
-        resolution failure degrades to the legacy chain with a warning.
+        resolution failure degrades to the legacy chain with a warning —
+        except ModelsBlockedByPolicy, which is a policy decision rather than a
+        deployment gap and must reach the caller.
         """
         requested_tier = Tier(tier) if tier is not None else None
         model_hint = self._coerce_tier(model_hint, tier, legacy_hint)
@@ -2490,6 +2867,7 @@ class ModelRouter:
             return self._resolve_governed(
                 gtier, extra, legacy_tier=legacy_tier, complexity=complexity,
                 is_vision=is_vision, hint=hint, constraints_kw=kw, channel=channel,
+                acl_filter=acl_filter,
             )
 
         # 0. PRIVACY FLOOR (hard enterprise invariant) — runs FIRST so nothing
@@ -3569,7 +3947,8 @@ class ModelRouter:
                  data_classification: Optional[str] = None,
                  *, tier: Optional[Tier] = None,
                  legacy_hint: Optional[str] = None,
-                 no_cloud_egress: bool = False):
+                 no_cloud_egress: bool = False,
+                 acl_filter: Optional[AclFilter] = None):
         """Route prompt to the correct gateway. Never raises — returns error str on failure.
         prompt: str OR list[dict] (multi-turn messages array).
 
@@ -3600,7 +3979,8 @@ class ModelRouter:
             decision = self.route(prompt, model_hint=None if tier is not None else model_hint,
                                   tier=tier, legacy_hint=legacy_hint,
                                   no_cloud_egress=no_cloud_egress,
-                                  data_classification=data_classification)
+                                  data_classification=data_classification,
+                                  acl_filter=acl_filter)
         except Exception as exc:
             # Only reachable under no_cloud_egress, which is the one constraint
             # the resolver refuses to degrade around. Returned as a string
@@ -3690,6 +4070,7 @@ class ModelRouter:
             tier: Optional[Tier] = None,
             legacy_hint: Optional[str] = None,
             no_cloud_egress: bool = False,
+            acl_filter: Optional[AclFilter] = None,
     ):
         """Route prompt and yield tokens directly (true token streaming).
         prompt: str OR list[dict] (multi-turn messages array).
@@ -3745,7 +4126,8 @@ class ModelRouter:
             # cannot stream rather than discovering it mid-response.
             decision = self.route(prompt, model_hint=None if tier is not None else model_hint,
                                   tier=tier, legacy_hint=legacy_hint,
-                                  no_cloud_egress=no_cloud_egress, needs_streaming=True)
+                                  no_cloud_egress=no_cloud_egress, needs_streaming=True,
+                                  acl_filter=acl_filter)
         except Exception as exc:
             if type(exc).__name__ != "NoEligibleModel":
                 raise
@@ -3796,7 +4178,8 @@ class ModelRouter:
     async def async_generate(self, prompt, model_hint: Optional[str] = None,
                              *, tier: Optional[Tier] = None,
                              legacy_hint: Optional[str] = None,
-                             no_cloud_egress: bool = False) -> str:
+                             no_cloud_egress: bool = False,
+                             acl_filter: Optional[AclFilter] = None) -> str:
         """Async route + generate. Uses persistent AsyncClient — no thread held during LLM I/O.
         Falls back to sync generate() when LLM_PROXY_URL is not set (local dev / direct gateway).
         prompt: str OR list[dict] (multi-turn messages array).
@@ -3818,7 +4201,8 @@ class ModelRouter:
         decision = self.route(prompt,
                               model_hint=None if tier is not None else model_hint,
                               tier=tier, legacy_hint=legacy_hint,
-                              no_cloud_egress=no_cloud_egress)
+                              no_cloud_egress=no_cloud_egress,
+                              acl_filter=acl_filter)
         self._record_selection(decision)
         logger.info(f"ModelRouter.async_generate → {decision.model} (tier={decision.tier})")
         gw_map = {
@@ -3903,6 +4287,7 @@ class ModelRouter:
             tier: Optional[Tier] = None,
             legacy_hint: Optional[str] = None,
             no_cloud_egress: bool = False,
+            acl_filter: Optional[AclFilter] = None,
     ):
         """Async streaming generator — yields str tokens then a sentinel dict.
 
@@ -3927,7 +4312,8 @@ class ModelRouter:
         decision = self.route(prompt,
                               model_hint=None if tier is not None else model_hint,
                               tier=tier, legacy_hint=legacy_hint,
-                              no_cloud_egress=no_cloud_egress, needs_streaming=True)
+                              no_cloud_egress=no_cloud_egress, needs_streaming=True,
+                              acl_filter=acl_filter)
         self._record_selection(decision)
         logger.info(
             f"ModelRouter.async_stream → {decision.model} (tier={decision.tier})"

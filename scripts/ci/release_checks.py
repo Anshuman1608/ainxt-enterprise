@@ -547,6 +547,20 @@ _PHASE6_MIGRATED_MODULES = (
     "models/hybrid_retriever.py",
     "sandbox/self_healing_engine.py",
     "workers/secure_code_gate_worker.py",
+    # §N.1 step 9 — the Chat Auto path. Every in-process chat entry point; the
+    # CLI and IDE dispatchers in gateway.py are deliberately still out of
+    # scope (D34) and routers/ide_router.py is therefore NOT listed, because
+    # its _hint_map is the inbound boundary shim §E keeps until Phase 9/10.
+    # gateway.py qualifies: after step 9 it carries no literal tier hint at
+    # all. The CLI and IDE sites that remain unmigrated pass VARIABLES
+    # (_hint_for_stream, _route_hint, _model_hint), which this check cannot
+    # see either way — so listing the file ratchets what step 9 fixed without
+    # claiming anything about what it did not.
+    "gateway.py",
+    "routers/kb_ask_router.py",
+    "routers/chat_router.py",
+    "workers/chat_worker.py",
+    "agents/tools.py",
     # §N.1 step 8 — the document pipeline, plus the last two consumers of
     # core/model_registry.py's SDLC CLI helpers that were not themselves SDLC.
     "workers/doc_worker.py",

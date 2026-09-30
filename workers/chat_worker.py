@@ -786,8 +786,10 @@ def _handle_doc_generation(
         struct_prompt = _build_freeform_prompt(effective_question[:6000], "pdf")
 
     try:
-        from models.model_router import model_router as _mr
-        _doc_result   = _mr.generate(struct_prompt, model_hint="complex", return_meta=True)
+        from core.tiers import Tier
+        from models.model_router import model_router as _mr, tier_request
+        _doc_result   = _mr.generate(struct_prompt, return_meta=True,
+                                     **tier_request(Tier.COMPLEX, "complex"))
         raw           = (_doc_result["text"] or "").strip()
         _doc_llm_meta = _doc_result["meta"]
 
@@ -1142,11 +1144,12 @@ def _handle_pptx_generation(
 
     _pptx_llm_meta: dict = {}
     try:
-        from models.model_router import model_router as _mr
+        from core.tiers import Tier
+        from models.model_router import model_router as _mr, tier_request
         _pptx_result  = _mr.generate(
             _build_pptx_prompt(_pptx_question[:6000]),
-            model_hint="complex",
             return_meta=True,
+            **tier_request(Tier.COMPLEX, "complex"),
         )
         raw           = (_pptx_result["text"] or "").strip()
         _pptx_llm_meta = _pptx_result["meta"]
@@ -1305,6 +1308,23 @@ _SLIDES_CACHE_TTL = 3600  # 1 hour — user has this window to pick a template
 
 STREAM_TTL     = 3600     # 1 hour
 STREAM_MAXLEN  = 10_000   # trim stream to prevent unbounded growth
+
+
+def _kb_answer_route(model_hint: "str | None", complexity: str) -> dict:
+    """Routing kwargs for the KB answer call (§N.1 step 9).
+
+    Precedence is unchanged: a user's pick wins over the classifier, which is
+    §G's hard requirement. Only the second branch moves — from the classifier
+    verdict as a raw hint string to the tier that serves it.
+
+    Returned as kwargs rather than a hint string for the reason D30 records:
+    there is no string meaning "resolve the tier", because _coerce_tier raises
+    on an unknown legacy_hint and strips falsy ones.
+    """
+    if model_hint:
+        return {"model_hint": model_hint}
+    from models.model_router import chat_complexity_route
+    return chat_complexity_route(complexity)
 
 
 def run_chat_job(payload: dict) -> None:
@@ -1540,7 +1560,10 @@ def _run_pipeline(payload: dict, stream_key: str) -> None:
 
                 if not cached_summary:
                     # Generate summary via LLM (simple model to keep cost low)
-                    from models.model_router import model_router as _mr_sum
+                    from core.tiers import Tier
+                    from models.model_router import (
+                        model_router as _mr_sum, tier_request,
+                    )
                     older_text = "\n".join(
                         f"{'User' if m.get('role')=='user' else 'Asst'}: "
                         f"{m.get('content','')[:300]}"
@@ -1553,7 +1576,14 @@ def _run_pipeline(payload: dict, stream_key: str) -> None:
                     )
                     try:
                         logger.info("[chat worker] : Chat summarizing call to LLM")
-                        cached_summary = _mr_sum.generate(sum_prompt, model_hint="simple")
+                        # §D lists this under `simple`. It was the last
+                        # conversation summariser still asking for the local
+                        # model by name: §N.1 step 1 moved
+                        # memory/chat_summarizer.py and core/context_manager.py
+                        # to Tier.SIMPLE, so until now two modules summarised
+                        # the same conversations on different models.
+                        cached_summary = _mr_sum.generate(
+                            sum_prompt, **tier_request(Tier.SIMPLE, "simple"))
                         # Cache the summary for 30 minutes to avoid re-generating each turn
                         _rc.setex(_sum_key, 1800, cached_summary)
                     except Exception as _se:
@@ -1838,6 +1868,17 @@ def _run_pipeline(payload: dict, stream_key: str) -> None:
 
     # ── STEP 9: Build prompt ──────────────────────────────────
     from models.model_router import model_router as _mr
+
+    # §N.1 step 9. The department ACL applies here because this is the user's
+    # own answer, not one of the platform's internal calls (§M.4) — the
+    # summariser and the docx/pptx structuring above deliberately pass none.
+    try:
+        from routers.model_governance_router import acl_filter_for as _acl_for
+        _acl = _acl_for(user_id, (user_ctx or {}).get("department") if user_ctx else None)
+    except Exception as _acl_err:      # noqa: BLE001 — governance never breaks chat
+        logger.warning(f"chat_worker: ACL filter unavailable ({_acl_err}) — unfiltered")
+        _acl = None
+
     if context_chunks:
         _ctx_text = "\n\n".join(context_chunks)
         # ── G2: KB_DOC_PROMPT for ALL docs_kb queries ────────────────────────
@@ -1864,6 +1905,7 @@ def _run_pipeline(payload: dict, stream_key: str) -> None:
                 question=question_with_history,
             )
         effective_hint = "medium" if not model_hint else model_hint
+        _answer_route  = _kb_answer_route(model_hint, "medium")
     else:
         # ── G1: Zero-context KB query — refuse, do not hallucinate ───────────
         # When retrieval returns 0 chunks for a docs_kb query, the previous
@@ -1896,6 +1938,12 @@ def _run_pipeline(payload: dict, stream_key: str) -> None:
         else:
             prompt = question_with_history
         effective_hint = model_hint or ("medium" if query_type == "simple" else query_type)
+        # Same precedence, one difference preserved verbatim: with no
+        # retrieved context a "simple" verdict is promoted to medium here and
+        # NOT at :1879, because a zero-context KB answer is a refusal the
+        # model still has to word correctly.
+        _answer_route  = _kb_answer_route(
+            model_hint, "medium" if query_type == "simple" else query_type)
 
     # ── STEP 10: Stream tokens ────────────────────────────────
     full_response = ""
@@ -1930,7 +1978,7 @@ def _run_pipeline(payload: dict, stream_key: str) -> None:
         # threading.local fallback would return 0 and cause an in_tok
         # of 3 or similar — same bug as the fast-path /ask had).
         _sm: dict = {}
-        for tok in _mr.stream(prompt, model_hint=effective_hint):
+        for tok in _mr.stream(prompt, acl_filter=_acl, **_answer_route):
             if isinstance(tok, dict):
                 _sm = tok.get("__stream_meta__") or _sm
                 continue

@@ -114,6 +114,37 @@ MIGRATED: list[tuple[Tier, str, str]] = [
     # where a call site WENT, not about matching the tier's name.
     (Tier.SIMPLE,  "haiku",   "services/feedback_processor.py:337"),
     (Tier.SIMPLE,  "mini",    "routers/coach_router.py:972 — was openai_model_for_tier"),
+
+    # ── step 9: the Chat Auto path
+    # Step 9 introduces no pair this file has not already proved — the
+    # classifier's whole vocabulary is {simple, medium, complex} and each word
+    # maps to the tier of the same name. The rows are here anyway, because the
+    # file's invariant is "every migrated call site's pair has a row that
+    # NAMES it": a reader whose Auto turns started going somewhere new needs
+    # to find the Auto path in this list, and a pair that is only implied by
+    # step 1's summariser row is a pair nobody checked for step 9.
+    #
+    # The `simple` row is the one that matters. Pre-migration,
+    # model_hint="simple" dispatched the in-house model via gateway_local_llm;
+    # Tier.SIMPLE resolves to whatever the administrator assigned. So the
+    # parity assertion below proves the ROLLBACK is exact — governance off and
+    # this row is byte-identical — while saying nothing about flag-on, where
+    # the change is the intended one (D35, §D.2). That limit is worth stating:
+    # it is the same shape as the index_worker row above, and it is why step 9
+    # needs field checks rather than only this file.
+    (Tier.SIMPLE,  "simple",
+     "gateway.py CIL task_complexity='simple'; workers/chat_worker.py:1556 "
+     "cached summary — was the local model by name"),
+    (Tier.MEDIUM,  "medium",
+     "gateway.py flat Auto default + CIL 'medium'; routers/kb_ask_router.py; "
+     "workers/chat_worker.py KB answer; gateway.py continue-truncated-answer"),
+    (Tier.COMPLEX, "complex",
+     "gateway.py voice_platform + CIL 'complex'; routers/kb_ask_router.py "
+     "voice; workers/chat_worker.py:790,1148 docx/pptx structuring"),
+    (Tier.SIMPLE,  "haiku",
+     "gateway.py:3672 follow-up suggestions; routers/chat_router.py:2347 "
+     "chat title"),
+    (Tier.MINI,    "mini",    "gateway.py:3346 prompt enhancement (ENHANCE_MODEL_HINT)"),
 ]
 
 _IDS = [f"{t.value}<-{h}" for t, h, _ in MIGRATED]

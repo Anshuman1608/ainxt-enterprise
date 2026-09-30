@@ -129,17 +129,22 @@ def test_the_precedence_is_user_pick_then_tier_then_classifier():
     src = (ROOT / "agents" / "tools.py").read_text(encoding="utf-8", errors="ignore")
     i_hint = src.index('if getattr(state, "model_hint", None):')
     i_tier = src.index('elif getattr(state, "tier", None) is not None:')
-    i_cls = src.index('_route_kwargs = {"model_hint": _complexity}')
+    i_cls = src.index('_route_kwargs = _chat_complexity_route(_complexity)')
     assert i_hint < i_tier < i_cls
 
 
-def test_the_classifier_branch_is_still_the_legacy_hint():
-    """Migrating the complexity→hint mapping is §N.1 step 9, not this item.
-    If this assertion starts failing because the branch now passes a tier,
-    that is step 9 landing — and it needs its own before/after evidence on a
-    fixed query set, not a quiet ride along with item 1."""
+def test_the_classifier_branch_now_asks_for_the_tier():
+    """§N.1 step 9 landed: the classifier branch maps its verdict to a tier
+    instead of passing the word through as a router hint.
+
+    This replaces test_the_classifier_branch_is_still_the_legacy_hint, which
+    asserted the opposite while step 9 was pending. Kept as an assertion in
+    the same place rather than deleted, so the file still says which branch
+    decides the model and the handover is visible in the diff.
+    """
     src = (ROOT / "agents" / "tools.py").read_text(encoding="utf-8", errors="ignore")
-    assert '_route_kwargs = {"model_hint": _complexity}' in src
+    assert '_route_kwargs = _chat_complexity_route(_complexity)' in src
+    assert '_route_kwargs = {"model_hint": _complexity}' not in src
 
 
 # ── The call site that was left behind ────────────────────────────────────

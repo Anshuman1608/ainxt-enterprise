@@ -110,6 +110,27 @@ class KbQuestion(BaseModel):
     mode:           Optional[str]        = None
 
 
+def _kb_route_for(voice_platform: bool, model_hint: Optional[str]) -> dict:
+    """Routing kwargs for a /kb/ask answer (§N.1 step 9).
+
+    Mirrors the `_fp_hint` precedence one line above its caller so the two
+    cannot drift: voice → complex, a user's pick wins, otherwise the flat
+    default. Unlike gateway.py's /ask there is no CIL branch — this endpoint
+    is given rag_mode on the request and does not classify (module docstring).
+
+    Kwargs rather than a hint string for D30's reason: no string expresses
+    "resolve the tier", since _coerce_tier raises on an unknown legacy_hint
+    and strips falsy ones.
+    """
+    from core.tiers import Tier
+    from models.model_router import tier_request
+    if voice_platform:
+        return tier_request(Tier.COMPLEX, "complex")
+    if model_hint:
+        return {"model_hint": model_hint}
+    return tier_request(Tier.MEDIUM, "medium")
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -728,6 +749,24 @@ async def kb_ask_ai(
     # Voice always uses "complex" (Claude) for best natural language quality.
     _fp_hint = "complex" if q.voice_platform else (_model_hint or "medium")
 
+    # ── §N.1 step 9: the same hint, as a tier request ──────────────────────
+    # _fp_hint stays a str because the log lines below read it. _fp_route is
+    # what actually routes. No CIL block here: this endpoint is handed
+    # rag_mode on the request and deliberately does not classify (see the
+    # module docstring), so "medium" is the only non-voice default.
+    #
+    # The ACL is new on THIS endpoint. /ask has filtered Auto turns by
+    # department since before the tier work; this router forked /ask and the
+    # governance block was not copied with the line above, so a department
+    # rule has never applied to a /kb/ask turn.
+    _fp_route = _kb_route_for(q.voice_platform, _model_hint)
+    try:
+        from routers.model_governance_router import acl_filter_for as _acl_for
+        _fp_acl = _acl_for(_user_id, _user_dept)
+    except Exception as _acl_err:      # noqa: BLE001 — governance never breaks chat
+        logger.warning(f"[kb_ask] ACL filter unavailable ({_acl_err}) — unfiltered")
+        _fp_acl = None
+
     # ── Detected language (for Kafka payload) ─────────────────────────────
     _detected_lang = "unknown"
     try:
@@ -762,7 +801,13 @@ async def kb_ask_ai(
 
         # KV-cache hoist for local models
         _LOCAL_KV_CACHE_HOIST = os.getenv("LOCAL_KV_CACHE_HOIST", "true").lower() == "true"
-        _is_local_route = bool(_local_model or _fp_hint in ("local", "simple"))
+        # §N.1 step 9: ask the resolved model, not the hint string. `simple`
+        # used to mean "the in-house model" by construction; now it means
+        # whatever the administrator assigned to it, so the old string test
+        # would call a Claude turn local — hoisting a local-only system
+        # message onto it and hiding its budget chip.
+        from models.model_router import is_local_route as _mr_is_local_route
+        _is_local_route = _mr_is_local_route(_local_model, _fp_route)
         if _LOCAL_KV_CACHE_HOIST and _is_local_route:
             try:
                 _kv_sys_content = _build_local_system_message(
@@ -869,10 +914,11 @@ async def kb_ask_ai(
 
             async for _tok in _mr.async_stream(
                 _fp_messages,
-                model_hint  = _fp_hint,
                 local_model = _local_model,
                 precleared  = True,
                 precleared_findings = _ask_chk.get("findings", []),
+                acl_filter  = _fp_acl,
+                **_fp_route,
             ):
                 if isinstance(_tok, dict):
                     _sm = _tok.get("__stream_meta__")
@@ -1082,7 +1128,11 @@ async def kb_ask_ai(
             )
             _bu_tok = _gmeta["in_tok"] + _gmeta["out_tok"]
             _bu_inc(_user_id, tokens=_bu_tok, requests=0, cost_usd=_gmeta["cost"])
-            if not _is_local_route:
+            # The model that actually served the turn, not the pre-dispatch
+            # prediction above: the chip must appear exactly when the turn was
+            # billable, and by here that is knowable rather than guessable.
+            from models.model_router import is_deployment_local as _is_dep_local
+            if not _is_dep_local(_gmeta.get("model")):
                 _bu_usage  = _bu_gut(_user_id)
                 _bu_limits = _bu_gb(_user_id)
                 _gmeta["budget"] = {

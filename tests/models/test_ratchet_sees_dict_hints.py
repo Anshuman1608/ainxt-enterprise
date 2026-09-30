@@ -9,15 +9,23 @@ and "use this hint" cannot both be expressed as one string:
     _route = {"model_hint": "complex"}
     model_router.generate(prompt, **_route)
 
-A splatted local is not a keyword, so the check read ZERO hits in
-agents/tools.py — the single most important file §N.1 step 9 has to change,
-and the one this migration has most carefully left alone. A ratchet blind to
-the shape the code is written in is not ratcheting anything.
+A splatted local is not a keyword, so the check read ZERO hits on the whole
+idiom. A ratchet blind to the shape the code is written in is not ratcheting
+anything.
 
 The dict form is flagged wherever the LITERAL appears rather than at the call,
 because following the variable would need dataflow analysis and the pair
 `{"model_hint": "<tier>"}` is indefensible anywhere in a module that has been
 migrated.
+
+CORRECTION (§N.1 step 9). Step 8 shipped this check and claimed it now
+guarded `agents/tools.py:539`. It did not: that line was
+`{"model_hint": _complexity}`, a NAME, and the sweep only reads Constants.
+Reverting step 9 in exactly that form still passes the ratchet — measured, not
+assumed. The variable form is guarded by source assertions in tests/agents/
+instead, and the boundary is pinned by
+test_the_dict_sweep_sees_LITERALS_only_and_that_is_the_limit below, along with
+the reason it cannot simply be widened.
 """
 
 from __future__ import annotations
@@ -106,22 +114,61 @@ def test_the_real_tree_is_clean(rc):
     assert rc.check_tier_migration(None) == []
 
 
-# ── The line this migration must not touch ────────────────────────────────
+# ── The line this check was widened for ───────────────────────────────────
+#
+# These two asserted the pre-step-9 state: that agents/tools.py still carried
+# the splat idiom and was NOT yet in the migrated list. Step 9 landed, so they
+# assert the other side of the same fact. They stay here rather than moving to
+# the step 9 test file because the point they make is about THIS check — the
+# reason it was taught to read ast.Dict at all was that it could not see this
+# one line, and that is worth keeping next to the check's own tests.
 
 
-def test_the_chat_auto_classifier_branch_is_still_the_legacy_hint():
-    """agents/tools.py:539 is §N.1 step 9's, not step 8's. Asserted HERE as
-    well as in tests/agents/test_orchestrator_tier_passthrough.py because
-    teaching the ratchet to see the splat idiom is exactly the change that
-    might tempt someone to "fix" this line while they are in the area — and
-    step 9 needs its own before/after evidence on a fixed query set, not a
-    quiet ride along with a CI improvement."""
+def test_the_chat_auto_classifier_branch_now_asks_for_the_tier():
+    """§N.1 step 9. The splat idiom is gone from the branch the ratchet was
+    widened to see, replaced by the shared complexity → tier mapping."""
     src = (ROOT / "agents" / "tools.py").read_text(encoding="utf-8")
-    assert '_route_kwargs = {"model_hint": _complexity}' in src
+    assert '_route_kwargs = _chat_complexity_route(_complexity)' in src
+    assert '_route_kwargs = {"model_hint": _complexity}' not in src
 
 
-def test_agents_tools_is_not_in_the_migrated_list_yet(rc):
-    """The corollary: the ratchet can now see that line's shape, so adding
-    agents/tools.py to _PHASE6_MIGRATED_MODULES before step 9 lands would
-    make CI fail. It is not there."""
-    assert "agents/tools.py" not in rc._PHASE6_MIGRATED_MODULES
+def test_the_dict_sweep_sees_LITERALS_only_and_that_is_the_limit(
+        rc, tmp_path, monkeypatch):
+    """A correction to what §N.1 step 8 claimed for D33.
+
+    Step 8's commit said the widened check "can now see
+    {"model_hint": "<tier>"} dict literals" and that this guarded
+    agents/tools.py:539. The first half is true; the second is not, and this
+    test exists so nobody relies on the difference again.
+
+    The check flags a dict VALUE only when it is an ast.Constant in
+    _PHASE6_TIER_HINTS. agents/tools.py:539 was
+    `{"model_hint": _complexity}` — a Name — so reverting step 9 in that exact
+    form still passes the ratchet. Verified by reverting it: the ratchet said
+    ok and five source assertions failed.
+
+    It CANNOT be widened to "any dict with a model_hint key", because the
+    legitimate user-pick passthroughs have exactly that shape
+    (`{"model_hint": state.model_hint}` two lines above the migrated branch,
+    workers/chat_worker.py::_kb_answer_route, routers/kb_ask_router.py::
+    _kb_route_for, and workers/doc_worker.py's local: handling). Telling a
+    classifier verdict apart from a user's pick is a judgement about meaning,
+    not shape — so the variable form is guarded by the source assertions in
+    tests/agents/, and this ratchet's remit stops at literals.
+    """
+    # A literal IS caught, in the splat form step 6 introduced…
+    assert _run_on(rc, tmp_path, monkeypatch, 'x = {"model_hint": "complex"}\n')
+    # …and a variable is NOT, in the same form.
+    assert not _run_on(rc, tmp_path, monkeypatch, 'x = {"model_hint": _complexity}\n')
+    # The legitimate shape that makes widening impossible.
+    assert not _run_on(rc, tmp_path, monkeypatch,
+                       'x = {"model_hint": state.model_hint}\n')
+
+
+def test_agents_tools_is_now_in_the_migrated_list(rc):
+    """The corollary, and the part that makes the widening load-bearing: with
+    agents/tools.py listed, a revert to `{"model_hint": _complexity}` is a
+    failing build rather than a silent regression. Before step 9 the file was
+    deliberately absent from the list; leaving it absent now would mean the
+    dict-literal sweep guards nothing in the file it was written for."""
+    assert "agents/tools.py" in rc._PHASE6_MIGRATED_MODULES

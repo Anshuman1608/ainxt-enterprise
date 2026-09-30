@@ -2289,7 +2289,8 @@ def auto_title_chat(chat_id: str, current_user: dict = Depends(get_current_user)
     try:
         from db.database import SessionLocal
         from db.models import Chat, ChatMessage
-        from models.model_router import model_router
+        from core.tiers import Tier
+        from models.model_router import model_router, tier_request
         import datetime as _dt
         db = SessionLocal()
         try:
@@ -2344,7 +2345,11 @@ def auto_title_chat(chat_id: str, current_user: dict = Depends(get_current_user)
             # at a real proxy service, or when API keys are configured for direct calls).
             if not raw:
                 try:
-                    raw = model_router.generate(prompt, model_hint="haiku")
+                    # §D lists this under `simple`: a 4-7 word title is short
+                    # output that still has to follow an instruction. "haiku"
+                    # was the vendor SKU standing in for that.
+                    raw = model_router.generate(
+                        prompt, **tier_request(Tier.SIMPLE, "haiku"))
                 except Exception:
                     raw = ""
             # Guard against error strings leaking as the title — model_router.generate

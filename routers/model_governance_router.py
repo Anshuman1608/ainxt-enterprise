@@ -113,6 +113,38 @@ def filter_allowed_models(model_ids, user_id: str, department: str, db) -> List[
     return [m for m in model_ids if user_rules.get(m, dept_rules.get(m, True))]
 
 
+def acl_filter_for(user_id: Optional[str], department: Optional[str]):
+    """An ``acl_filter`` for ModelRouter, bound to one user (§N.1 step 9).
+
+    Returns the callable ``route(acl_filter=…)`` expects — model ids in,
+    permitted subset out — or ``None`` when there is no identity to check, so
+    an anonymous or service-to-service turn behaves exactly as it does today.
+
+    This exists so the four chat entry points share one definition. Before
+    step 9 each of them decided for itself which model to ACL-check, which is
+    how ``gateway.py`` came to check ``hint_to_model_id(hint)`` — the
+    pre-registry hint → .env map, whose answer for the Auto default was a
+    model the platform cannot even dispatch — while ``kb_ask_router.py``
+    checked nothing at all.
+
+    The session is opened and closed per call because the router invokes this
+    mid-route, on whichever thread or event loop is dispatching; borrowing the
+    request's session would outlive its scope on the streaming paths.
+    """
+    if not user_id:
+        return None
+
+    def _filter(model_ids: List[str]) -> List[str]:
+        from db.database import SessionLocal
+        db = SessionLocal()
+        try:
+            return filter_allowed_models(list(model_ids), user_id, department or "", db)
+        finally:
+            db.close()
+
+    return _filter
+
+
 def is_web_search_allowed(model_id: str, user_id: str, department: str, db) -> bool:
     """Resolve effective Web Search permission for a user and model.
 
