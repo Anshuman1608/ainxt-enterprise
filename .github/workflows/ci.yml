@@ -132,6 +132,21 @@ jobs:
             cd ai-ui && npm install --no-audit --no-fund --silent && npm test
           fi
 
+      - name: Agent Studio frontend tests
+        # Phase 7. `npm test` (vitest) has been in this package.json all along
+        # but no workflow called it, and the directory had no test files — so
+        # the hook and its governance allowlist were unguarded. Phase 7 fixes
+        # the allowlist rule in src/hooks/useAvailableModels.js (an empty
+        # allowlist meant "no restriction", which showed a fully-blocked user
+        # the whole catalogue), and a fix nothing runs is a fix nobody keeps.
+        #
+        # Gating rather than advisory, matching the ai-ui step: the directory
+        # starts with no failing suites, so this cannot inherit existing debt.
+        run: |
+          if [ -f AgentStudio/frontend/package.json ]; then
+            cd AgentStudio/frontend && npm install --no-audit --no-fund --silent && npm test
+          fi
+
   # ── TIER 2 ────────────────────────────────────────────────────────────────
   tests:
     name: Tier 2 · tests

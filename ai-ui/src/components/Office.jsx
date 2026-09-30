@@ -35,19 +35,15 @@ import rehypeKatex from "rehype-katex";
 import { API_BASE as API, authFetch } from "../config";
 import { usePromptQueue } from "../hooks/usePromptQueue.js";
 import { validateFreeText } from "../utils/securityValidation";
+import { buildModelOptions, optionLabel } from "../utils/modelPicker";
 
 // Channel tag for every Buddy → backend call.
 const OFFICE_CLIENT_HEADER = { "X-AiNxt-Client": "office" };
 
-// Fallback shown only until GET /all-models resolves (or on fetch failure) —
-// the live list (admin-configured providers/models) always replaces this.
-// See OfficeServer's model-options effect below.
-const MODELS = [
-  { key: "auto",   label: "Auto" },
-  { key: "claude", label: "Claude Sonnet 4.6" },
-  { key: "gpt",    label: "GPT-5.4" },
-  { key: "gemini", label: "Gemini 2.5 Flash" },
-];
+// Phase 7: the fallback list that used to sit here named four models by
+// display label, none of which this deployment necessarily routes to. It is
+// Auto-only now (utils/modelPicker.js AUTO_ONLY) — the one entry whose label
+// cannot go stale.
 
 const SUGGESTIONS = [
   { icon: FileText,        text: "Summarize the attached PDFs and give me a Word document" },
@@ -202,7 +198,15 @@ function OfficeServer() {
   const [messages, setMessages] = useState([]); // {id, role, content, events?, streaming?}
   const [input, setInput] = useState("");
   const [model, setModel] = useState("auto");
-  const [modelOptions, setModelOptions] = useState(MODELS);
+  // allModelProviders / allowedModels / governanceLoaded mirror Chat.jsx.
+  // This screen previously fetched /all-models ONLY and applied no governance
+  // filter at all, so it offered every configured model regardless of the
+  // user's department rules. Those picks were already refused server-side
+  // (gateway.py's explicit-pick check, since this posts to /ask), so the
+  // symptom was a model you could select and then be told you may not use.
+  const [allModelProviders, setAllModelProviders] = useState([]);
+  const [allowedModels, setAllowedModels] = useState([]);
+  const [governanceLoaded, setGovernanceLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [attachments, setAttachments] = useState([]); // {id, name}
   const [uploading, setUploading] = useState(false);
@@ -233,17 +237,28 @@ function OfficeServer() {
     authFetch(`${API}/all-models`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
-        if (!d?.providers?.length) return;
-        const flat = [];
-        for (const grp of d.providers) {
-          for (const m of grp.models || []) {
-            flat.push({ key: m.hint || m.id, label: m.label || m.id });
-          }
+        if (d?.providers?.length) setAllModelProviders(d.providers);
+      })
+      .catch(() => {});
+
+    // governance_loaded=true even when models=[] (everything blocked), so the
+    // filter applies rather than failing open. A network error leaves the flag
+    // false, which fails open deliberately.
+    authFetch(`${API}/model-governance/my-models`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.governance_loaded) {
+          setAllowedModels(d.models || []);
+          setGovernanceLoaded(true);
         }
-        if (flat.length) setModelOptions(flat);
       })
       .catch(() => {});
   }, []);
+
+  // This screen's <select> renders `{key, label}`, so the shared canonical
+  // shape is adapted here rather than changing the markup.
+  const modelOptions = buildModelOptions(allModelProviders, allowedModels, governanceLoaded)
+    .map((o) => ({ key: o.value, label: optionLabel(o), disabled: o.disabled }));
 
   useEffect(() => { refreshModelOptions(); }, [refreshModelOptions]);
 
@@ -716,7 +731,7 @@ function OfficeServer() {
             <div className="flex-1" />
             <select value={model} onChange={(e) => setModel(e.target.value)} onFocus={refreshModelOptions}
               className="text-xs border border-gray-200 rounded-lg px-2 py-1.5 outline-none bg-white text-gray-500 cursor-pointer hover:border-gray-300" title="Select model">
-              {modelOptions.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+              {modelOptions.map((m) => <option key={m.key} value={m.key} disabled={m.disabled}>{m.label}</option>)}
             </select>
             <button
               onClick={busy ? stop : () => send()}

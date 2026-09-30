@@ -67,6 +67,7 @@ import { isKbChat } from '../utils/kbChat.js';
 import { stripMemoryTag, parseMemoryTag, stripSystemPrefix, detectTone, stripAttachmentContext } from '../utils/messageContent.js';
 import { generateImage, IMAGE_ARTIFACT_TITLE } from '../utils/imageGenerate';
 import { validateIdentifier, validateFreeText } from '../utils/securityValidation';
+import { buildModelOptions, optionLabel } from '../utils/modelPicker';
 
 // ── extractDurationFromPrompt: parse a desired video duration from natural
 // language. Returns a clamped integer in [min, max], or `fallback` if no
@@ -340,45 +341,11 @@ function getFirstName(user) {
   return "there";
 }
 
-const BASE_MODEL_OPTIONS = [
-  { value: "auto",   label: "Auto" },
-  { value: "claude", label: "Claude Sonnet 4.6" },
-  { value: "gpt",    label: "GPT-5.4" },
-];
-
-// Phase 5.3: context-window badge for the model picker. Native <select> options
-// can only hold plain text, so we append a compact "· 200K" tag to the label
-// (matching the backend _MODEL_CONTEXT_WINDOW map in gateway.py). Keyed by
-// case-insensitive substring; first match wins; no badge for Auto/dividers.
-const MODEL_CONTEXT_BADGE = [
-  ["gemini", "1M"],
-  ["gpt-5",  "256K"],
-  ["gpt",    "128K"],
-  ["claude", "200K"],
-  ["sonnet", "200K"],
-  ["opus",   "200K"],
-  ["haiku",  "200K"],
-  ["kimi",   "128K"],
-  ["local",  "128K"],
-];
-function _modelContextBadge(value = "", label = "") {
-  const hay = `${value} ${label}`.toLowerCase();
-  for (const [key, tag] of MODEL_CONTEXT_BADGE) {
-    if (hay.includes(key)) return tag;
-  }
-  return null;
-}
-
-// Price-tier tag shown after the context badge, e.g.
-// "Claude Sonnet 4.6 · 200K · Paid". The tier is authoritative from the
-// backend (/all-models returns tier: "paid" | "free" per model) — the UI does
-// NOT hardcode any provider→tier mapping. This helper only maps the backend
-// value to a display word.
-function _modelTierTag(tier) {
-  if (tier === "paid") return "Paid";
-  if (tier === "free") return "Free";
-  return null;  // Auto / unknown → no tag
-}
+// Phase 7: the option list, the governance filter and the "· 200K · Paid"
+// suffix all moved to utils/modelPicker.js. This file held the reference
+// implementation of the governance rule — four other pickers had drifted from
+// it — and a hand-copied context-window table that had itself drifted from
+// config/model_context_windows.json. Both are derived now.
 
 // Status banner shown while a doc job is queued (keyed by format).
 const DOC_STATUS_MAP = {
@@ -782,29 +749,12 @@ export default function Chat({
   const [governanceLoaded, setGovernanceLoaded] = useState(false); // true once /my-models responds
 
   // Flattened MODEL_OPTIONS filtered to only models the user is permitted to use
-  const MODEL_OPTIONS = (() => {
-    const raw = allModelProviders.length > 0
-      ? allModelProviders.flatMap((group, gi) => [
-          ...(gi > 0 ? [{ value: `__div_${gi}__`, label: `── ${group.provider} ──`, disabled: true }] : []),
-          // modelId = full concrete model ID (e.g. "claude-sonnet-4-6") used for governance matching
-          // value   = short alias sent as the model hint in POST /ask (e.g. "claude")
-          ...group.models.map(m => ({ value: m.id, modelId: m.modelId || m.id, label: m.label, tier: m.tier, modality: m.modality })),
-        ])
-      : BASE_MODEL_OPTIONS;
-
-    // Only show all models if governance hasn't loaded yet (network pending / error).
-    // Once loaded, an empty allowedModels means ALL models are blocked — show only Auto.
-    if (!governanceLoaded) return raw;
-
-    // Keep "auto" always, dividers always; filter real model entries by allowedModels.
-    // Match against modelId (full concrete ID like "claude-sonnet-4-6") because
-    // /model-governance/my-models returns full IDs, not short aliases like "claude".
-    return raw.filter(o =>
-      o.value === 'auto' ||
-      o.disabled ||            // section dividers
-      allowedModels.includes(o.modelId || o.value)
-    );
-  })();
+  // Catalogue → governance-filtered options. The three rules this used to
+  // spell out inline (fail open until governance loads, always keep Auto and
+  // dividers, match on the full modelId because /my-models never returns short
+  // aliases) now live in utils/modelPicker.js, shared with the other four
+  // pickers that each had their own version of them.
+  const MODEL_OPTIONS = buildModelOptions(allModelProviders, allowedModels, governanceLoaded);
 
   // ── Image attachment state ─────────────────────────────────
   const [imageFiles, setImageFiles] = useState([]);  // Array of { file, previewUrl }
@@ -5292,21 +5242,15 @@ export default function Chat({
                 }`}
                 title={imageGenerating ? "Model selection disabled during image generation" : "Select model"}
               >
-                {MODEL_OPTIONS.map(o => {
-                  // Phase 5.3: append a context-window badge to real model
-                  // entries (skip Auto + section dividers).
-                  const skip = o.disabled || o.value === "auto";
-                  const badge = skip ? null : _modelContextBadge(o.value, o.label);
-                  // Price tier (Paid / Free) comes from the backend /all-models
-                  // response — NOT hardcoded in the UI. Appended after the badge.
-                  const tier = skip ? null : _modelTierTag(o.tier);
-                  const suffix = [badge, tier].filter(Boolean).join(" · ");
-                  return (
-                    <option key={o.value} value={o.value} disabled={o.disabled}>
-                      {suffix ? `${o.label} · ${suffix}` : o.label}
-                    </option>
-                  );
-                })}
+                {MODEL_OPTIONS.map(o => (
+                  // "· 200K · Paid". The window comes from the model's
+                  // capabilities.context_window via /all-models, the price
+                  // tier from its `tier` field — neither is inferred from the
+                  // model name any more.
+                  <option key={o.value} value={o.value} disabled={o.disabled}>
+                    {optionLabel(o)}
+                  </option>
+                ))}
               </select>
 
               {/* Send / Stop

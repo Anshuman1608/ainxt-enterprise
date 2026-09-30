@@ -497,6 +497,97 @@ def check_model_literals(cfg) -> list[str]:
     ]
 
 
+# ── Phase 7: the same ratchet, for the frontend ───────────────────────────
+#
+# check_model_literals above sweeps `tracked("*.py")` only, so every vendor SKU
+# written into a .jsx picker was invisible to CI. Phase 7's exit criterion is
+# "no vendor SKU literal remains in any frontend selectable list", and nothing
+# was enforcing it.
+#
+# Two differences from the Python sweep, both measured rather than assumed:
+#
+#   * The quote class has to be `['"]`. JS uses single quotes, and the
+#     double-quote-only pattern above matched 17 of the 44 literals that
+#     existed when this was written — so reusing it verbatim would have
+#     declared most of the problem absent.
+#   * The count INCLUDES comments. Several of these files now explain, by name,
+#     the drifted ids they used to carry, and stripping comments to exclude
+#     that would also stop the check seeing a model id parked in a commented-out
+#     line. A ratchet that counts a few explanatory mentions is honest; one that
+#     can be evaded by commenting code out is not.
+_FRONTEND_LITERAL_ALLOWED = {
+    # Nothing yet. AgentStudio/frontend/src/utils/modelMaxTokens.js holds 16 of
+    # the remaining 37 and is the §F row plan.html:1302 assigns to Phase 7's
+    # max-tokens item, deliberately deferred (D58) — it is counted, not
+    # exempted, so migrating it shows up as the number falling.
+}
+
+# Measured after Phase 7's picker cleanup: 44 before, 37 after. Comments
+# included, per the note above. Lower it as files are migrated; it may never
+# rise.
+_FRONTEND_LITERAL_BASELINE = 37
+
+_FRONTEND_LITERAL_RE = re.compile(
+    r"""['"](claude-[a-z0-9.\-]+"""
+    r"""|gpt-[0-9][a-z0-9.\-]*"""
+    r"""|gemini-[0-9][a-z0-9.\-]*"""
+    r"""|o[0-9]-[a-z\-]+"""
+    r"""|dall-e-[0-9]"""
+    r"""|veo-[a-z0-9.\-]+)['"]""",
+    re.I,
+)
+
+
+def check_frontend_model_literals(cfg) -> list[str]:
+    """No NEW hardcoded vendor model ID in any frontend module.
+
+    The web pickers used to ship arrays like
+    `{ value: "claude", label: "Claude Sonnet 4.6" }` as the list shown until
+    GET /all-models resolved. Those went stale the moment an admin changed the
+    registry, and every deployment saw another organisation's model names on
+    first paint.
+
+    A ratchet, matching check_model_literals' convention: the count may fall,
+    never rise. Not a zero rule, because some of these are legitimate —
+    ModelGovernance.jsx is an admin screen whose job is naming models, and
+    config/models.js keeps one literal on purpose as a historical marker for
+    migrating old workflow rows.
+
+    Honest limit: this cannot see the actual Phase 7 defect. The stale entries
+    were display LABELS ("Claude Sonnet 4.6"), not model ids, and no id regex
+    will ever match one. Those are guarded by
+    ai-ui/src/utils/modelPicker.source.test.js, which CI runs as a hard gate.
+    """
+    per_file: dict[str, int] = {}
+    for f in tracked("*.js", "*.jsx", "*.ts", "*.tsx"):
+        if f in _FRONTEND_LITERAL_ALLOWED:
+            continue
+        if f.startswith("tests/") or "/tests/" in f or ".test." in f or ".spec." in f:
+            continue
+        if "node_modules/" in f:
+            continue
+        try:
+            src = (ROOT / f).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        n = len(_FRONTEND_LITERAL_RE.findall(src))
+        if n:
+            per_file[f] = n
+
+    total = sum(per_file.values())
+    if total <= _FRONTEND_LITERAL_BASELINE:
+        return []
+
+    worst = sorted(per_file.items(), key=lambda kv: -kv[1])[:5]
+    detail = ", ".join(f"{f} ({n})" for f, n in worst)
+    return [
+        f"hardcoded vendor model IDs in frontend modules rose to {total}, above "
+        f"the recorded baseline of {_FRONTEND_LITERAL_BASELINE}. Read the model "
+        f"from GET /all-models (see ai-ui/src/utils/modelPicker.js) rather than "
+        f"writing the ID into the component. Highest counts: {detail}"
+    ]
+
+
 # ── Phase 6: the tier migration's exit criterion, enforced per module ─────
 #
 # plan.html's Phase 6 exit criterion is that `grep -rn 'model_hint="'` returns
@@ -733,6 +824,7 @@ CHECKS = {
     "python-syntax":        check_python_syntax,
     "model-hint-coverage":  check_model_hint_coverage,
     "model-literals":       check_model_literals,
+    "fe-model-literals":    check_frontend_model_literals,
     "docs-panel-coverage":  check_docs_panel_coverage,
     "readme-feature-table": check_readme_feature_table,
     "tier-migration":       check_tier_migration,

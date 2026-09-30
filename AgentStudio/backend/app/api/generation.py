@@ -72,7 +72,20 @@ def _cli_reference_models() -> list[dict]:
 
 def _cli_reference_models_env_fallback() -> list[dict]:
     """Legacy catalogue built from core.model_registry env vars — used only
-    when core.llm_provider_registry can't be imported/read at all."""
+    when core.llm_provider_registry can't be imported/read at all.
+
+    Phase 7 note. The ENABLE_* gates below stay for now, for the reason given
+    at length on the twin of this function
+    (``routers/messages_compat_router.py::_list_models_compat_env_fallback``):
+    this path runs when the registry is unreadable, and on that path nothing
+    else can honour an operator's decision to disable a SKU. They retire in
+    Phase 8 along with the variables themselves (D63).
+
+    The duplication is deliberate — see the twin's docstring. This copy must
+    keep working when ``core`` is not importable, which is exactly what moving
+    the shared body into ``core/`` would break. Kept in step by
+    ``tests/routers/test_env_fallback_twins.py``.
+    """
     try:
         from core.model_registry import (
             CLAUDE_PRIMARY_MODEL, CLAUDE_SONNET_5_MODEL,

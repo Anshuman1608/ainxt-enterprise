@@ -39,7 +39,7 @@ import AiNxtSpinner from "./AiNxtSpinner.jsx";
 import DiffLines from "./code/DiffLines.jsx";
 import FileExplorer from "./code/FileExplorer.jsx";
 import FileEditorPanel from "./code/FileEditorPanel.jsx";
-import { API_BASE, authFetch, MODEL_DEFAULT, MODEL_ALIASES, MODEL_PICKER } from "../config";
+import { API_BASE, authFetch, MODEL_DEFAULT, MODEL_ALIASES } from "../config";
 
 // Code task sessions are SERVER-persisted (Postgres /code/conversations) — NO
 // localStorage (it's lost on app restart). Scoped to the JWT user + project
@@ -97,31 +97,12 @@ import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import { mdComponents } from "./Message.jsx";
+import { buildModelOptions, optionLabel } from "../utils/modelPicker";
 
-// Context-window badge for the model picker (same as Chat.jsx).
-const MODEL_CONTEXT_BADGE = [
-  ["gemini", "1M"],
-  ["gpt-5",  "256K"],
-  ["gpt",    "128K"],
-  ["claude", "200K"],
-  ["sonnet", "200K"],
-  ["opus",   "200K"],
-  ["haiku",  "200K"],
-  ["kimi",   "128K"],
-  ["local",  "128K"],
-];
-function _modelContextBadge(value = "", label = "") {
-  const hay = `${value} ${label}`.toLowerCase();
-  for (const [key, tag] of MODEL_CONTEXT_BADGE) {
-    if (hay.includes(key)) return tag;
-  }
-  return null;
-}
-function _modelTierTag(tier) {
-  if (tier === "paid") return "Paid";
-  if (tier === "free") return "Free";
-  return null;
-}
+// Phase 7: the badge table that used to sit here was a verbatim copy of
+// Chat.jsx's, itself a hand-copy of config/model_context_windows.json that had
+// drifted from it. Both now read capabilities.context_window off the model row
+// via utils/modelPicker.js.
 // Module-level label resolver (fallback only — reducer uses this outside the component).
 // The component's MODEL_OPTIONS has richer labels; this is just a fallback for the reducer.
 const MODEL_LABEL = (id) => (id || "").replace(/^claude-/, "") || "model";
@@ -571,19 +552,16 @@ export default function Code() {
   const [allModelProviders, setAllModelProviders] = useState([]);
   const [allowedModels, setAllowedModels] = useState([]);
   const [governanceLoaded, setGovernanceLoaded] = useState(false);
-  const MODEL_OPTIONS = (() => {
-    const raw = allModelProviders.length > 0
-      ? allModelProviders.flatMap((group, gi) => [
-          ...(gi > 0 ? [{ value: `__div_${gi}__`, label: `── ${group.provider} ──`, disabled: true }] : []),
-          ...group.models.map(m => ({ value: m.id, modelId: m.modelId || m.id, label: m.label, tier: m.tier })),
-        ])
-      : MODEL_PICKER.map(m => ({ value: m.key, modelId: m.key, label: m.label }));
-    if (!governanceLoaded) return raw;
-    return raw.filter(o =>
-      o.disabled ||
-      allowedModels.includes(o.modelId || o.value)
-    );
-  })();
+  // Catalogue → governance-filtered options.
+  //
+  // The filter here was missing the `o.value === "auto"` keep that Chat.jsx and
+  // KbChat.jsx both have. _all_model_ids() (routers/model_governance_router.py)
+  // is built from registry rows only, so "auto" is never in the allowlist —
+  // which meant "Auto (Routing)" was offered until /my-models responded and
+  // then silently disappeared from this picker. Its fallback was MODEL_PICKER,
+  // empty unless VITE_MODEL_PICKER is set at build time, so before the
+  // catalogue arrived the <select> rendered with no options at all.
+  const MODEL_OPTIONS = buildModelOptions(allModelProviders, allowedModels, governanceLoaded);
   const [auth, setAuth] = useState({ authenticated: false, error: "loading" });
   const [loginLog, setLoginLog] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
@@ -1822,17 +1800,11 @@ export default function Code() {
               <Cpu className="w-3 h-3" />
               <select value={model} onChange={(e) => onModelChange(e.target.value)} onFocus={refreshModelLists}
                 className="bg-transparent outline-none cursor-pointer text-gray-500 hover:text-gray-700 max-w-[220px]">
-                {MODEL_OPTIONS.map((o) => {
-                  const skip = o.disabled;
-                  const badge = skip ? null : _modelContextBadge(o.value, o.label);
-                  const tier = skip ? null : _modelTierTag(o.tier);
-                  const suffix = [badge, tier].filter(Boolean).join(" · ");
-                  return (
-                    <option key={o.value} value={o.value} disabled={o.disabled}>
-                      {suffix ? `${o.label} · ${suffix}` : o.label}
-                    </option>
-                  );
-                })}
+                {MODEL_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value} disabled={o.disabled}>
+                    {optionLabel(o)}
+                  </option>
+                ))}
               </select>
             </label>
             <span className="text-gray-200">|</span>

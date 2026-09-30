@@ -404,6 +404,64 @@ async def kb_ask_ai(
     if _local_model and _model_hint is None:
         _model_hint = "local"
 
+    # ── MODEL GOVERNANCE ENFORCEMENT (explicit picks) ──────────────────────
+    # Phase 7. §N.1 step 9 gave this endpoint the Auto-path `acl_filter`
+    # further down, but NOT this block, so an EXPLICIT pick was never checked
+    # here at all — `/ask` has refused one since before the tier work
+    # (gateway.py's matching block), and this router forked `/ask` without it.
+    #
+    # It mattered because the web KB picker did not filter either: KbChat.jsx
+    # treated an empty allowlist as "not loaded yet" and showed every model to
+    # a fully-blocked user, who could then pick one and be served. Both halves
+    # are fixed together — a filtered picker alone would still leave a direct
+    # POST /kb/ask able to name a blocked model.
+    #
+    # Only fires on an explicit hint: an Auto turn is governed by the candidate
+    # filter below, which is the §G rule ("a user's pick is never
+    # second-guessed" — but it IS access-checked). Fails open on any DB or
+    # import error so a governance misconfiguration cannot take KB chat down.
+    if _model_hint:
+        try:
+            from routers.model_governance_router import filter_allowed_models as _gov_filter
+            from models.model_router import resolve_pick_to_model_id as _gov_resolve_pick
+
+            # resolve_pick_to_model_id, not hint_to_model_id: the latter answers
+            # an .env constant and is falsy for five of the eight tier heads on
+            # this deployment, which is how the same check on /ask was silently
+            # skipped before step 9 (D37).
+            _gov_model = _gov_resolve_pick(_model_hint)
+            if not _gov_model and q.local_model:
+                _gov_model = f"local:{q.local_model}"
+
+            if _gov_model:
+                from db.database import SessionLocal as _GovDB
+                _gov_db = _GovDB()
+                try:
+                    _gov_allowed = _gov_filter([_gov_model], _user_id, _user_dept, _gov_db)
+                finally:
+                    _gov_db.close()
+
+                if not _gov_allowed:
+                    logger.warning(
+                        f"[kb_ask/governance] BLOCKED | user={_user_id} "
+                        f"dept={_user_dept!r} model={_gov_model!r} hint={_model_hint!r}"
+                    )
+                    from fastapi.responses import JSONResponse as _GovJSON
+                    return _GovJSON(
+                        status_code=403,
+                        content={
+                            "error": "model_not_allowed",
+                            "detail": (
+                                "Your department does not have access to the "
+                                "requested model. Please contact your administrator."
+                            ),
+                            "code": "MODEL_GOVERNANCE_BLOCKED",
+                        },
+                    )
+        except Exception as _gov_err:      # noqa: BLE001 — never block a request
+            logger.warning(f"[kb_ask/governance] check error (fail-open): {_gov_err}")
+    # ── END MODEL GOVERNANCE ENFORCEMENT ───────────────────────────────────
+
     # ── Agent context ──────────────────────────────────────────────────────
     _agent_system_prompt = None
     _agent_kb_namespace  = None

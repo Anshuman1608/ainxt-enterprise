@@ -346,14 +346,28 @@ def get_cli_style_models(channel: Optional[str] = None) -> list[dict]:
         billing_tier = caps.get("billing_tier", default_tier)
         raw_id = m["model_id"]
         mid = f"local:{raw_id}" if bucket == "inhouse" and not raw_id.startswith("local:") else raw_id
-        out.append({
+        entry = {
             "id": mid,
             "hint": mid,
             "provider": bucket,
             "label": f"{m['display_name']} ({raw_id})",
             "tag": f"{m['provider_name']} · {billing_tier}",
             "billing_tier": billing_tier,
-        })
+        }
+        # Phase 7: carried so a consumer can show a context-window badge from
+        # the registry rather than a hand-maintained per-family table.
+        #
+        # Only the ADMIN-declared capability is emitted here, with no
+        # config-file fallback, and that is deliberate: this module is in
+        # `core` and the family resolver lives in `gateway`, so reading it
+        # would invert the layering. The one caller that renders this number —
+        # the CLI /v1/models payload — already applies the fallback itself in
+        # `messages_compat_router::_with_context_window`, which imports the
+        # gateway resolver defensively. So the field is an override channel
+        # here, not the whole answer.
+        if caps.get("context_window"):
+            entry["context_window"] = caps["context_window"]
+        out.append(entry)
     return out
 
 

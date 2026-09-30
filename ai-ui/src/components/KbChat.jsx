@@ -56,6 +56,7 @@ import { stripMemoryTag, stripSystemPrefix, detectTone } from '../utils/messageC
 import { formatKbScopePath } from '../utils/kbFormat.js';
 import { validateFreeText } from '../utils/securityValidation';
 import DocPickerCard from './DocPickerCard.jsx';
+import { buildModelOptions, optionLabel } from '../utils/modelPicker';
 
 // ── extractDurationFromPrompt: parse a desired video duration from natural
 // language. Returns a clamped integer in [min, max], or `fallback` if no
@@ -155,11 +156,10 @@ function getFirstName(user) {
   return "there";
 }
 
-const BASE_MODEL_OPTIONS = [
-  { value: "auto",   label: "Auto" },
-  { value: "claude", label: "Claude Sonnet 4.6" },
-  { value: "gpt",    label: "GPT-5.4" },
-];
+// Phase 7: the option list and the governance filter moved to
+// utils/modelPicker.js. The hardcoded fallback above it named two models this
+// deployment may not even route to, and the filter below it was the one copy
+// of the governance rule that failed OPEN when every model was blocked.
 
 // Document formats that the skill-based generator (POST /docs/generate) supports.
 const DOC_FORMATS = ["pdf", "docx", "xlsx", "pptx", "md", "txt"];
@@ -460,25 +460,18 @@ export default function KbChat({
   const [localModels, setLocalModels] = useState([]);         // kept for backward compat
   const [allModelProviders, setAllModelProviders] = useState([]); // from /all-models
   const [allowedModels, setAllowedModels] = useState([]);     // from /model-governance/my-models
+  const [governanceLoaded, setGovernanceLoaded] = useState(false); // true once /my-models responds
 
-  // Flattened MODEL_OPTIONS filtered to only models the user is permitted to use
-  const MODEL_OPTIONS = (() => {
-    const raw = allModelProviders.length > 0
-      ? allModelProviders.flatMap((group, gi) => [
-          ...(gi > 0 ? [{ value: `__div_${gi}__`, label: `── ${group.provider} ──`, disabled: true }] : []),
-          ...group.models.map(m => ({ value: m.id, modelId: m.modelId, label: m.label, modality: m.modality })),
-        ])
-      : BASE_MODEL_OPTIONS;
-
-    if (allowedModels.length === 0) return raw;  // no restriction loaded yet — show all
-
-    // Keep "auto" always, dividers always; filter real model entries by allowedModels
-    return raw.filter(o =>
-      o.value === 'auto' ||
-      o.disabled ||            // section dividers
-      allowedModels.includes(o.modelId || o.value)
-    );
-  })();
+  // Catalogue → governance-filtered options.
+  //
+  // This block used to gate on `allowedModels.length === 0`, which cannot tell
+  // "the allowlist has not arrived" from "the allowlist is empty because every
+  // model is blocked" — and it took the second case to mean the first, so a
+  // fully-blocked user was shown the entire catalogue. Chat.jsx had already
+  // been fixed with a `governanceLoaded` flag; this copy never was. Worse than
+  // cosmetic here: routers/kb_ask_router.py had no explicit-pick governance
+  // check either, so the model the user then picked was actually served.
+  const MODEL_OPTIONS = buildModelOptions(allModelProviders, allowedModels, governanceLoaded);
 
   // ── Image attachment state ─────────────────────────────────
   const [imageFiles, setImageFiles] = useState([]);  // Array of { file, previewUrl }
@@ -839,11 +832,20 @@ export default function KbChat({
       })
       .catch(() => {});
 
-    // Fetch user-specific allowed models from governance rules
+    // Fetch user-specific allowed models from governance rules.
+    // governance_loaded=true means the backend evaluated the rules, even when
+    // models=[] (everything blocked). Gating on `d?.models?.length` instead —
+    // as this did — meant the all-blocked response never reached the filter at
+    // all, so the picker showed every model.
     authFetch(`${API}/model-governance/my-models`)
       .then(r => r.ok ? r.json() : null)
-      .then(d => { if (d?.models?.length) setAllowedModels(d.models); })
-      .catch(() => {});
+      .then(d => {
+        if (d?.governance_loaded) {
+          setAllowedModels(d.models || []);  // [] = all blocked, still apply filter
+          setGovernanceLoaded(true);
+        }
+      })
+      .catch(() => {});  // network error → governanceLoaded stays false → fail-open
   }, []);
 
   useEffect(() => { refreshModelLists(); }, [refreshModelLists]);
@@ -3822,7 +3824,7 @@ export default function KbChat({
                 title={imageGenerating ? "Model selection disabled during image generation" : "Select model"}
               >
                 {MODEL_OPTIONS.map(o => (
-                  <option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>
+                  <option key={o.value} value={o.value} disabled={o.disabled}>{optionLabel(o)}</option>
                 ))}
               </select>
 

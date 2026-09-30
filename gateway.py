@@ -13264,6 +13264,28 @@ def get_all_models(request: Request):
             }
             if caps.get("modality"):
                 entry["modality"] = caps["modality"]
+            # Phase 7: the picker's context-window badge reads this. It used to
+            # carry a 9-row substring table copied by hand out of
+            # config/model_context_windows.json, and the copy had drifted —
+            # "kimi" was tagged 128K against the config's 262144, and glm /
+            # qwen / deepseek / llama / gemma / mistral had no entry at all, so
+            # a model an admin configured got no badge.
+            #
+            # Precedence: the ADMIN's declared capability wins; otherwise fall
+            # back to the same config-file family resolver this module already
+            # routes on. Both are needed, and measuring said so — on this
+            # deployment `capabilities.context_window` is set on 0 of 12
+            # enabled models, because the Phase 2 seed path skips rows that
+            # already exist and its backfill covered privacy_class/modality
+            # rather than this key. Capability-only would therefore have
+            # removed the badge from every model instead of correcting it.
+            #
+            # This is the precedence messages_compat_router::_with_context_window
+            # already uses for the CLI /v1/models payload, so the two
+            # catalogues cannot disagree about the same model.
+            _cw = caps.get("context_window") or _context_window_for(m["model_id"])
+            if _cw:
+                entry["context_window"] = _cw
             by_provider.setdefault(m["provider_name"], []).append(entry)
         for name, models in by_provider.items():
             providers.append({"provider": name, "models": models})

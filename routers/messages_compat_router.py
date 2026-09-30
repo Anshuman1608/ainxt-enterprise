@@ -3522,7 +3522,31 @@ async def list_models_compat(request: Request):
 def _list_models_compat_env_fallback() -> list:
     """Legacy catalogue built from core.model_registry env vars — used only
     when core.llm_provider_registry can't be read at all. See
-    list_models_compat's docstring for why the registry is now primary."""
+    list_models_compat's docstring for why the registry is now primary.
+
+    Phase 7 note — why the ENABLE_* gates below are still here.
+
+    plan.html's Phase 7 says to "delete the per-SKU feature-flag gating inside
+    the CLI env fallback while keeping the fallback itself for the DB-down
+    case". Deleting them here would be wrong, and the reason is the condition
+    this function exists for: it runs ONLY when the registry is unreadable.
+    On that path nothing else honours an operator's decision to disable a SKU
+    — `capabilities.channels` lives in the registry that is down, and
+    `filter_allowed_models` is equally DB-backed, so it cannot re-block the
+    model either. Dropping the gates would make a deliberately disabled model
+    both offered here and servable, precisely while governance is blind.
+
+    So the gates retire in Phase 8, together with the variables they read
+    (§I) — one atomic change rather than a window where a disabled SKU is
+    reachable. Recorded as D63.
+
+    This function is a near-twin of
+    ``AgentStudio/backend/app/api/generation.py::_cli_reference_models_env_fallback``
+    and the two are deliberately NOT unified: that copy exists for the case
+    where ``core`` is not importable at all, so moving the shared body into
+    ``core/`` would make it unreachable in the only situation it serves.
+    ``tests/routers/test_env_fallback_twins.py`` keeps them in step.
+    """
     try:
         from core.model_registry import (
             CLAUDE_PRIMARY_MODEL, CLAUDE_OPUS_MODEL,

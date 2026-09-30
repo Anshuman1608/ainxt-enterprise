@@ -77,15 +77,22 @@ function _flattenProviderIds(providers) {
     return out;
 }
 
-// Apply the governance allowlist to the grouped catalogue using the EXACT
-// same rule as the Chat sidebar:
-//   - empty allowlist  → no restriction (return providers unchanged)
-//   - ``auto`` is always kept (Chat treats it as a routing pseudo-model)
-//   - real models filtered by ``id ∈ allowed``
+// Apply the governance allowlist to the grouped catalogue, using the same rule
+// as ai-ui/src/utils/modelPicker.js::applyGovernance:
+//   - allowlist not yet loaded → no restriction (fail open)
+//   - loaded and EMPTY → every model is blocked; keep only ``auto``
+//   - ``auto`` is always kept (a routing pseudo-model, never a registry row,
+//     so it is never in the allowlist)
 // Empty groups are dropped so the dropdown doesn't render bare headings.
-function _applyAllowlist(providers, allowed) {
-    if (!Array.isArray(allowed) || allowed.length === 0) return providers;
-    const allowSet = new Set(allowed);
+//
+// The ``loaded`` flag is the correction. This used to treat an empty allowlist
+// as "no restriction", which conflated "the response has not arrived" with
+// "the response said everything is blocked" — so a fully-blocked user was
+// shown the whole catalogue. The comment claiming parity with Chat.jsx was
+// describing Chat.jsx's behaviour from before it grew ``governanceLoaded``.
+function _applyAllowlist(providers, allowed, loaded) {
+    if (!loaded) return providers;
+    const allowSet = new Set(Array.isArray(allowed) ? allowed : []);
     return (providers || [])
         .map(g => ({
             ...g,
@@ -104,6 +111,10 @@ export default function useAvailableModels() {
     // Optional frontend allowlist. The backend already applies governance on
     // /llm/models; apply this only when using platform /all-models fallback.
     const [allowedModels, setAllowedModels] = useState([]);
+    // True once /my-models has answered — distinct from `allowedLoaded`, which
+    // only records that the fetch settled (it settles on failure too, and a
+    // failure must fail open).
+    const [governanceLoaded, setGovernanceLoaded] = useState(false);
     const [usingPlatformFallback, setUsingPlatformFallback] = useState(false);
 
     // Track which fetches have settled so we can move from LOADING to
@@ -116,9 +127,9 @@ export default function useAvailableModels() {
     // Pure function of the two pieces of state above — no extra state.
     const providers = useMemo(
         () => usingPlatformFallback
-            ? _applyAllowlist(allModelProviders, allowedModels)
+            ? _applyAllowlist(allModelProviders, allowedModels, governanceLoaded)
             : allModelProviders,
-        [allModelProviders, allowedModels, usingPlatformFallback],
+        [allModelProviders, allowedModels, governanceLoaded, usingPlatformFallback],
     );
 
     // Derived: flat list of model IDs from the filtered catalogue.
@@ -189,11 +200,13 @@ export default function useAvailableModels() {
             .then(r => (r.ok ? r.json() : null))
             .then(d => {
                 if (cancelled) return;
-                if (d && Array.isArray(d.models)) {
-                    setAllowedModels(d.models);
+                // governance_loaded=true even when models=[] (everything
+                // blocked), which is the case the flag exists to separate from
+                // "no response yet".
+                if (d && d.governance_loaded) {
+                    setAllowedModels(Array.isArray(d.models) ? d.models : []);
+                    setGovernanceLoaded(true);
                 }
-                // Note: an empty/missing allowlist is fine — _applyAllowlist
-                // treats it as "no restriction", same as Chat.jsx semantics.
             })
             .catch(() => {
                 // Non-fatal: no allowlist means show everything (Chat does same).

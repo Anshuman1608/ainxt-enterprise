@@ -142,6 +142,7 @@ import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import { mdComponents, DocDownloadButton, parseDocMarkers } from "./Message.jsx";
+import { formatBillingTier } from "../utils/modelPicker";
 
 // Real model ids the gateway routes for the headless office agent.
 // FALLBACK ONLY — used until GET /all-models resolves (offline/slow first paint),
@@ -855,6 +856,12 @@ export default function CoworkDesktop() {
   // Falls back to BASE_MODELS (Claude-only) until /all-models responds, so the
   // picker/​`/model` command never render empty and behave exactly as before
   // for any deployment that can't reach that endpoint.
+  // Phase 7 deliberately did NOT move this onto utils/modelPicker.js's
+  // buildModelOptions, unlike the other four pickers. Two things here are
+  // intentional and specific to Buddy: "Auto" is omitted (see below), and
+  // local: ids get _localLabel() rather than the catalogue label. The shared
+  // builder would re-add Auto on a route that cannot honour it. The governance
+  // rule below is already identical to modelPicker.applyGovernance's.
   const models = useMemo(() => {
     if (!allModelProviders.length) return BASE_MODELS;
     // Deliberately omit "Auto" — Buddy's /v1/messages route has no complexity-
@@ -3335,7 +3342,7 @@ export default function CoworkDesktop() {
                       return [...groups.entries()].map(([provider, list]) => {
                         const opts = list.map((m) => (
                           <option key={m.key} value={m.key}>
-                            {m.label}{m.tier ? ` · ${m.tier === "paid" ? "Paid" : "Free"}` : ""}
+                            {m.label}{formatBillingTier(m.tier) ? ` · ${formatBillingTier(m.tier)}` : ""}
                           </option>
                         ));
                         return provider
