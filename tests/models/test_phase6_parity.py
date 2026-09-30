@@ -178,6 +178,29 @@ MIGRATED: list[tuple[Tier, str, str]] = [
     (Tier.MEDIUM,  "medium",
      "both _llm() cross-provider second attempts (_core.py:400, "
      "sdlc_state_machine.py:100) and _generate_conflict_resolution"),
+
+    # ── Phase 6.6: the CLI direct path and the OpenAI-compatible endpoint ──
+    #
+    # (COMPLEX, "claude") already has a row from step 4. It is repeated rather
+    # than annotated onto that one because the two sites reach it from
+    # opposite directions and a reader tracing either should find their own
+    # line: broadcast_router passed the vendor alias as a HINT, while
+    # gateway.py's #33 browser-agent pin passed it as a deliberate override of
+    # the complexity classifier. Both mean "the capable tier", which is what
+    # _HINT_MAP["claude"] == "complex" has always said.
+    (Tier.COMPLEX, "claude",
+     "gateway.py _gateway_stream — the #33 browser-agent pin"),
+    # MINI's first and only application caller. Before Phase 6.6 the hint's
+    # own comment named gpt-5-mini as the destination — a model with no
+    # registry row on this deployment, which is the provider assumption the
+    # tier exists to replace.
+    (Tier.MINI, "mini",
+     "gateway.py _cli_direct_stream — the _TRIVIAL_QUERY_RE downgrade"),
+    # Named here for the same reason the SDLC rows above are: the file's
+    # invariant is that every migrated site's pair has a row that NAMES it.
+    (Tier.COMPLEX, "complex",
+     "gateway.py _cli_direct_stream — the CLI default when the user has not "
+     "picked a model with /model"),
 ]
 
 _IDS = [f"{t.value}<-{h}" for t, h, _ in MIGRATED]

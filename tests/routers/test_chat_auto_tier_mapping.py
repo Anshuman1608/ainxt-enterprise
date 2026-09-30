@@ -272,6 +272,14 @@ def test_the_user_facing_chat_dispatches_pass_an_acl_filter(trees, src):
     path and is covered by its own test file.
     """
     for name, hint in (("gateway.py", "_fp_route"),
+                       # Phase 6.6 added two more user-facing dispatches in
+                       # this same file — the CLI relay and the
+                       # OpenAI-compatible endpoint. Both had NO governance
+                       # check of any kind before it, for the same reason
+                       # /kb/ask had none: each was written by copying a path
+                       # that predated the ACL.
+                       ("gateway.py", "_cli_route"),
+                       ("gateway.py", "_oai_route"),
                        ("kb_ask_router.py", "_fp_route"),
                        ("chat_worker.py", "_answer_route")):
         calls = [c for c in _router_stream_calls(trees[name])
@@ -300,17 +308,33 @@ def test_the_platform_internal_calls_do_not_pass_one(src):
 # ── Scope (D34) ───────────────────────────────────────────────────────────
 
 
-def test_the_cli_and_ide_paths_are_untouched(src):
-    """D34 keeps these out. The IDE block is a SECOND dispatcher — it reads
-    RoutingDecision.tier and hand-calls _get_openai()/_get_claude()/
-    _get_local() on legacy TIER_* constants, bypassing the governed attempt
-    chain — so migrating it is deleting a dispatcher, not swapping a hint.
+def test_the_cli_and_ide_paths_are_migrated(src):
+    """INVERTED by Phase 6.6.
+
+    Step 9 excluded both by name (D34) and this test pinned them in place so
+    the exclusion was deliberate rather than forgotten. Phase 6.6 migrated
+    them, so the same test now guards the other direction — the move step 10
+    made on tests/models/test_registry_helper_consumers.py, and for the same
+    reason: a test that asserts "not yet" is worth exactly as much as the
+    plan to do it, and worth nothing once it is done.
+
+    The detail worth keeping from the old docstring: the IDE block was a
+    SECOND dispatcher. It read RoutingDecision.tier and hand-called
+    _get_openai()/_get_claude()/_get_local() on legacy TIER_* constants,
+    bypassing the governed attempt chain — which is why migrating it meant
+    deleting a dispatcher rather than swapping a hint. The detail the old
+    docstring did NOT know: under governance those branches never ran at
+    all, because a resolved tier returns TIER_GOVERNED.
     """
     s = src["gateway.py"]
-    assert "_hint_for_stream = _model_hint or \"complex\"" in s, \
-        "the CLI path changed; it is step 9's non-goal"
-    assert "decision = _mr.route(_prompt, model_hint=_route_hint)" in s, \
-        "the IDE dispatcher changed; it is step 9's non-goal"
+    assert "decision = _mr.route(_prompt, model_hint=_route_hint)" not in s, \
+        "the IDE dispatcher's discarded-pin route call is back"
+    assert "_cli_tier = _Tier.MINI" in s, "the CLI path lost its tier request"
+    assert "_oai_route = _tier_request(_Tier.COMPLEX, \"claude\")" in s, \
+        "the browser-agent pin is a vendor literal again"
+    # The full assertions live in the two Phase 6.6 files; these three are
+    # here so that a revert fails the STEP 9 file too, where the exclusion
+    # was originally written down.
 
 
 def test_ide_router_is_not_in_the_ratchet():

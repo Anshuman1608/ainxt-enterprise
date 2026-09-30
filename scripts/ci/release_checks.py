@@ -547,15 +547,20 @@ _PHASE6_MIGRATED_MODULES = (
     "models/hybrid_retriever.py",
     "sandbox/self_healing_engine.py",
     "workers/secure_code_gate_worker.py",
-    # §N.1 step 9 — the Chat Auto path. Every in-process chat entry point; the
-    # CLI and IDE dispatchers in gateway.py are deliberately still out of
-    # scope (D34) and routers/ide_router.py is therefore NOT listed, because
-    # its _hint_map is the inbound boundary shim §E keeps until Phase 9/10.
-    # gateway.py qualifies: after step 9 it carries no literal tier hint at
-    # all. The CLI and IDE sites that remain unmigrated pass VARIABLES
-    # (_hint_for_stream, _route_hint, _model_hint), which this check cannot
-    # see either way — so listing the file ratchets what step 9 fixed without
-    # claiming anything about what it did not.
+    # §N.1 step 9 — the Chat Auto path. Every in-process chat entry point.
+    # routers/ide_router.py is NOT listed: its _hint_map is the inbound
+    # boundary shim §E keeps until Phase 9/10.
+    #
+    # Phase 6.6 migrated the last two holdouts in this file — the CLI direct
+    # relay and the OpenAI-compatible endpoint's dispatchers. Listing
+    # gateway.py has never said much about them and still does not: they pass
+    # VARIABLES (_cli_route, _oai_route, _model_hint), and this check reads
+    # keyword literals. That gap is covered by AST assertions in
+    # tests/routers/test_gateway_cli_direct_tiers.py,
+    # test_oai_compat_dispatch_tiers.py and test_oai_tool_channel.py, not
+    # here — a blanket "no _get_claude() in a migrated module" rule would
+    # false-positive on the CLI image branch, which legitimately needs a
+    # gateway the router has no entry point for.
     "gateway.py",
     "routers/kb_ask_router.py",
     "routers/chat_router.py",

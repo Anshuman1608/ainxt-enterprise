@@ -1,0 +1,244 @@
+# SPDX-License-Identifier: MIT
+"""Phase 6.6 — the tool-call channel resolver (D52 / D53).
+
+A tool-call turn on ``/v1/chat/completions`` picked its provider AND its model
+from hint literals and ``.env`` constants:
+
+    _use_claude = _model_hint in ("claude", "solution", "haiku")   # the family
+    _claude_tools_model = … else CLAUDE_PRIMARY_MODEL              # the SKU
+    _tools_model        = … else OPENAI_CODING_MODEL               # the other SKU
+
+So an Auto agentic turn — the browser agent's normal case — always ran
+``OPENAI_CODING_MODEL`` through the proxy, whatever the administrator had
+assigned. ``_oai_tool_channel`` replaces the family and the Auto SKU; the
+explicit-pick rungs stay.
+
+Two properties are asserted, and the first one is the point of the file:
+
+  **D52 — the governed/pick split is DERIVED, never restated.** A hint is a
+  capability request iff ``_HINT_MAP[hint]`` is a key of
+  ``_LEGACY_TO_GOVERNED``. These tests read those two tables rather than
+  listing hints, so the day someone adds a tier alias the partition follows
+  automatically. A second hand-written list is how ``threads_router.py`` sat
+  on the migrated-module list for six steps still passing
+  ``synthesis_hint="solution"``.
+
+  **D53 — the channel must be able to address the model.**
+  ``stream_cloud_tools`` takes ``openai | claude | gemini``. A tier holding
+  an Ollama model has no tool-call channel, and handing it to one produces a
+  400 rather than a fallback. Same bar §N.1 step 6 set for CodeWiki and step
+  10 reused for the ``ainxt`` CLI.
+
+Unlike the other two Phase 6.6 files these are real unit tests: the helper is
+a module-level function in ``gateway.py``, so it can be loaded on its own
+without importing the ~80 routers attached at module scope.
+"""
+
+from __future__ import annotations
+
+import ast
+import pathlib
+import types
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+GATEWAY = ROOT / "gateway.py"
+
+
+@pytest.fixture(scope="module")
+def helper():
+    """`_oai_tool_channel` and its constant, lifted out of gateway.py.
+
+    Compiled from the source of those two definitions alone. Importing
+    gateway.py would attach every router and open a database; copying the
+    function into the test would let the two drift, which is the failure this
+    whole migration keeps finding. Neither is acceptable, so the real
+    definition is executed in a bare namespace.
+    """
+    tree = ast.parse(GATEWAY.read_text(encoding="utf-8", errors="replace"))
+    wanted = [n for n in tree.body
+              if (isinstance(n, ast.FunctionDef) and n.name == "_oai_tool_channel")
+              or (isinstance(n, ast.Assign)
+                  and any(getattr(t, "id", "") == "_FAMILY_TO_TOOL_PROVIDER"
+                          for t in n.targets))]
+    assert len(wanted) == 2, (
+        "_oai_tool_channel and/or _FAMILY_TO_TOOL_PROVIDER are no longer "
+        "module-level definitions in gateway.py")
+
+    import logging
+    ns: dict = {"logger": logging.getLogger("test"), "Optional": __import__("typing").Optional}
+    exec(compile(ast.Module(body=wanted, type_ignores=[]), "<gateway-subset>", "exec"), ns)
+    return types.SimpleNamespace(fn=ns["_oai_tool_channel"],
+                                 families=ns["_FAMILY_TO_TOOL_PROVIDER"])
+
+
+class _Cand:
+    def __init__(self, model_id, family):
+        self.model_id, self.family = model_id, family
+
+
+@pytest.fixture
+def governed(monkeypatch):
+    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
+
+
+def _pin_candidates(monkeypatch, candidates):
+    """Make resolve_tier_candidates return exactly these, for any tier."""
+    import core.tier_resolver as tr
+    monkeypatch.setattr(tr, "resolve_tier_candidates",
+                        lambda *a, **k: list(candidates), raising=True)
+
+
+# ── D52: the partition is derived, not restated ────────────────────────────
+
+
+def test_every_governed_alias_is_treated_as_a_capability(helper, governed, monkeypatch):
+    """Derived from the router's own tables. If someone adds an alias to
+    _LEGACY_TO_GOVERNED, this test starts covering it with no edit here."""
+    from models.model_router import _HINT_MAP, _LEGACY_TO_GOVERNED
+
+    _pin_candidates(monkeypatch, [_Cand("some-model", "anthropic")])
+    governed_hints = [h for h, t in _HINT_MAP.items() if t in _LEGACY_TO_GOVERNED]
+    assert governed_hints, "the router exposes no governed aliases at all"
+
+    for hint in governed_hints:
+        provider, model_id = helper.fn(hint)
+        assert provider == "claude" and model_id == "some-model", (
+            f"{hint!r} maps to a governed tier but was treated as a user's pick")
+
+
+def test_every_non_governed_alias_is_left_alone(helper, governed, monkeypatch):
+    """§G. model_router.py:1836-1851 records why each of these is absent from
+    _LEGACY_TO_GOVERNED — they are SKUs a user chose from a dropdown, and
+    resolving them through a tier would substitute a different model for the
+    one that was asked for."""
+    from models.model_router import _HINT_MAP, _LEGACY_TO_GOVERNED
+
+    _pin_candidates(monkeypatch, [_Cand("some-model", "anthropic")])
+    picks = [h for h, t in _HINT_MAP.items() if t not in _LEGACY_TO_GOVERNED]
+    assert "gemini" in picks and "local" in picks, \
+        "the fixture's assumption about the router's tables no longer holds"
+
+    for hint in picks:
+        assert helper.fn(hint) == (None, ""), (
+            f"{hint!r} is a user's pick and must not be re-resolved through a tier")
+
+
+def test_no_hint_is_a_capability_request(helper, governed, monkeypatch):
+    """Auto on a tool-call turn is agentic code generation against visible
+    context — §D.2's `complex`. Before this it was OPENAI_CODING_MODEL, a
+    vendor SKU the admin screen could not reach."""
+    _pin_candidates(monkeypatch, [_Cand("assigned-model", "anthropic")])
+    for empty in (None, "", "   "):
+        assert helper.fn(empty) == ("claude", "assigned-model")
+
+
+def test_an_unknown_model_id_is_a_pick(helper, governed, monkeypatch):
+    """A raw model id is not in _HINT_MAP, so it is the user naming a model
+    and must survive untouched — the same rule the ratchet applies."""
+    _pin_candidates(monkeypatch, [_Cand("assigned-model", "anthropic")])
+    assert helper.fn("some-vendor/some-model-v3") == (None, "")
+
+
+# ── D53: the channel has to be able to reach it ────────────────────────────
+
+
+def test_a_family_with_no_tool_channel_is_rejected(helper, governed, monkeypatch, caplog):
+    """The live case on a deployment whose tiers hold Ollama models.
+    stream_cloud_tools takes openai|claude|gemini only."""
+    _pin_candidates(monkeypatch, [_Cand("llama3.2:1b", "ollama")])
+    with caplog.at_level("WARNING"):
+        assert helper.fn(None) == (None, "")
+    assert "llama3.2:1b" in caplog.text, \
+        "the rejected candidate is not named, so an operator cannot act on it"
+    assert "no tool-call channel" in caplog.text
+
+
+def test_it_walks_past_a_rejected_candidate_to_a_usable_one(helper, governed, monkeypatch):
+    """The administrator's priority order is a LADDER. Stopping at the head
+    would make one unusable assignment disable the whole path."""
+    _pin_candidates(monkeypatch, [_Cand("llama3.2:1b", "ollama"),
+                                  _Cand("claude-x", "anthropic")])
+    assert helper.fn(None) == ("claude", "claude-x")
+
+
+def test_a_blocked_model_is_skipped(helper, governed, monkeypatch):
+    import core.model_registry as mr
+    monkeypatch.setattr(mr, "BLOCKED_MODELS", {"retired-model"}, raising=False)
+    _pin_candidates(monkeypatch, [_Cand("retired-model", "anthropic"),
+                                  _Cand("current-model", "anthropic")])
+    assert helper.fn(None) == ("claude", "current-model")
+
+
+@pytest.mark.parametrize("family,provider", [
+    ("anthropic", "claude"), ("openai", "openai"),
+    ("google", "gemini"), ("gemini", "gemini"),
+    ("openai_compatible", "openai"), ("generic_openai", "openai"),
+])
+def test_each_addressable_family_maps_to_its_channel(helper, governed, monkeypatch,
+                                                     family, provider):
+    _pin_candidates(monkeypatch, [_Cand("m", family)])
+    assert helper.fn(None) == (provider, "m")
+
+
+def test_an_empty_tier_falls_back_rather_than_failing(helper, governed, monkeypatch):
+    """NoEligibleModel is the resolver's business, not this function's — a
+    tool turn must still run."""
+    import core.tier_resolver as tr
+    from core.tier_resolver import NoEligibleModel
+
+    def _boom(*a, **k):
+        raise NoEligibleModel("nothing assigned")
+    monkeypatch.setattr(tr, "resolve_tier_candidates", _boom, raising=True)
+    assert helper.fn(None) == (None, "")
+
+
+# ── D57: the flag-off contract ─────────────────────────────────────────────
+
+
+def test_governance_off_changes_nothing(helper, monkeypatch):
+    """The whole rollback story for this path. With the flag off the helper
+    declines to answer and every .env expression in both tool branches is
+    the one that runs — so there is nothing to compare, by construction."""
+    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
+    _pin_candidates(monkeypatch, [_Cand("assigned-model", "anthropic")])
+    for hint in (None, "claude", "solution", "haiku", "deep", "mini", "gemini"):
+        assert helper.fn(hint) == (None, ""), f"{hint!r} resolved with governance off"
+
+
+# ── The call sites consume it ──────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def src() -> str:
+    return GATEWAY.read_text(encoding="utf-8", errors="replace")
+
+
+def test_the_channel_choice_follows_the_model(src):
+    """Picking the vendor from a hint literal and then asking a different
+    tier for the model is how the two came to disagree."""
+    assert 'if _tool_provider:\n                    _use_claude = (_tool_provider == "claude")' in src
+
+
+def test_both_tool_branches_prefer_the_resolved_model(src):
+    assert '_tool_model_id          if _tool_provider == "claude" else' in src
+    assert 'if _tool_provider in ("openai", "gemini") and _tool_model_id:' in src
+
+
+def test_the_explicit_sku_rungs_survive(src):
+    """§G keeps them, and they are also the governance-off answer — so
+    deleting them would break rollback as well as the user's pick."""
+    for rung in ("CLAUDE_OPUS_48_MODEL    if _model_hint == \"opus-4-8\" else",
+                 "CLAUDE_OPUS_5_MODEL     if _model_hint == \"opus-5\" else",
+                 "CLAUDE_SONNET_5_MODEL   if _model_hint == \"sonnet-5\" else"):
+        assert rung in src, f"missing explicit-pick rung: {rung}"
+
+
+def test_the_image_turn_still_forces_the_proxy(src):
+    """A capability requirement, not a routing preference: the Claude stream
+    drops image_url parts. It has to override the tier as well as the hint,
+    and it is now applied AFTER both rather than only inside the passthrough
+    branch."""
+    assert ("if _passthrough and _force_proxy_for_image:\n"
+            "                    _use_claude = False") in src

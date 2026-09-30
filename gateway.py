@@ -9713,10 +9713,88 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
     if _is_cli:
         logger.info(f"[CLI] direct model path (skip orchestrator) model_hint={_model_hint!r}")
 
+        # ── Phase 6.6 — the routing decision, made before the generator ──────
+        # Hoisted out of _cli_direct_stream so the governance pre-flight below
+        # can read the tier. safe_question is final by here (last assigned at
+        # :6291), and the generator body is otherwise unchanged.
+        #
+        # Default: respect the user's explicit model choice; for trivial
+        # greetings/acks, downgrade so "hi" doesn't burn 2-3s of a workhorse
+        # model's latency. The user can still force a model via /model.
+        #
+        # _hint_for_stream STAYS a str — the log line prints it and it is the
+        # vocabulary /model speaks — with the tier travelling beside it, the
+        # way step 9 carried _fp_tier alongside _fp_hint on the fast path.
+        #
+        # Which of these is a TIER and which is a PICK is not a new judgement:
+        # an explicit _model_hint is the user's, and §G says governance never
+        # second-guesses it. Only the two defaults are the platform's own
+        # decision, so only they become tier requests. The old comment named
+        # gpt-5-mini as the destination of "mini" — a model with no registry
+        # row on this deployment, which is the provider assumption the tier
+        # replaces.
+        _hint_for_stream = _model_hint or "complex"
+        _cli_tier: "object | None" = None if _model_hint else _Tier.COMPLEX
+        if not _model_hint and _TRIVIAL_QUERY_RE.match((safe_question or "").strip()):
+            _hint_for_stream = "mini"
+            _cli_tier = _Tier.MINI
+            logger.info("[CLI] trivial query → routing to the mini tier")
+        _cli_route = (_tier_request(_cli_tier, _hint_for_stream)
+                      if _cli_tier is not None
+                      else {"model_hint": _hint_for_stream})
+
+        # ── Department / user ACL (§N.1 step 9's D36, extended here) ─────────
+        # This path had no governance check of any kind. Step 9 wired
+        # acl_filter into the four in-process chat entry points; the CLI direct
+        # relay was out of its scope (D34) and so kept dispatching whatever the
+        # tier resolved, for any user. An explicit pick is left alone for the
+        # same reason the tier request above is: §G.
+        #
+        # Fails open on any DB/import error — governance never takes chat down.
+        _cli_acl = None
+        if not _model_hint:
+            try:
+                from routers.model_governance_router import acl_filter_for as _cli_acl_for
+                _cli_acl = _cli_acl_for(_user_id, _user_dept)
+            except Exception as _cli_gov_err:
+                logger.warning(f"[governance/cli] ACL filter unavailable (fail-open): {_cli_gov_err}")
+
+        # Pre-flight, so a denial is an HTTP 403 with a reason rather than an
+        # exception raised into an SSE body the client has started rendering.
+        # acl_filter above stays authoritative; this only decides whether to
+        # begin, and it fires on the honest condition — every model the tier
+        # would try is denied to this user.
+        _cli_blocked = (_cli_tier is not None
+                        and _fp_fully_blocked(_cli_tier, _cli_acl))
+        if _cli_blocked:
+            logger.warning(
+                f"[governance/cli] every candidate for tier "
+                f"{getattr(_cli_tier, 'value', _cli_tier)!r} is blocked | "
+                f"user={_user_id} dept={_user_dept!r} models={_cli_blocked} — returning 403"
+            )
+            from fastapi.responses import JSONResponse as _GovCliJSONResponse
+            return _GovCliJSONResponse(
+                status_code=403,
+                content={
+                    "error": "no_model_available",
+                    "detail": (
+                        "All AI models have been restricted for your department. "
+                        "Please contact your administrator."
+                    ),
+                    "code": "GOVERNANCE_NO_MODEL_AVAILABLE",
+                },
+            )
+
         def _cli_direct_stream():
             _full  = ""
             _t0    = time.time()
             _cmeta = {"out_tok": 0, "in_tok": 0, "model": "auto", "cost": 0.0, "latency": 0.0}
+            # Populated from model_router.stream()'s trailing sentinel. Read in
+            # preference to the router's thread-locals below: under uvicorn the
+            # generator can resume on a different worker thread between the
+            # final _propagate_tokens write and the post-loop read, which is
+            # the race the sentinel was added to close.
+            _cli_meta: dict = {}
             # Output compliance: stream tokens through a rolling redaction buffer.
             # PCI patterns (PAN, Aadhaar, mobile) are all <= 20 chars, so a 32-char
             # look-behind ensures we never split a pattern across a yielded chunk.
@@ -9814,15 +9892,28 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                     # save + budget + meta below.
                     pass
                 else:
-                    # Default hint: respect user's explicit model choice; for
-                    # trivial greetings/acks, downgrade to "mini" (gpt-5-mini)
-                    # so "hi" doesn't burn 2-3s of Claude Sonnet latency.
-                    # The user can still force claude via /model.
-                    _hint_for_stream = _model_hint or "complex"
-                    if not _model_hint and _TRIVIAL_QUERY_RE.match(safe_question.strip() or ""):
-                        _hint_for_stream = "mini"
-                        logger.info("[CLI] trivial query → routing to mini (gpt-5-mini)")
-                    for _tok in _mr_cli.stream(_cli_msgs, model_hint=_hint_for_stream, local_model=_local_model):
+                    # _cli_route / _hint_for_stream are resolved above, before
+                    # this generator was defined, so the governance pre-flight
+                    # could read the tier.
+                    #
+                    # The trailing sentinel MUST be consumed before the string
+                    # concatenation below. model_router.stream() always yields
+                    # exactly one {"__stream_meta__": …} dict last (see its
+                    # docstring), and this loop used to run `_full += _tok` on
+                    # it unguarded — a TypeError raised AFTER the final real
+                    # token, caught by the handler below, which appended an
+                    # "[Error: …]" chunk to every CLI turn and skipped the
+                    # _cmeta block entirely, so no CLI turn ever recorded its
+                    # model id, tokens or cost. The other two stream() callers
+                    # in this file (the continuation stream and the /ask fast
+                    # path) have always guarded it; this one did not.
+                    for _tok in _mr_cli.stream(_cli_msgs, local_model=_local_model,
+                                               acl_filter=_cli_acl, **_cli_route):
+                        if isinstance(_tok, dict):
+                            _sm_cli = _tok.get("__stream_meta__")
+                            if _sm_cli:
+                                _cli_meta = _sm_cli
+                            continue
                         if _tok:
                             _full += _tok
                             _out_buf += _tok
@@ -9849,9 +9940,13 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                 # them in the image branch above.
                 if not _vision_handled:
                     _cmeta["latency"] = time.time() - _t0
-                    _cmeta["model"]   = _resolve_model_id(getattr(_mr_cli, "last_model_id", None) or getattr(_mr_cli, "last_model_label", ""))
-                    _ri = getattr(_mr_cli, "last_input_tokens",  0) or 0
-                    _ro = getattr(_mr_cli, "last_output_tokens", 0) or 0
+                    _cmeta["model"]   = _resolve_model_id(
+                        _cli_meta.get("model_id")
+                        or _cli_meta.get("model_label")
+                        or getattr(_mr_cli, "last_model_id", None)
+                        or getattr(_mr_cli, "last_model_label", ""))
+                    _ri = _cli_meta.get("in_tok")  or getattr(_mr_cli, "last_input_tokens",  0) or 0
+                    _ro = _cli_meta.get("out_tok") or getattr(_mr_cli, "last_output_tokens", 0) or 0
                     _cmeta["in_tok"]  = _ri if _ri > 0 else int(len(safe_question.split()) * 1.3)
                     _cmeta["out_tok"] = _ro if _ro > 0 else int(len(_full.split()) * 1.3)
                     _cmeta["cost"]    = _estimate_cost(_cmeta["model"], _cmeta["in_tok"], _cmeta["out_tok"])
@@ -10811,6 +10906,102 @@ def _oai_model_hint(model_name: str) -> Optional[str]:
     return None  # let model_router auto-route
 
 
+# A tool-call turn can only be served by a family the tools channel can
+# address. services.cloud_tool_stream.stream_cloud_tools takes
+# "openai" | "claude" | "gemini", and _tools_proxy_stream posts to the
+# matching per-family proxy endpoint — so a tier assigned, say, an Ollama
+# model has no tool-call channel at all and must not be handed to one.
+#
+# This is D46's bar, the one §N.1 step 6 defined for CodeWiki and step 10
+# reused for the ainxt CLI: resolve the tier, keep the first candidate the
+# channel can actually reach, and fall back to today's answer naming every
+# rejection rather than dispatching an id that will 400.
+_FAMILY_TO_TOOL_PROVIDER = {
+    "anthropic":         "claude",
+    "openai":            "openai",
+    "generic_openai":    "openai",
+    "openai_compatible": "openai",
+    "google":            "gemini",
+    "gemini":            "gemini",
+}
+
+
+def _oai_tool_channel(model_hint: Optional[str]) -> tuple:
+    """(provider, model_id) for a tool-call turn, or (None, "") to keep today's.
+
+    Returns ``(None, "")`` — meaning "leave the existing .env expression
+    exactly as it is" — in three cases, which together are the whole of this
+    function's flag-off parity contract (D57):
+
+      * governance is off;
+      * the hint is a USER'S PICK rather than a capability request;
+      * nothing assigned to the tier can be addressed by the tools channel.
+
+    The pick-vs-capability split is not a list maintained here. It is
+    ``_LEGACY_TO_GOVERNED`` membership, read through ``_HINT_MAP``:
+    ``claude`` → complex, plus ``solution``, ``haiku``, ``deep`` and ``mini``
+    are capability requests the platform governs, while ``gemini``, ``local``,
+    ``opus-4-8``, ``opus-5``, ``sonnet-5``, ``tera`` and ``luna`` are SKUs a
+    user chose and §G says are never second-guessed. model_router.py:1836-1851
+    already records why each absent entry is absent; a second copy of that
+    judgement here is how routers/threads_router.py sat on the migrated list
+    for six steps still passing synthesis_hint="solution".
+
+    No hint at all means Auto, which on a tool-call turn is agentic code
+    generation against visible context — §D.2's `complex`.
+    """
+    try:
+        from core.tiers import Tier as _TCh
+        from core.tier_resolver import resolve_tier_candidates as _rtc
+        from core.model_registry import BLOCKED_MODELS as _blocked
+        from core.tiers import governance_enabled as _gov_on
+        from models.model_router import _HINT_MAP as _hm, _LEGACY_TO_GOVERNED as _l2g
+    except Exception as exc:                      # noqa: BLE001
+        logger.debug("[IDE-TOOLS] tier resolution unavailable (%s) — using .env", exc)
+        return None, ""
+
+    if not _gov_on():
+        return None, ""
+
+    key = (model_hint or "").strip().lower()
+    if key:
+        pair = _l2g.get(_hm.get(key))
+        if pair is None:
+            return None, ""                       # the user's pick — §G
+        tier, _extra = pair
+    else:
+        tier = _TCh.COMPLEX
+
+    try:
+        candidates = _rtc(tier)
+    except Exception as exc:                      # noqa: BLE001 — never break a turn
+        logger.warning(
+            "[IDE-TOOLS] tier %r did not resolve (%s) — using the .env constants",
+            getattr(tier, "value", tier), exc)
+        return None, ""
+
+    rejected = []
+    for cand in candidates:
+        if cand.model_id in _blocked:
+            rejected.append(f"{cand.model_id} (on the blocked list)")
+            continue
+        provider = _FAMILY_TO_TOOL_PROVIDER.get(cand.family)
+        if not provider:
+            rejected.append(f"{cand.model_id} ({cand.family}: no tool-call channel)")
+            continue
+        if rejected:
+            logger.info("[IDE-TOOLS] skipped %s", "; ".join(rejected))
+        return provider, cand.model_id
+
+    logger.warning(
+        "[IDE-TOOLS] no model assigned to the %r tier can serve a tool-call turn — %s. "
+        "Falling back to the .env constants. Assign a model from an Anthropic, "
+        "OpenAI or Google provider on Admin > Model Governance to govern this path.",
+        getattr(tier, "value", tier),
+        "; ".join(rejected or ["the tier has no candidates"]))
+    return None, ""
+
+
 def _audit_model_hint_coverage() -> list:
     """Every model id this server advertises must map to a routing hint.
 
@@ -10999,15 +11190,31 @@ def openai_chat_completions(
     _ide_thread_id: Optional[str] = req.session_id or None
 
     # ── Resolve identity: JWT → API key → 401 (no anonymous access) ──
+    # _oai_user_dept is resolved alongside `sub` for the Phase 6.6 governance
+    # ACL. This endpoint used to resolve only the user, and passing
+    # department="" to filter_allowed_models applies user-level rules only —
+    # it would have looked wired up while letting every department rule
+    # through.
+    #
+    # It has to go through enrich_user_context(), NOT _payload["department"]:
+    # the DAST fix removed all PII from the JWT, so the claim is simply not
+    # there any more and reading it returns "" on every request. /ask enriches
+    # for exactly this reason (:3811). Verified by field check — the first
+    # implementation here read the claim, and a department rule denying every
+    # candidate did not block the turn.
     _user_id = None
+    _oai_user_dept = ""
     if authorization and authorization.lower().startswith("bearer "):
         _token = authorization[7:].strip()
         try:
             from auth.jwt_handler import decode_token as _decode
+            from auth.dependencies import enrich_user_context as _oai_enrich
             _payload = _decode(_token)
             if _payload:
                 # JWT no longer contains "email" (DAST fix — PII removed from JWT)
+                _payload = _oai_enrich(_payload)   # adds department from DB/cache
                 _user_id = _payload.get("sub")
+                _oai_user_dept = _payload.get("department", "") or ""
         except Exception:
             pass
         if not _user_id:
@@ -11017,6 +11224,7 @@ def openai_chat_completions(
                     _kp = _res_ak(_token)
                     if _kp:
                         _user_id = _kp["sub"]
+                        _oai_user_dept = _kp.get("department", "") or ""
             except Exception:
                 pass
     if not _user_id:
@@ -11369,6 +11577,12 @@ def openai_chat_completions(
 
     # Resolve model hint from the requested model name
     _model_hint = _oai_model_hint(req.model)
+    # Phase 6.6 — the tool-call channel and model, resolved once for the whole
+    # turn. ("", None) means "keep every .env expression below exactly as it
+    # is", which is both the governance-off path and the user's-own-pick path.
+    _tool_provider, _tool_model_id = _oai_tool_channel(_model_hint)
+    if _tool_provider:
+        logger.info(f"[IDE-TOOLS] tier governance → {_tool_provider}/{_tool_model_id}")
     # Extract bare model name when IDE sends "local:Kimi-k2.5" so the local
     # gateway knows which specific model to call.
     _local_model_name = (req.model.split(":", 1)[1] if (req.model or "").lower().startswith("local:") else None)
@@ -11876,7 +12090,11 @@ def openai_chat_completions(
         import httpx as _httpx
         import json as _json2
 
-        _use_gemini = (_model_hint == "gemini")
+        # "gemini" and "local" are SKU/deployment picks a user made, so they
+        # stay hint-driven (§G) — _oai_tool_channel returns nothing for them.
+        # A tier that RESOLVES to a Google model still reaches the Gemini
+        # endpoint, via _tool_provider.
+        _use_gemini = (_model_hint == "gemini") or _tool_provider == "gemini"
         _use_local  = (_model_hint == "local")
 
         if _use_local:
@@ -11980,7 +12198,14 @@ def openai_chat_completions(
             return
 
         _tools_endpoint  = "/llm/gemini-tools-stream" if _use_gemini else "/llm/openai-tools-stream"
-        if _use_gemini:
+        # Phase 6.6: the assignment wins for a capability request ("deep",
+        # "mini", or no hint); the .env rungs below remain the answer for a
+        # user's own pick and for the whole governance-off path. The Auto case
+        # used to be OPENAI_CODING_MODEL unconditionally — a hardcoded vendor
+        # SKU serving every agentic turn the admin screen could not reach.
+        if _tool_provider in ("openai", "gemini") and _tool_model_id:
+            _tools_model = _tool_model_id
+        elif _use_gemini:
             _tools_model = _GEMINI_VISION
         elif _model_hint == "deep":
             _tools_model = OPENAI_LATEST_MODEL
@@ -12239,7 +12464,16 @@ def openai_chat_completions(
 
         # ── Select Claude model for tool-use stream ──────────────────────────────
         # Routes through services/cloud_tool_stream.stream_cloud_tools()
+        #
+        # Phase 6.6: the administrator's assignment wins when this turn is a
+        # capability request — "claude", "solution", "haiku" or no hint at
+        # all. The ladder below is what remains: the SKU aliases a user picked
+        # from an IDE dropdown (opus-4-8, opus-5, sonnet-5), which §G keeps,
+        # plus the whole governance-off path. Before this, every rung was an
+        # .env constant and the final one, CLAUDE_PRIMARY_MODEL, served every
+        # Auto agentic turn on this endpoint regardless of what was assigned.
         _claude_tools_model = (
+            _tool_model_id          if _tool_provider == "claude" else
             SOLUTION_MODEL          if _model_hint == "solution" else
             CLAUDE_OPUS_48_MODEL    if _model_hint == "opus-4-8" else
             CLAUDE_OPUS_5_MODEL     if _model_hint == "opus-5" else
@@ -12283,7 +12517,12 @@ def openai_chat_completions(
         """Yield tokens directly from the appropriate gateway."""
         nonlocal safe_question   # reassigned in RAG injection below; must be nonlocal
         from agents.compliance_engine import compliance_engine
-        from models.model_router import model_router as _mr, TIER_SIMPLE, TIER_MEDIUM, TIER_COMPLEX, TIER_VISION, TIER_GEMINI, TIER_HAIKU
+        # The six TIER_* constants that used to be imported here went with the
+        # hand-rolled dispatcher below. This was the last non-test application
+        # import of TIER_VISION / TIER_GEMINI in the repository, which is what
+        # blocked Phase 8 from deleting them and Phase 10 from checking
+        # "exactly 8 application-facing tiers exist".
+        from models.model_router import model_router as _mr
 
         # ── Gate 1: current user message ─────────────────────────
         findings_all = compliance_engine.validate_input(last_user).get("findings", [])
@@ -12378,52 +12617,85 @@ def openai_chat_completions(
         # Claude model — silently downgrading their choice. So (a) honour an explicit
         # model hint verbatim, and (b) when there is NO explicit hint on a browser turn,
         # pin to the capable Claude tier instead of letting the DOM size pick a mini.
-        _route_hint = _model_hint
-        if _shape_match and not _route_hint:
-            _route_hint = "claude"
-            logger.info("[IDE] browser-agent turn with no explicit model — pinning to Claude "
-                        "tier to avoid DOM-size complexity downgrade (#33)")
-        decision = _mr.route(_prompt, model_hint=_route_hint)
-        _mr.last_model_label = decision.model
-        _mr.last_tier        = decision.tier
-        # Use bare model ID for model_usages; _resolve_model_id handles "auto" fallback.
-        _meta["model"]       = _resolve_model_id(_mr.last_model_id or decision.model)
-        logger.info(f"[IDE] ROUTING   tier={decision.tier!r}  model={decision.model!r}  "
-                    f"hint={decision.hint!r}  complexity={decision.complexity!r}  fallback={decision.fallback}")
-        logger.info(f"[IDE] → SENDING TO MODEL (plain chat, no tools)")
+        # ── Phase 6.6 — the pin becomes a tier request ───────────────────────
+        # "pin to the capable Claude tier" is a TIER, and _HINT_MAP already
+        # agrees: it maps "claude" to complex. Naming the vendor here made the
+        # pin unreachable the moment governance resolved the tier to anything
+        # else, and it is the vendor literal §E exists to remove.
+        # _route_hint is gone with the ladder. It existed to hold the pin, and
+        # holding it in a SECOND variable from the one the dispatch read is
+        # precisely how the pin came to be computed, logged and then dropped.
+        # One route object now feeds both route() and stream().
+        _oai_route: dict = {"model_hint": _model_hint}
+        if _shape_match and not _model_hint:
+            _oai_route = _tier_request(_Tier.COMPLEX, "claude")
+            logger.info("[IDE] browser-agent turn with no explicit model — pinning to "
+                        "the complex tier to avoid DOM-size complexity downgrade (#33)")
 
+        # ── Department / user ACL ────────────────────────────────────────────
+        # This endpoint had no governance check at all — step 9 wired the four
+        # in-process chat entry points and this one was out of its scope. An
+        # explicit pick is left alone (§G); only an Auto turn is filtered.
+        # Fails open on any DB/import error.
+        _oai_acl = None
+        if not _model_hint:
+            try:
+                from routers.model_governance_router import acl_filter_for as _oai_acl_for
+                _oai_acl = _oai_acl_for(_user_id, _oai_user_dept)
+            except Exception as _oai_gov_err:
+                logger.warning(f"[governance/ide] ACL filter unavailable (fail-open): {_oai_gov_err}")
+
+        # No explicit route() call here. stream() resolves the turn itself and
+        # records the selection, so asking route() first would resolve TWICE —
+        # which is what the old code did (once here, once inside the
+        # generate() fall-through) and it is not free: on an Auto turn
+        # route() runs the complexity classifier, so the turn paid for two
+        # classifications and could act on two different answers. The
+        # decision is read back off the sentinel below instead.
+        logger.info(f"[IDE] → SENDING TO MODEL (plain chat, no tools) route={_oai_route}")
+
+        # ── One governed dispatch, replacing the second dispatcher ───────────
+        # What was here: five `if decision.tier == TIER_X` branches that
+        # hand-called _get_openai() / _get_claude() / _get_gemini() /
+        # _get_local(), then a blocking _mr.generate() fall-through.
+        #
+        # Under governance every one of those branches was DEAD. A resolved
+        # tier returns RoutingDecision(tier=TIER_GOVERNED) — "governed" — which
+        # equals none of TIER_MEDIUM/COMPLEX/VISION/GEMINI/HAIKU/SIMPLE, so
+        # control always reached the fall-through. That had three consequences
+        # nothing recorded: plain chat on this endpoint did not stream (one
+        # blocking call, yielded whole); every turn routed TWICE; and the
+        # fall-through passed _model_hint rather than _route_hint, so the #33
+        # browser-agent pin above was discarded — a turn pinned to the capable
+        # tier re-resolved to `simple` and answered from a 1B local model.
+        #
+        # The branches that DID match (gemini, and the auto/local case) called
+        # gw.generate(_prompt) with no model=, so they ran the gateway's .env
+        # default rather than the id the router had just resolved.
+        #
+        # stream() carries the candidate ladder, the ACL and the legacy-chain
+        # degradation, so nothing is lost by deleting the ladder — those are
+        # the things it was approximating.
         try:
-            if decision.tier == TIER_MEDIUM:
-                gw = _mr._get_openai()
-                if gw:
-                    yield from gw.generate(_prompt)
-                    return
-            if decision.tier == TIER_COMPLEX:
-                gw = _mr._get_claude()
-                if gw:
-                    yield from gw.generate(_prompt)
-                    return
-            if decision.tier in (TIER_VISION, TIER_GEMINI):
-                # Both explicit Gemini selection and vision-detected queries route here
-                gw = _mr._get_gemini()
-                if gw:
-                    yield from gw.generate(_prompt)
-                    return
-            if decision.tier == TIER_HAIKU:
-                gw = _mr._get_claude()
-                if gw:
-                    yield from gw.generate(_prompt, model=_CLAUDE_HAIKU)
-                    return
-            if decision.tier == TIER_SIMPLE:
-                # Local in-house LLM — routes from the gateway server directly (no proxy)
-                local = _mr._get_local()
-                if local and local.available:
-                    yield from local.generate(_prompt, model=_local_model_name, tier="simple")
-                    return
-            # Gateway unavailable or unknown tier — blocking fallback with model_router
-            result = _mr.generate(_prompt, model_hint=_model_hint)
-            logger.info(f"[IDE] ← RESPONSE (fallback) chars={len(result)}  preview={result[:120]!r}")
-            yield result
+            for _tok in _mr.stream(_prompt, acl_filter=_oai_acl, **_oai_route):
+                # The trailing sentinel must not escape: the caller does
+                # `full_answer += token`, and a dict there is a TypeError.
+                if isinstance(_tok, dict):
+                    _sm_ide = _tok.get("__stream_meta__") or {}
+                    if _sm_ide:
+                        _meta["in_tok"]  = int(_sm_ide.get("in_tok")  or _meta["in_tok"])
+                        _meta["out_tok"] = int(_sm_ide.get("out_tok") or _meta["out_tok"])
+                        _meta["model"]   = _resolve_model_id(
+                            _sm_ide.get("model_id") or _sm_ide.get("model_label")
+                            or _meta["model"])
+                    continue
+                if _tok:
+                    yield _tok
+            return
+        except _ModelsBlockedByPolicy as _blk:
+            logger.warning(f"[governance/ide] every candidate blocked for user={_user_id}: {_blk}")
+            yield ("All AI models have been restricted for your department. "
+                   "Please contact your administrator.")
             return
         except Exception as _e:
             logger.exception(
@@ -12497,18 +12769,25 @@ def openai_chat_completions(
         try:
             if req.tools:
                 # ── Agent / tool-call mode ───────────────────────────────
-                # Route to Claude for agentic tool-calling when the model hint
-                # is "claude" (much better multi-step reasoning).
-                # Fall back to OpenAI proxy for other hints/models.
-                if _passthrough:
+                # Which channel serves the turn. Phase 6.6: when the tier
+                # resolved a model, the CHANNEL FOLLOWS THE MODEL — picking
+                # the vendor from a hint literal and then asking a different
+                # tier for the model is how these two came to disagree. The
+                # two literal hint sets below are the governance-off and
+                # user's-own-pick answer, unchanged and still exercised.
+                if _tool_provider:
+                    _use_claude = (_tool_provider == "claude")
+                elif _passthrough:
                     # Browser-agent: complete, drift-proof hint set (includes opus-4-8).
                     _use_claude = _model_hint in _CLAUDE_TOOL_HINTS
-                    # Image turns MUST use the proxy — Claude stream drops image_url parts.
-                    if _force_proxy_for_image:
-                        _use_claude = False
                 else:
                     # IDE path — unchanged, byte-identical to today.
                     _use_claude = _model_hint in ("claude", "solution", "haiku")
+                # Image turns MUST use the proxy — Claude stream drops
+                # image_url parts. A capability requirement, so it overrides
+                # both the tier and the hint, and it always did.
+                if _passthrough and _force_proxy_for_image:
+                    _use_claude = False
                 _tool_gen = _tools_claude_stream() if _use_claude else _tools_proxy_stream()
                 for raw_chunk in _tool_gen:
                     if not raw_chunk:
