@@ -51,13 +51,24 @@ tests/core/test_coach_events.py::test_channel_from_client_source[vscode-ide]
 #    pre-existing: models/followup_condenser.py is untouched by this change, and
 #    the whole file collects fine once the env var is populated.
 # 2. test_async_stream_reports_actual_claude_fallback_when_openai_unavailable
-#    asserts the streamed model_id equals CLAUDE_PRIMARY_MODEL, which is "" in
-#    CI, while the router reports "unknown". Verified pre-existing: the test
-#    passes unchanged with CLAUDE_PRIMARY_MODEL=claude-sonnet-4-6 set.
+#    asserted the streamed model_id equals CLAUDE_PRIMARY_MODEL, which is "" in
+#    CI, while the router reports "unknown".
+#    FIXED in Phase 9 and removed from this file. The note below asked for
+#    exactly this: the test now takes the expected model from the gateway that
+#    ACTUALLY served the call, so it depends on no env var at all. That is also
+#    the better assertion — the invariant is "the metadata names whoever
+#    answered", and comparing against a constant only tested it by coincidence.
 #
 # Both should be fixed by making the tests env-independent rather than by
 # setting model env vars in CI — that would contradict the migration's goal of
-# removing model identity from the environment. Not done here: fixing unrelated
-# pre-existing failures inside a governance migration is out of scope.
+# removing model identity from the environment.
+#
+# Still outstanding: test_followup_condenser.py. Its whole "fallback chain"
+# section derives _PRIMARY/_SECONDARY from the DEPLOYMENT's configured chain
+# (`fc._CONDENSE_MODEL_CHAIN[1]` at module scope, ~15 call sites), so making it
+# env-independent means giving that section a test-owned chain — a real
+# refactor of a 539-line file rather than a line change. Phase 9 left it
+# deliberately: see plan.html D68, which also records the live finding
+# underneath it (models/followup_condenser.py asks for the SKU alias "haiku",
+# which application code is not supposed to do).
 tests/models/test_followup_condenser.py
-tests/models/test_model_router_async_stream.py::test_async_stream_reports_actual_claude_fallback_when_openai_unavailable

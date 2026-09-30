@@ -279,7 +279,8 @@ TIER_USED_BY: Final[dict[Tier, tuple[str, ...]]] = {
 #      tiers and nothing else.
 #   3. Bounded lifetime. Every translation increments
 #      `ainxt_legacy_model_alias_total`; removal in Phase 10 is gated on that
-#      counter reading zero for a full release.
+#      counter reading zero for a full release. It is a RANGE reading, not a
+#      point reading — see note_legacy_alias() below and CHANGELOG.md.
 EXPLICIT_MODEL: Final[Literal["EXPLICIT_MODEL"]] = "EXPLICIT_MODEL"
 
 LEGACY_INBOUND_ALIASES: Final[dict[str, Union[Tier, str]]] = {
@@ -388,6 +389,18 @@ def note_legacy_alias(value: str, surface: str) -> None:
     release.
 
     ``surface`` is the client the value arrived from, e.g. "cli" or "ide".
+
+    HOW THAT GATE IS ACTUALLY READ — see CHANGELOG.md, "Legacy model aliases".
+    Two mistakes both yield a confident, false "nobody uses it":
+
+      * The counter below is IN-PROCESS. It resets on gateway restart and on
+        worker recycle, so reading it once — or reading it after a deploy —
+        measures uptime, not client behaviour. The gate is
+        ``increase(ainxt_legacy_model_alias_total[<window>]) == 0`` over a
+        range, which accounts for resets.
+      * ``GET /ainxt/v1/api/metrics/prometheus`` is admin-only. A scrape job
+        with no admin bearer token records 401s rather than zeroes, and the
+        series never appears at all.
     """
     try:
         key = (value or "").strip().lower()
@@ -401,12 +414,18 @@ def note_legacy_alias(value: str, surface: str) -> None:
             _warned_legacy_aliases.add(key)
             from core.logger import logger
 
+            # The removal release and the exact gate query live in
+            # CHANGELOG.md so the warning can name a document rather than a
+            # version the repository does not yet carry. Naming it matters:
+            # the previous text said only "once no client relies on it", which
+            # tells an operator neither where to look nor how to check.
             logger.warning(
                 "[tiers] legacy model alias %r received from %s. Provider/SKU-shaped "
-                "hints are deprecated in favour of the eight approved capability "
-                "tiers (core.tiers.Tier); this compatibility translation is "
-                "scheduled for removal once no client relies on it. "
-                "Tracked as %s_legacy_model_alias_total.",
+                "hints are DEPRECATED in favour of the eight approved capability "
+                "tiers (core.tiers.Tier). Removal is two minor releases after the "
+                "one that publishes the notice — see CHANGELOG.md, 'Legacy model "
+                "aliases', for the removal gate and how to read it. Tracked as "
+                "%s_legacy_model_alias_total.",
                 key, surface, "ainxt",
             )
     except Exception:   # noqa: BLE001 — observability must never break a request

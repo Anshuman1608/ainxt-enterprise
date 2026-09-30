@@ -1850,6 +1850,8 @@ running platform. [Compact version](#compact-version) is the same thing as a cop
 | [`docs/CODEBASE_INDEXING_SETUP.md`](docs/CODEBASE_INDEXING_SETUP.md) | Indexing your code repositories for AI-assisted development |
 | [`docs/SDLC_CLI_SETUP.md`](docs/SDLC_CLI_SETUP.md) | SDLC pipeline CLI setup |
 | [`docs/README.md`](docs/README.md) | Index of all 587 per-module reference pages |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release notes, and every active deprecation with its removal release |
+| [`VERSIONING.md`](VERSIONING.md) | Version scheme, stability tier per surface, deprecation process, support window |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, coding standards, DCO sign-off |
 | [`SUPPORT.md`](SUPPORT.md) | Where to ask questions |
 | [`SECURITY.md`](SECURITY.md) | Reporting vulnerabilities — **do not open a public issue** |

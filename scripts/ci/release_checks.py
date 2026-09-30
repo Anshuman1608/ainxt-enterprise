@@ -522,10 +522,23 @@ _FRONTEND_LITERAL_ALLOWED = {
     # exempted, so migrating it shows up as the number falling.
 }
 
-# Measured after Phase 7's picker cleanup: 44 before, 37 after. Comments
+# Measured after Phase 7's picker cleanup: 44 before, 38 after. Comments
 # included, per the note above. Lower it as files are migrated; it may never
 # rise.
-_FRONTEND_LITERAL_BASELINE = 37
+#
+# CORRECTED IN PHASE 9, and the correction is worth reading before anyone
+# treats this as a rise. Phase 7 recorded 37. It counted 37 and then, later in
+# the same change, added the comment at ai-ui/src/utils/modelPicker.js:33 that
+# names the stale labels the pickers used to ship — including "GPT-5.4". The
+# count was never retaken, so this check has FAILED at HEAD since 1cd6b5a.
+#
+# Fixed by correcting the number rather than by stripping comments or editing
+# the comment, because the note above makes counting them a deliberate design
+# choice: a ratchet that ignores comments can be evaded by commenting code out.
+# The 38th literal is an explanatory mention, not a coupling — but the rule is
+# the rule, and exempting the mention would be exempting the very file this
+# check was written to protect.
+_FRONTEND_LITERAL_BASELINE = 38
 
 _FRONTEND_LITERAL_RE = re.compile(
     r"""['"](claude-[a-z0-9.\-]+"""

@@ -321,6 +321,69 @@ def test_legacy_alias_counter_increments_and_is_scrapeable() -> None:
     assert 'alias="opus"' in scraped and 'surface="cli"' in scraped
 
 
+def test_the_deprecation_warning_points_somewhere_actionable(caplog) -> None:
+    """Phase 9 published the removal notice; the warning must lead to it.
+
+    The text used to end "scheduled for removal once no client relies on it",
+    which tells an operator neither when nor how to check. It now names
+    CHANGELOG.md, where the removal release and the gate query live — and the
+    gate is the reason this matters: it is a RANGE reading of a counter that
+    resets on restart, so an operator who reads the counter once concludes
+    the opposite of the truth.
+
+    Asserted rather than trusted because it is a log string, which is exactly
+    the kind of thing a later edit rewrites without noticing what depended on
+    it.
+    """
+    import logging
+
+    from core.tiers import _warned_legacy_aliases, note_legacy_alias
+
+    alias = "opus-4-8"
+    _warned_legacy_aliases.discard(alias)       # the warning is once-per-process
+    with caplog.at_level(logging.WARNING):
+        note_legacy_alias(alias, surface="ide")
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "CHANGELOG.md" in text, (
+        "the deprecation warning no longer names the document that carries "
+        "the removal release and the gate query"
+    )
+    assert "DEPRECATED" in text or "deprecated" in text
+    assert "ainxt_legacy_model_alias_total" in text, (
+        "the warning must name the counter, or the gate is unfindable from "
+        "the one place an operator actually sees the problem"
+    )
+
+
+def test_the_published_notice_exists_and_explains_the_gate() -> None:
+    """The warning points at CHANGELOG.md; this is the other end of that.
+
+    A pointer to a section that does not exist is worse than no pointer. The
+    two caveats below are the ones that make the gate readable at all — an
+    unauthenticated scrape records 401s rather than zeroes, and a point
+    reading of an in-process counter measures uptime.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    changelog = root / "CHANGELOG.md"
+    assert changelog.exists(), "CHANGELOG.md is missing — the warning is a dead link"
+
+    text = changelog.read_text(encoding="utf-8")
+    assert "### Deprecated" in text
+    assert "LEGACY_INBOUND_ALIASES" in text
+    assert "increase(ainxt_legacy_model_alias_total" in text, (
+        "the gate must be written as a RANGE query; the counter resets on "
+        "restart, so `== 0` on a point reading is always eventually true"
+    )
+    assert "admin" in text and "401" in text, (
+        "the notice must say the scrape job needs an admin credential — "
+        "/metrics/prometheus is admin-only, and an unauthenticated job "
+        "records 401s rather than zeroes"
+    )
+
+
 def test_note_legacy_alias_never_raises() -> None:
     """It sits on a request path; a telemetry fault must not break the request."""
     from core.tiers import note_legacy_alias
