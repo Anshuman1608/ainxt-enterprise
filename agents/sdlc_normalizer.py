@@ -11,7 +11,8 @@ DESIGN NOTES
 ------------
 - Model: haiku tier by default; override via SDLC_MODEL_NORMALIZE, which accepts
   either a router tier name or a concrete model id of any provider (resolved by
-  sdlc_stage_hint → model_router, so it works on a harness with no Anthropic).
+  the `normalize` stage tier → model_router, so an administrator picks the
+  model and it works on a harness with no Anthropic).
 - Input: jira_get_issue_full() dict + repo context + workspace root
 - Thin tickets: infers from ticket type + repo context, raises open_questions
 - Thick tickets: distils — extracts structured fields, ignores narrative noise
@@ -106,16 +107,23 @@ class NormalizationAgent:
     """Converts a raw Jira issue dict into a locked WorkItem.
 
     Call normalize() once per pipeline run immediately after PREFLIGHT/BASELINE_BUILD.
-    The agent uses haiku (cheap, fast) for JSON extraction and raises open_questions
+    The agent uses the `simple` tier for JSON extraction and raises open_questions
     only for fields it genuinely cannot infer from the ticket text or repo context.
     """
 
     def __init__(self, run_id: str = ""):
         self._run_id = run_id or ""
 
-    def _model(self) -> str:
-        from core.model_registry import sdlc_stage_hint
-        return sdlc_stage_hint("normalize")
+    def _route(self) -> dict:
+        """Routing kwargs for the `normalize` stage (§N.1 step 10).
+
+        Was sdlc_stage_hint("normalize") → the string "haiku" → an .env
+        constant. Now the tier an administrator assigned to `simple`: this
+        stage extracts JSON fields from ticket text, which is §D.2's
+        definition of that tier.
+        """
+        from models.model_router import sdlc_stage_route
+        return sdlc_stage_route("normalize")
 
     def normalize(
         self,
@@ -200,8 +208,11 @@ Respond with ONLY valid JSON matching this schema:
 {json.dumps(_NORMALIZATION_SCHEMA, indent=2)}
 """
         try:
-            from models.model_router import model_router
-            result_raw = model_router.generate(prompt, model_hint=self._model())
+            from models.model_router import (
+                model_router, route_label as _route_label,
+                dispatched_model_id as _dispatched_model_id,
+            )
+            result_raw = model_router.generate(prompt, **self._route())
         except Exception as e:
             logger.warning(f"[NORM {self._run_id}] LLM call failed: {e} — returning minimal WorkItem")
             wi = WorkItem(
@@ -251,8 +262,13 @@ Respond with ONLY valid JSON matching this schema:
             f"acceptance_criteria={len(ac)} "
             f"scope={len(scope)} out_of_scope={len(out_of_scope)}"
         )
+        # The model that ACTUALLY ran, not the tier we asked with (§N.1 step 10,
+        # 10f). This line used to call self._model(), which returned the hint
+        # string — so the normalizer's log named a tier and the audit row named
+        # a tier, and neither could be joined to a cost.
         logger.info(
-            f"[NORM {self._run_id}] model={self._model()} "
+            f"[NORM {self._run_id}] asked_for={_route_label(self._route())} "
+            f"model={_dispatched_model_id(model_router, '?')} "
             f"prompt_chars={len(prompt)} tokens_in={tokens_in} tokens_out={tokens_out}"
         )
 

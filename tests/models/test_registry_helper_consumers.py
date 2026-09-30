@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: MIT
 """§N.1 step 8f — the SDLC CLI helpers are now consumed by SDLC only.
 
-core/model_registry.py's cli_model_for_tier() and openai_model_for_tier() are
-SDLC plumbing: the first hardcodes ("anthropic", …) for three tiers and
+core/model_registry.py's cli_model_for_tier() and openai_model_for_tier() were
+SDLC plumbing: the first hardcoded ("anthropic", …) for three tiers and
 ("openai", …) for two — the most provider-biased map in the repository — and
-the second exists purely because the SDLC manifest cross-validator speaks the
-OpenAI wire format. §N.1 step 10 deletes both.
+the second existed purely because the SDLC manifest cross-validator spoke the
+OpenAI wire format.
+
+§N.1 step 10 DELETED both, along with cli_model_for(). The map survives only
+inside _legacy_cli_model_for_tier() as the governance-off fallback, and Phase
+8 removes it with the rest of the .env model constants. This file now guards
+two things: that nothing has reintroduced them, and that the three named
+phase helpers that replaced them stay SDLC-only.
 
 Three modules outside SDLC had drifted onto them, each acquiring an accidental
 dependency on SDLC_TIER_*_MODEL and ENABLE_OPUS:
@@ -29,8 +35,19 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-_HELPERS = {"cli_model_for_tier", "openai_model_for_tier", "cli_model_for",
-            "cli_classify_model", "cli_plan_model", "cli_implement_model"}
+# Deleted outright by §N.1 step 10 — importing one is now an ImportError, so
+# this set is a readability guard rather than a ratchet. Kept because a
+# revert would otherwise show up only as a crash at run time in a module with
+# no test coverage.
+_DELETED_HELPERS = {"cli_model_for_tier", "openai_model_for_tier", "cli_model_for"}
+
+# Still present, still SDLC-only: the named CLI phases. They resolve through
+# cli_tier_model_id() (the tier assignments) rather than through .env, so the
+# reason to keep non-SDLC modules off them is narrower than it was — but it
+# has not gone away. Each applies a DEPRECATED per-phase env pin, and a
+# non-SDLC caller picking one up would inherit an SDLC operator's override.
+_HELPERS = {"cli_classify_model", "cli_plan_model", "cli_implement_model",
+            "cli_coder_model", "cli_tier_model_id"} | _DELETED_HELPERS
 
 # Where an SDLC helper legitimately belongs until §N.1 step 10 deletes it.
 # The last two are SDLC modules that do not carry the `sdlc` prefix — listed
@@ -70,10 +87,36 @@ def test_only_sdlc_imports_the_sdlc_cli_helpers():
         if hit:
             offenders[rel] = sorted(hit)
     assert not offenders, (
-        f"non-SDLC modules import SDLC CLI helpers: {offenders}. These resolve "
-        f"through _tier_to_role, which hardcodes a provider family per tier, "
-        f"and read SDLC_TIER_*_MODEL / ENABLE_OPUS. Ask the router for a tier "
-        f"instead — see services/feedback_processor.py for the shape.")
+        f"non-SDLC modules import SDLC CLI helpers: {offenders}. These carry "
+        f"SDLC's own deprecated per-phase env pins and resolve a CONCRETE id "
+        f"for an out-of-process spawn. An in-process caller wants routing "
+        f"kwargs — ask for a tier; see services/feedback_processor.py.")
+
+
+def test_the_provider_biased_helpers_are_deleted():
+    """The thing this file was written in step 8 to make possible. Its
+    docstring then said "§N.1 step 10 deletes both"; this is that."""
+    import core.model_registry as mr
+
+    still_here = sorted(h for h in _DELETED_HELPERS if hasattr(mr, h))
+    assert not still_here, (
+        f"{still_here} came back. _tier_to_role hardcoded a provider family "
+        f"per tier and never read the admin's assignments; it lives on only "
+        f"as _legacy_cli_model_for_tier, the governance-off path.")
+
+
+def test_nothing_anywhere_imports_a_deleted_helper():
+    """Including the SDLC modules themselves — they are exempt from the
+    sweep above, so without this the deletion would be unguarded exactly
+    where it matters most."""
+    offenders = {}
+    for rel, path in _python_files():
+        if rel.startswith("tests/"):
+            continue
+        hit = _imports_a_helper(path) & _DELETED_HELPERS
+        if hit:
+            offenders[rel] = sorted(hit)
+    assert not offenders, f"deleted helpers are still imported by {offenders}"
 
 
 @pytest.mark.parametrize("rel", [

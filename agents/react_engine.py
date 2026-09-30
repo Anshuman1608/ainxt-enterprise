@@ -49,8 +49,17 @@ class ReactEngine:
         retrieve_fn:          Callable[[query: str], list[str]] — returns text chunks.
         max_iterations:       Hard cap on reasoning loops (default 3).
         confidence_threshold: Stop early once this score is reached.
-        synthesis_hint:       Model hint for the final answer ("solution" → Opus if ENABLE_OPUS).
-        iteration_hint:       Model hint for mid-loop calls ("complex" → Sonnet — cost control).
+        synthesis_route:      Routing kwargs for the final answer.
+        iteration_route:      Routing kwargs for mid-loop calls.
+
+    §N.1 step 10 replaced the two `*_hint` strings with routing kwargs. They
+    were the last "solution"/"complex" literals outside SDLC, and the CI
+    ratchet could not see them: it reads `model_hint=` keywords and these
+    arrived as `synthesis_hint=` / `iteration_hint=` on a constructor. Both
+    resolve to the `complex` tier now — synthesis is long-context reasoning
+    and the mid-loop analysis is the same capability, so the two ended up at
+    the same destination the old strings named (§M.3a keeps the reviewer a
+    role within `complex`, and neither of these is a review gate).
     """
 
     def __init__(
@@ -59,15 +68,19 @@ class ReactEngine:
         retrieve_fn:          Callable[[str], list[str]],
         max_iterations:       int   = MAX_REACT_ITERATIONS,
         confidence_threshold: float = CONFIDENCE_THRESHOLD,
-        synthesis_hint:       str   = "solution",
-        iteration_hint:       str   = "complex",
+        synthesis_route:      dict  = None,
+        iteration_route:      dict  = None,
     ):
         self.task                 = task
         self.retrieve_fn          = retrieve_fn
         self.max_iterations       = max_iterations
         self.confidence_threshold = confidence_threshold
-        self.synthesis_hint       = synthesis_hint
-        self.iteration_hint       = iteration_hint
+        from core.tiers import Tier as _Tier
+        from models.model_router import tier_request as _tier_request
+        # Defaults carry their pre-migration legacy hints, so governance-off
+        # dispatch is byte-identical to what these two strings did (D15/D50).
+        self.synthesis_route      = synthesis_route or _tier_request(_Tier.COMPLEX, "solution")
+        self.iteration_route      = iteration_route or _tier_request(_Tier.COMPLEX, "complex")
         self._last_critique       = ""
 
     # ------------------------------------------------------------------
@@ -102,7 +115,7 @@ class ReactEngine:
             # ── Analyse ────────────────────────────────────────────────
             prompt = self._analysis_prompt(gathered, analysis, i)
             try:
-                analysis = model_router.generate(prompt, model_hint=self.iteration_hint)
+                analysis = model_router.generate(prompt, **self.iteration_route)
             except Exception as e:
                 logger.warning(f"[ReactEngine] analysis LLM error: {e}")
                 break
@@ -122,7 +135,7 @@ class ReactEngine:
                 try:
                     self._last_critique = model_router.generate(
                         self._critique_prompt(analysis),
-                        model_hint=self.iteration_hint,
+                        **self.iteration_route,
                     )
                     steps.append(ReactStep(
                         action="critique", query=f"iter-{i + 1}",
@@ -135,13 +148,15 @@ class ReactEngine:
         try:
             answer = model_router.generate(
                 self._synthesis_prompt(gathered, analysis),
-                model_hint=self.synthesis_hint,
+                **self.synthesis_route,
             )
         except Exception as e:
             logger.warning(f"[ReactEngine] synthesis fallback ({e}) — using last analysis")
             answer = analysis
 
-        model_used = getattr(model_router, "last_model_label", self.synthesis_hint)
+        from models.model_router import route_label as _route_label
+        model_used = getattr(model_router, "last_model_label", None) or _route_label(
+            self.synthesis_route)
         steps.append(ReactStep(action="synthesize", query="final", result=answer[:150]))
 
         return ReactResult(

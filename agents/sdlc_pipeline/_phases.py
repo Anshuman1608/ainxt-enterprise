@@ -138,7 +138,8 @@ def _phase_normalize_ticket(run_id: str, jira_key: str, issue: dict,
 
 def _phase_validate_manifest(run_id: str, jira_key: str, work_item_dict: dict,
                               design: dict, analysis: dict,
-                              workspace_root: str = "") -> tuple:
+                              workspace_root: str = "",
+                              author_family: str = "") -> tuple:
     """MANIFEST_VALIDATION stage — structural + OpenAI cross-check of the change manifest.
 
     Returns (passed: bool, issues: list[str]).
@@ -337,44 +338,29 @@ def _phase_validate_manifest(run_id: str, jira_key: str, work_item_dict: dict,
             f'{{ "valid": true/false, "missing_components": [], '
             f'"out_of_scope_violations": [], "issues": [] }}'
         )
-        # Step 1: resolve the judge model through config. _sdlc_model returns the
-        # TIER (default "deep" → gpt-5.5, env-overridable via SDLC_MODEL_MANIFEST_VALIDATE),
-        # OR a concrete model id when the operator pins one.
+        # §N.1 step 10. The judge asks for the `complex` tier — judging a plan
+        # needs the capability that wrote it (§D.2) — with ONE constraint:
+        # distinct_from_family, so the family that authored the plan does not
+        # mark its own homework (§M.3b). That constraint is the whole of what
+        # "GPT judges Claude's plan" was reaching for; hardcoding a provider
+        # was never the requirement, it was one deployment's way of meeting it.
         #
-        # Two dispatch paths:
-        #   • An OpenAI tier (deep/medium/mini/simple) keeps the historical DIRECT
-        #     OpenAI-gateway call — sending a Claude id (or None) 400s, and this is
-        #     also the intentional cross-FAMILY check (GPT judges Claude's plan).
-        #   • Anything else (a concrete model id of any provider, or a non-OpenAI
-        #     tier) routes through the general model router, so a harness with no
-        #     OpenAI (or no Anthropic) can still run the cross-validator. The router
-        #     resolves a concrete id via the admin provider registry.
-        from core.model_registry import openai_model_for_tier as _omft
-        _mv_hint = _sdlc_model("manifest_validate")
-        _mv_use_router = _mv_hint.strip().lower() not in {"deep", "medium", "mini", "simple"}
-        if _mv_use_router:
-            _mv_model = _mv_hint
-            _mv_fellback = False
-            _mv_source = "env-router"
-            logger.info(
-                "[MANIFEST-VALIDATE] judge model resolved (router)",
-                run_id=run_id, model=_mv_model, source=_mv_source,
-            )
-        else:
-            _mv_model, _mv_fellback = _omft(_mv_hint)
-            _mv_source = (
-                "fallback" if _mv_fellback
-                else ("env" if os.getenv("SDLC_MODEL_MANIFEST_VALIDATE") else "default")
-            )
-            if _mv_fellback:
-                logger.warning(
-                    "[MANIFEST-OPENAI] judge tier has no OpenAI model — using latest",
-                    run_id=run_id, requested_hint=_mv_hint, model=_mv_model,
-                )
-            logger.info(
-                "[MANIFEST-OPENAI] judge model resolved",
-                run_id=run_id, model=_mv_model, source=_mv_source,
-            )
+        # What this replaces: openai_model_for_tier(), which forced an OpenAI
+        # id whatever the tier said and fell back to OPENAI_LATEST_MODEL when
+        # the tier had no OpenAI equivalent — and a DIRECT gateway call that
+        # bypassed route() entirely, so the judge was the one SDLC model
+        # governance could not see.
+        _mv_route = _sdlc_model("manifest_validate")
+        _mv_author_family = (author_family or "").strip()
+        if _mv_author_family and "tier" in _mv_route:
+            _mv_route = {**_mv_route, "distinct_from_family": _mv_author_family}
+        from models.model_router import route_label as _route_label
+        _mv_model = _route_label(_mv_route)
+        logger.info(
+            "[MANIFEST-VALIDATE] judge resolved",
+            run_id=run_id, asked_for=_mv_model,
+            distinct_from_family=_mv_author_family or None,
+        )
         prompt_chars = len(cross_prompt)
         logger.info(
             f"[MANIFEST-OPENAI {run_id}] sending manifest model={_mv_model} prompt_chars={prompt_chars}"
@@ -394,33 +380,50 @@ def _phase_validate_manifest(run_id: str, jira_key: str, work_item_dict: dict,
         # with the model. On any call failure `raw` stays empty and the cross-check
         # SKIPs gracefully below (non-blocking gate).
         from models.model_router import model_router as _mr
-        # OpenAI gateway is only needed for the direct-OpenAI tier path.
-        _gw = None if _mv_use_router else _mr._get_openai()
 
         def _judge_call(_p: str) -> str:
-            """Call the judge once with the resolved model; account cost;
-            return raw text ('' on any failure — non-blocking)."""
+            """Call the judge once; account cost; return raw text.
+
+            Returns '' on any failure — this is a non-blocking gate and the
+            caller SKIPs gracefully when the verdict is missing.
+            """
+            _used = dict(_mv_route)
             try:
-                if _mv_use_router:
-                    # General router: resolves a concrete id via the provider
-                    # registry (any family). Returns a str, never raises.
-                    _r = _mr.generate(_p, model_hint=_mv_model) or ""
-                else:
-                    if _gw is None:
-                        logger.warning(f"[MANIFEST-OPENAI {run_id}] no OpenAI gateway available — cross-check skipped")
-                        return ""
-                    _r = _mr._collect(_gw.generate(_p, model=_mv_model)) or ""
+                _r = _mr.generate(_p, **_used) or ""
             except Exception as _ce:
-                logger.warning(f"[MANIFEST-VALIDATE {run_id}] cross-check call failed (non-fatal): {_ce}")
-                return ""
+                # N10-c. distinct_from_family is a HARD filter: on a
+                # single-family deployment there is no distinct candidate and
+                # the resolver raises. Warn and judge anyway — §J.2/R9 is
+                # "warn, do not block", because a single-provider estate is a
+                # legitimate deployment that must still be able to run SDLC.
+                if type(_ce).__name__ == "NoEligibleModel" and "distinct_from_family" in _used:
+                    logger.warning(
+                        "[MANIFEST-VALIDATE] no model in this tier is from a family other "
+                        "than the plan author's — the judge and the author share a family, "
+                        "so this cross-check is weaker than it looks",
+                        run_id=run_id, author_family=_mv_author_family,
+                    )
+                    _used.pop("distinct_from_family", None)
+                    try:
+                        _r = _mr.generate(_p, **_used) or ""
+                    except Exception as _ce2:
+                        logger.warning(f"[MANIFEST-VALIDATE {run_id}] cross-check call failed "
+                                       f"(non-fatal): {_ce2}")
+                        return ""
+                else:
+                    logger.warning(f"[MANIFEST-VALIDATE {run_id}] cross-check call failed "
+                                   f"(non-fatal): {_ce}")
+                    return ""
             # Best-effort cost/budget accounting (mirrors _llm's estimate) since this
-            # bypasses _llm. Cost tier tracks the ACTUAL model used — deep rate when the
-            # deep/fallback OpenAI model runs; the resolved hint/id otherwise (Step 1).
-            # tier_cost_per_1m handles a concrete id as well as a tier. Never fatal.
+            # bypasses _llm. Priced against the model that ACTUALLY ran (§N.1
+            # step 10, 10f) — before, it priced the requested tier WORD, which
+            # is why the SDLC budget and the SDLC audit trail disagreed whenever
+            # the router fell back. Never fatal.
             try:
                 from core.model_registry import tier_cost_per_1m as _tc
                 _ti, _to = len(_p) // 4, (len(_r) // 4 if _r else 0)
-                _ri, _ro = _tc(_mv_hint if _mv_use_router else ("deep" if _mv_fellback else _mv_hint))
+                from models.model_router import dispatched_model_id as _dmi
+                _ri, _ro = _tc(_dmi(_mr, _mv_model))
                 _mv_cost = (_ti / 1_000_000 * _ri) + (_to / 1_000_000 * _ro)
                 from services.sdlc_budget_tracker import record_llm_cost as _rec_cost
                 _rec_cost(_ti, _to, round(_mv_cost, 6), run_id=run_id)
@@ -1210,6 +1213,7 @@ def _run_plan_fix_round(run_id: str, workspace_root: str, repo_resolved: str,
     from agents.sdlc_cli_engine import run_cli, CliEngineConfig
     from agents.sdlc_cli_budget import remaining_budget, resolve_plan_turns, record_cli_usage
     from core.model_registry import cli_plan_model
+    from models.model_router import model_family as _model_family
     try:
         cfg = CliEngineConfig.from_env()
         issue = issue or {}
@@ -1331,6 +1335,7 @@ def _run_plan_phase(run_id: str, jira_key: str, repo_resolved: str, language: st
     )
     from agents.sdlc_cli_utils import _looks_truncated_json
     from core.model_registry import cli_plan_model
+    from models.model_router import model_family as _model_family
     from store.sdlc_artifacts import _store_artifact, compute_input_hash
 
     issue = issue or {}
@@ -1776,6 +1781,10 @@ def _run_plan_phase(run_id: str, jira_key: str, repo_resolved: str, language: st
         try:
             return _phase_validate_manifest(
                 run_id, jira_key, _wi, _plan_arg, _plan_arg, workspace_root,
+                # §N.1 step 10 / §M.3b. The judge must not be from the family
+                # that WROTE this plan, and the only place that knows which
+                # family that was is here, where the plan model was resolved.
+                author_family=_model_family(cli_plan_model()),
             )
         except Exception as _mve:
             # Best-effort: a crashing cross-check must not silently pass — fail toward
@@ -2001,9 +2010,17 @@ def _run_review_phase(run_id: str, diff_text: str, plan: dict,
             '"notes": "..."}'
         )
 
-        # 2. ONE in-process platform call — Opus (honors ENABLE_OPUS→Sonnet via the
-        #    code_review stage tier). This is the platform reviewer, NOT the CLI.
-        _review_model = _sdlc_model("code_review")
+        # 2. ONE in-process platform call. This is the platform reviewer, NOT
+        #    the CLI. §N.1 step 10: it asks for the `complex` tier PREFERRING a
+        #    candidate the administrator tagged role='review' — §M.3a makes
+        #    "a stronger model reviews" a role within the tier rather than a
+        #    tier of its own, which is what the old `solution` hint was. A
+        #    preference, not a filter, so a deployment with one capable model
+        #    still runs the gate with author and reviewer coinciding — visible
+        #    on the admin screen rather than a failed stage.
+        from models.model_router import route_label as _route_label
+        _review_route = _sdlc_model("code_review")
+        _review_model = _route_label(_review_route)
         # ── FULL PROMPT DUMP (no stripping / no truncation) — for diagnosing why the
         #    diff review approves/blocks. Delimited so it is easy to extract from logs.
         logger.info(
@@ -2012,7 +2029,7 @@ def _run_review_phase(run_id: str, diff_text: str, plan: dict,
             f"{review_prompt}\n"
             f"[REVIEW {run_id}] ===== FULL DIFF-REVIEW PROMPT END ====="
         )
-        raw = _llm(review_prompt, hint=_review_model, agent_id="sdlc-diff-reviewer")
+        raw = _llm(review_prompt, hint=_review_route, agent_id="sdlc-diff-reviewer")
         # ── FULL RESPONSE DUMP (no stripping / no truncation) ──
         logger.info(
             f"[REVIEW {run_id}] ===== FULL DIFF-REVIEW RESPONSE BEGIN "

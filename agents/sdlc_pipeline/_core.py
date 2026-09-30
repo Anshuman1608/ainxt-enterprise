@@ -332,12 +332,26 @@ from store.sdlc_store import (
 
 # ── Model router shortcut ─────────────────────────────────────
 
-def _llm(prompt: str, hint: str = "solution", agent_id: str = None) -> str:
+def _llm(prompt: str, hint=None, agent_id: str = None) -> str:
     """
-    SDLC model policy: Claude Opus 4.7 primary, GPT-5.4 fallback.
-    NO local models (Ollama) ever — always routes to solution tier
-    (Opus 4.7 when ENABLE_OPUS=true) and falls back to GPT-5.4 (medium tier).
-    Circuit breaker wraps both providers to prevent cascade failures.
+    SDLC model policy: the `complex` tier primary, the `medium` tier as a
+    cross-provider second attempt. Circuit breaker wraps both to prevent
+    cascade failures.
+
+    `hint` is what the CALLER wants this particular call to be. It takes three
+    shapes and §N.1 step 10 added the first two:
+
+      None        the default — Tier.COMPLEX, the capability every SDLC stage
+                  that reaches here needs. Was the string "solution", which
+                  under governance resolved to `complex` PREFERRING the
+                  review-role model; so until now EVERY hintless SDLC call was
+                  competing for the reviewer. Only the two review gates ask for
+                  that role now (D43). This is a real behaviour change and the
+                  intended one: a synthesis should not consume the reviewer.
+      a dict      routing kwargs from sdlc_stage_route(), splatted through.
+      a string    a legacy hint or a concrete model id, passed to the router
+                  verbatim. Kept because SDLC_MODEL_<STAGE> may still name a
+                  raw model id (§I defers restricting that to Phase 8).
 
     Prompt size policy (changed from earlier silent-truncation):
       • No truncation by default. The full prompt is sent to the model. If
@@ -381,30 +395,39 @@ def _llm(prompt: str, hint: str = "solution", agent_id: str = None) -> str:
         from core.context_compressor import compact_prompt
         prompt = compact_prompt(prompt, _F4_CEILING)
 
-    from models.model_router import model_router
+    from models.model_router import (
+        model_router, sdlc_llm_route, tier_request as _tier_request,
+        route_label as _route_label, dispatched_model_id as _dispatched_model_id,
+    )
+    from core.tiers import Tier as _Tier
     from core.circuit_breaker import get_breaker
-    # Primary tier is the caller's hint (default "solution"). This lets each stage
-    # pick its model — pass a stage-resolved hint, e.g. _sdlc_model("noncode").
-    # GPT-5.4 (medium) remains the cross-provider fallback.
-    _model_used = hint or "solution"
+    # §N.1 step 10. The primary is the caller's stage tier (default COMPLEX);
+    # the second attempt is the `medium` tier. The second attempt is KEPT and
+    # not replaced by the resolver's own candidate list: the resolver walks
+    # the ladder when a tier has nothing ELIGIBLE, not when a call FAILS, so
+    # deleting this would remove the only cross-tier retry SDLC has.
+    _route = sdlc_llm_route(hint)
+    _model_used = _route_label(_route)
     try:
         result = get_breaker("claude").call(
-            lambda: model_router.generate(prompt, model_hint=_model_used)
-        )  # primary tier = caller hint (solution/Opus by default)
+            lambda: model_router.generate(prompt, **_route)
+        )
         if not result or not result.strip():
-            raise ValueError("empty response from Claude")
+            raise ValueError("empty response from the primary tier")
     except Exception as _ce:
-        logger.warning(f"[SDLC] Claude unavailable ({_ce}) — falling back to GPT-5.4 (medium)")
+        logger.warning(f"[SDLC] primary {_model_used!r} unavailable ({_ce}) — "
+                       f"falling back to the 'medium' tier")
+        _fb = _tier_request(_Tier.MEDIUM, "medium")
         try:
             result = get_breaker("openai").call(
-                lambda: model_router.generate(prompt, model_hint="medium")
-            )  # GPT-5.4
+                lambda: model_router.generate(prompt, **_fb)
+            )
             if not result or not result.strip():
-                raise ValueError("GPT-5.4 returned empty response")
+                raise ValueError("the 'medium' tier returned an empty response")
         except Exception as _gpt_e:
-            logger.error(f"[SDLC] _llm: both Claude and GPT-5.4 failed ({_gpt_e}) — returning error sentinel")
+            logger.error(f"[SDLC] _llm: both tiers failed ({_gpt_e}) — returning error sentinel")
             result = '{"error": "Both LLM providers failed or returned empty"}'
-        _model_used = "medium"
+        _model_used = _route_label(_fb)
     # W-I-emit (G3): surface any model-router fallback that just happened.
     # model_router.last_decision reflects the LAST generate() call above (the
     # router's own internal primary→fallback swap, e.g. Opus unavailable →
@@ -417,11 +440,18 @@ def _llm(prompt: str, hint: str = "solution", agent_id: str = None) -> str:
     from core.model_registry import tier_cost_per_1m
     _tokens_in  = len(prompt) // 4
     _tokens_out = len(result) // 4 if result else 0
-    _rate_in, _rate_out = tier_cost_per_1m(_model_used)
+    # §N.1 step 10 (10f). The model that ACTUALLY ran, not the word we asked
+    # with. Every SDLC model_usages row written before this said "solution" or
+    # "medium" — a tier name in a model column, joinable to nothing, and after
+    # the migration it would have been a Tier enum. last_model_id is
+    # thread-local and set by the dispatcher, and is already what the chat
+    # paths write. tier_cost_per_1m prices a concrete id as happily as a hint.
+    _model_ran = _dispatched_model_id(model_router, _model_used)
+    _rate_in, _rate_out = tier_cost_per_1m(_model_ran)
     _cost = (_tokens_in / 1_000_000 * _rate_in) + (_tokens_out / 1_000_000 * _rate_out)
     logger.info(
-        f"[SDLC] _llm model={_model_used} tokens_in~{_tokens_in} tokens_out~{_tokens_out} "
-        f"cost~${_cost:.4f}"
+        f"[SDLC] _llm requested={_model_used} model={_model_ran} "
+        f"tokens_in~{_tokens_in} tokens_out~{_tokens_out} cost~${_cost:.4f}"
     )
     try:
         from memory.postgres_memory import PostgresMemory as _PM
@@ -430,7 +460,7 @@ def _llm(prompt: str, hint: str = "solution", agent_id: str = None) -> str:
             user_id="sdlc",
             agent_id=agent_id or "sdlc-pipeline",
             endpoint="/sdlc/pipeline",
-            model=_model_used,
+            model=_model_ran,
             tokens_in=_tokens_in,
             tokens_out=_tokens_out,
             cost_usd=round(_cost, 6),
@@ -445,15 +475,19 @@ def _llm(prompt: str, hint: str = "solution", agent_id: str = None) -> str:
     return result
 
 
-def _sdlc_model(tier: str) -> str:
+def _sdlc_model(stage: str) -> dict:
+    """Routing kwargs for an SDLC stage. Delegates to the canonical resolver
+    (models.model_router.sdlc_stage_route), whose table is
+    core.model_registry.SDLC_STAGE_TIERS.
+
+    Returns a DICT to splat, not a hint string: §N.1 step 10 replaced "which
+    .env constant" with "which tier, plus any §M constraint the stage needs",
+    and a constraint cannot be expressed as a string. Callers splat it —
+    `_llm(prompt, hint=_sdlc_model("code_review"))` or
+    `generate(prompt, **_sdlc_model(...))`.
     """
-    Returns the model router hint for a task tier/stage. Delegates to the canonical
-    per-stage resolver (core.model_registry.sdlc_stage_hint): defaults live in code,
-    each stage is overridable via SDLC_MODEL_<STAGE>, and solution→complex when
-    ENABLE_OPUS=false. Known tiers: synthesis | exploration | noncode | classify.
-    """
-    from core.model_registry import sdlc_stage_hint
-    return sdlc_stage_hint(tier, default="complex")
+    from models.model_router import sdlc_stage_route
+    return sdlc_stage_route(stage)
 
 
 _SDLC_AGENT_TIMEOUT = 600  # 10 minutes — SDLC steps run multi-file LLM loops
@@ -1807,7 +1841,8 @@ def _phase_normalize_ticket(run_id: str, jira_key: str, issue: dict,
 
 def _phase_validate_manifest(run_id: str, jira_key: str, work_item_dict: dict,
                               design: dict, analysis: dict,
-                              workspace_root: str = "") -> tuple:
+                              workspace_root: str = "",
+                              author_family: str = "") -> tuple:
     """MANIFEST_VALIDATION stage — structural + OpenAI cross-check of the change manifest.
 
     Returns (passed: bool, issues: list[str]).
@@ -1999,26 +2034,20 @@ def _phase_validate_manifest(run_id: str, jira_key: str, work_item_dict: dict,
             f'{{ "valid": true/false, "missing_components": [], '
             f'"out_of_scope_violations": [], "issues": [] }}'
         )
-        # Step 1: resolve the judge model through config. _sdlc_model returns the
-        # TIER (default "deep" → gpt-5.5, env-overridable via SDLC_MODEL_MANIFEST_VALIDATE);
-        # openai_model_for_tier maps it to a CONCRETE OpenAI model id. This validator
-        # calls the OpenAI gateway directly, so a Claude tier must fall back to the
-        # latest OpenAI model — sending a Claude id (or None) 400s.
-        from core.model_registry import openai_model_for_tier as _omft
-        _mv_hint = _sdlc_model("manifest_validate")
-        _mv_model, _mv_fellback = _omft(_mv_hint)
-        _mv_source = (
-            "fallback" if _mv_fellback
-            else ("env" if os.getenv("SDLC_MODEL_MANIFEST_VALIDATE") else "default")
-        )
-        if _mv_fellback:
-            logger.warning(
-                "[MANIFEST-OPENAI] judge tier has no OpenAI model — using latest",
-                run_id=run_id, requested_hint=_mv_hint, model=_mv_model,
-            )
+        # §N.1 step 10 — kept byte-for-byte in step with the copy in
+        # agents/sdlc_pipeline/_phases.py (D49). See that one for the full
+        # reasoning: `complex` tier, distinct_from_family so the plan's author
+        # does not mark its own homework, and no direct-OpenAI branch.
+        _mv_route = _sdlc_model("manifest_validate")
+        _mv_author_family = (author_family or "").strip()
+        if _mv_author_family and "tier" in _mv_route:
+            _mv_route = {**_mv_route, "distinct_from_family": _mv_author_family}
+        from models.model_router import route_label as _route_label
+        _mv_model = _route_label(_mv_route)
         logger.info(
-            "[MANIFEST-OPENAI] judge model resolved",
-            run_id=run_id, model=_mv_model, source=_mv_source,
+            "[MANIFEST-VALIDATE] judge resolved",
+            run_id=run_id, asked_for=_mv_model,
+            distinct_from_family=_mv_author_family or None,
         )
         prompt_chars = len(cross_prompt)
         logger.info(
@@ -2039,26 +2068,40 @@ def _phase_validate_manifest(run_id: str, jira_key: str, work_item_dict: dict,
         # with the model. On any call failure `raw` stays empty and the cross-check
         # SKIPs gracefully below (non-blocking gate).
         from models.model_router import model_router as _mr
-        _gw = _mr._get_openai()
 
         def _judge_call(_p: str) -> str:
-            """Call the OpenAI judge once with the resolved model; account cost;
-            return raw text ('' on any failure — non-blocking)."""
-            if _gw is None:
-                logger.warning(f"[MANIFEST-OPENAI {run_id}] no OpenAI gateway available — cross-check skipped")
-                return ""
+            """Call the judge once; account cost; return raw text ('' on failure)."""
+            _used = dict(_mv_route)
             try:
-                _r = _mr._collect(_gw.generate(_p, model=_mv_model)) or ""
+                _r = _mr.generate(_p, **_used) or ""
             except Exception as _ce:
-                logger.warning(f"[MANIFEST-OPENAI {run_id}] cross-check call failed (non-fatal): {_ce}")
-                return ""
-            # Best-effort cost/budget accounting (mirrors _llm's estimate) since this
-            # bypasses _llm. Cost tier tracks the ACTUAL model used — deep rate when the
-            # deep/fallback model runs (Step 1). Never fatal.
+                # N10-c — see the _phases.py twin.
+                if type(_ce).__name__ == "NoEligibleModel" and "distinct_from_family" in _used:
+                    logger.warning(
+                        "[MANIFEST-VALIDATE] no model in this tier is from a family other "
+                        "than the plan author's — the judge and the author share a family, "
+                        "so this cross-check is weaker than it looks",
+                        run_id=run_id, author_family=_mv_author_family,
+                    )
+                    _used.pop("distinct_from_family", None)
+                    try:
+                        _r = _mr.generate(_p, **_used) or ""
+                    except Exception as _ce2:
+                        logger.warning(f"[MANIFEST-VALIDATE {run_id}] cross-check call failed "
+                                       f"(non-fatal): {_ce2}")
+                        return ""
+                else:
+                    logger.warning(f"[MANIFEST-VALIDATE {run_id}] cross-check call failed "
+                                   f"(non-fatal): {_ce}")
+                    return ""
+            # Best-effort cost/budget accounting (mirrors _llm's estimate) since
+            # this bypasses _llm. Priced against the model that ACTUALLY ran
+            # (§N.1 step 10, 10f). Never fatal.
             try:
                 from core.model_registry import tier_cost_per_1m as _tc
                 _ti, _to = len(_p) // 4, (len(_r) // 4 if _r else 0)
-                _ri, _ro = _tc("deep" if _mv_fellback else _mv_hint)
+                from models.model_router import dispatched_model_id as _dmi
+                _ri, _ro = _tc(_dmi(_mr, _mv_model))
                 _mv_cost = (_ti / 1_000_000 * _ri) + (_to / 1_000_000 * _ro)
                 from services.sdlc_budget_tracker import record_llm_cost as _rec_cost
                 _rec_cost(_ti, _to, round(_mv_cost, 6), run_id=run_id)
@@ -2821,7 +2864,7 @@ def _run_plan_fix_round(run_id: str, workspace_root: str, repo_resolved: str,
     missing component (or ruled_out it) and drop/justify each out-of-scope file."""
     from agents.sdlc_cli_engine import run_cli, CliEngineConfig
     from agents.sdlc_cli_budget import remaining_budget, resolve_plan_turns, record_cli_usage
-    from core.model_registry import cli_model_for
+    from core.model_registry import cli_coder_model, cli_plan_model
     try:
         cfg = CliEngineConfig.from_env()
         issue = issue or {}
@@ -2897,7 +2940,7 @@ def _run_plan_fix_round(run_id: str, workspace_root: str, repo_resolved: str,
             fix_prompt = fix_prompt + _gov_pointer(_gov_block)
         result = run_cli(
             config=cfg, workspace_root=workspace_root, prompt=fix_prompt,
-            profile="plan", model=cli_model_for("plan"), output_schema=PLAN_SCHEMA,
+            profile="plan", model=cli_plan_model(), output_schema=PLAN_SCHEMA,
             max_turns=max_turns, run_id=run_id, resume_session_id=session_id or "",
             transient_retries=2,   # read-only PLAN-fix: safe to re-spawn on a proxy 502
         )
@@ -2942,7 +2985,7 @@ def _run_plan_phase(run_id: str, jira_key: str, repo_resolved: str, language: st
         resolve_plan_turns,
     )
     from agents.sdlc_agent_loop import _looks_truncated_json
-    from core.model_registry import cli_model_for
+    from core.model_registry import cli_coder_model, cli_plan_model
     from store.sdlc_artifacts import _store_artifact, compute_input_hash
 
     issue = issue or {}
@@ -3160,7 +3203,7 @@ def _run_plan_phase(run_id: str, jira_key: str, repo_resolved: str, language: st
         workspace_root=workspace_root,
         prompt=prompt,
         profile="plan",
-        model=cli_model_for("plan"),
+        model=cli_plan_model(),
         output_schema=PLAN_SCHEMA,
         max_turns=max_turns,
         run_id=run_id,
@@ -3374,8 +3417,12 @@ def _run_plan_phase(run_id: str, jira_key: str, repo_resolved: str, language: st
     def _run_manifest_gate(_plan_arg):
         _wi = (get_run(run_id) or {}).get("context", {}).get("work_item") or {}
         try:
+            from core.model_registry import cli_plan_model
+            from models.model_router import model_family as _model_family
             return _phase_validate_manifest(
                 run_id, jira_key, _wi, _plan_arg, _plan_arg, workspace_root,
+                # §N.1 step 10 / §M.3b — see the _phases.py twin (D49).
+                author_family=_model_family(cli_plan_model()),
             )
         except Exception as _mve:
             # Best-effort: a crashing cross-check must not silently pass — fail toward
@@ -4381,7 +4428,11 @@ Output to review:
 {_safe_view(output)}"""
         # Use Sonnet (complex tier) for format correction — this is JSON extraction,
         # not reasoning. Opus is not needed here and iter 2 is almost always trivial.
-        result = _llm(review_prompt, hint="complex")
+        # §N.1 step 10. A self-repair loop over this function's own output —
+        # deep reasoning, not the review GATE, so it takes the tier plain (D43).
+        from core.tiers import Tier as _Tier
+        from models.model_router import tier_request as _tier_request
+        result = _llm(review_prompt, hint=_tier_request(_Tier.COMPLEX, "complex"))
         # Strip fences from the reviewer's response before any evaluation
         result = _strip_llm_json_fences(result) if result else result
         _is_approved = bool(result and result.strip().upper().startswith("APPROVED"))
@@ -9028,8 +9079,9 @@ def _detect_merge_conflict(repo_url: str, branch: str, base_branch: str = "main"
 
 
 def _generate_conflict_resolution(conflict_context: str) -> str:
-    """Use Claude to propose merge conflict resolution steps."""
-    from models.model_router import model_router
+    """Propose merge conflict resolution steps on the `complex` tier."""
+    from models.model_router import model_router, tier_request as _tier_request
+    from core.tiers import Tier as _Tier
     from core.circuit_breaker import get_breaker
     prompt = (
         "You are a senior engineer. Propose step-by-step merge conflict resolution for:\n\n"
@@ -9042,15 +9094,21 @@ def _generate_conflict_resolution(conflict_context: str) -> str:
     )
     system = "You are an expert at resolving Git merge conflicts."
     try:
+        # §N.1 step 10. Proposing a merge-conflict resolution is deep reasoning
+        # over code — §D.2 `complex`. It is not a review gate, so no role (D43).
         result = get_breaker("claude").call(
-            lambda: model_router.generate(prompt, model_hint="solution", system_prompt=system)
+            lambda: model_router.generate(
+                prompt, system_prompt=system,
+                **_tier_request(_Tier.COMPLEX, "solution"))
         )
         if result and result.strip():
             return result
-        raise ValueError("empty response from Claude")
+        raise ValueError("empty response from the primary tier")
     except Exception as _ce:
-        logger.warning(f"[SDLC] Claude conflict resolution unavailable ({_ce}) — falling back to GPT-5.2")
-        return model_router.generate(prompt, model_hint="medium", system_prompt=system)
+        logger.warning(f"[SDLC] conflict resolution unavailable on the primary tier "
+                       f"({_ce}) — falling back to the 'medium' tier")
+        return model_router.generate(prompt, system_prompt=system,
+                                     **_tier_request(_Tier.MEDIUM, "medium"))
 
 
 
@@ -9923,10 +9981,10 @@ def trigger_domain_fix(run_id: str, domain: str, actor: str,
 
         # ── 5. run CLI fixer (profile="code") ──────────────────────────────────
         from agents.sdlc_cli_engine import run_cli, CliEngineConfig
-        from core.model_registry import cli_model_for
+        from core.model_registry import cli_coder_model, cli_plan_model
         fix_result = run_cli(
             config=CliEngineConfig.from_env(), workspace_root=workspace,
-            prompt=fix_prompt, profile="code", model=cli_model_for("coder"),
+            prompt=fix_prompt, profile="code", model=cli_coder_model(),
             max_turns=60, run_id=run_id,
         )
         if fix_result.status == "suspended":

@@ -1152,6 +1152,125 @@ def chat_complexity_route(complexity: Optional[str]) -> dict:
     return tier_request(tier, key)
 
 
+def sdlc_stage_route(stage: str) -> dict:
+    """Routing kwargs for an SDLC stage (§N.1 step 10).
+
+    The in-process twin of core.model_registry.cli_tier_model_id(), and the
+    sibling of chat_complexity_route() above: one place where a stage name
+    becomes a tier request, rather than one per call site. That is not
+    tidiness — the pre-migration code had the SAME stage resolved through two
+    different tables in _core.py and _phases.py, and they had diverged.
+
+    The stage table lives in core.model_registry because the CLI resolver
+    needs it too and that module is importable without pulling in the router.
+
+    Returns `{"tier": …, "legacy_hint": …}` plus any §M constraints the stage
+    declares — today only `require_role` on the review gate. An unknown stage
+    is NOT a tier request: it returns the empty hint, which route() reads as
+    "classify this prompt yourself". That matches what sdlc_stage_hint's
+    `default="complex"` was reaching for without pretending an unregistered
+    stage has a governed answer.
+    """
+    from core.model_registry import SDLC_STAGE_TIERS
+
+    entry = SDLC_STAGE_TIERS.get((stage or "").strip().lower())
+    if entry is None:
+        logger.warning(
+            "sdlc_stage_route(%r): no such SDLC stage — routing unhinted. The "
+            "stage table is core.model_registry.SDLC_STAGE_TIERS.", stage)
+        return {"model_hint": ""}
+
+    tier, legacy_hint, extra = entry
+    # SDLC_MODEL_<STAGE> survives as a DEPRECATED per-stage pin (§I, Phase 8),
+    # applied through tier_request's override so it warns once per variable
+    # per process exactly like CIL_INTENT_MODEL and DOC_INTENT_MODEL do.
+    override_name = f"SDLC_MODEL_{stage.strip().upper()}"
+    route = tier_request(tier, legacy_hint, os.getenv(override_name, ""),
+                         override_name=override_name)
+    # An override won: it is a bare hint, and a §M constraint on top of an
+    # explicitly named model would be answering a question the operator did
+    # not ask.
+    if "tier" not in route:
+        return route
+    return {**route, **extra}
+
+
+def sdlc_llm_route(hint=None) -> dict:
+    """Normalise the three shapes SDLC's `_llm(prompt, hint=…)` accepts.
+
+    `_llm` exists twice — agents/sdlc_pipeline/_core.py and
+    agents/sdlc_state_machine.py — and before §N.1 step 10 the two disagreed
+    about their own default (`"solution"` in one, `"complex"` reaching the
+    other through `_llm_traced`). One helper so they cannot drift again.
+
+      dict  → routing kwargs from sdlc_stage_route(); used as-is.
+      str   → a legacy hint or a concrete model id; route() decides which.
+              SDLC_MODEL_<STAGE> can still name a raw id (§I, Phase 8).
+      None  → Tier.COMPLEX. The legacy hint is "solution" so flag-off is
+              byte-identical, but note what that means flag-ON: "solution"
+              carries require_role="review" through _LEGACY_TO_GOVERNED, and
+              this does NOT. That is deliberate (D43) — the review role now
+              belongs to the two review gates, not to every hintless call.
+    """
+    if isinstance(hint, dict):
+        return dict(hint)
+    if hint:
+        return {"model_hint": hint}
+    return tier_request(Tier.COMPLEX, "solution")
+
+
+def route_label(route: dict) -> str:
+    """A short human name for what a route ASKED for — logs, not audit rows.
+
+    `tier=Tier.COMPLEX` reads as "complex"; a bare hint reads as itself. Used
+    where the old SDLC code logged its hint string, so the log line keeps
+    saying something a reader recognises after the hint is gone.
+    """
+    tier = (route or {}).get("tier")
+    if tier is not None:
+        return getattr(tier, "value", str(tier))
+    return str((route or {}).get("model_hint") or "auto")
+
+
+def dispatched_model_id(router, fallback: str = "") -> str:
+    """The concrete model id the LAST dispatch on this thread used.
+
+    For audit rows (§L.5) and cost, which must name the model that RAN — not
+    the tier that was requested. `router.last_model_id` is thread-local and
+    set by the dispatcher; "auto" is its never-called sentinel, so that and a
+    blank both mean "we do not actually know" and yield the caller's fallback
+    rather than a confident wrong answer.
+    """
+    try:
+        mid = (router.last_model_id or "").strip()
+    except Exception:  # noqa: BLE001 — an audit row must never fail a run
+        return fallback
+    return mid if mid and mid.lower() not in ("auto", "unknown") else fallback
+
+
+def model_family(model_id: Optional[str]) -> str:
+    """The registry family of a concrete model id, or "" if it is unknown.
+
+    The input to `distinct_from_family` (§M.3b), which is a relational
+    constraint: "not whoever wrote the thing being judged". A caller that
+    knows the AUTHOR's model id can turn it into the family the resolver
+    compares against without learning the registry's schema.
+
+    Returns "" rather than guessing, and the caller then omits the constraint
+    — an unknown author is not grounds for refusing to review.
+    """
+    mid = (model_id or "").strip()
+    if not mid:
+        return ""
+    try:
+        from core.llm_provider_registry import get_model as _get_registry_model
+        row = _get_registry_model(mid)
+        return (row or {}).get("family") or ""
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("model_family(%r): registry unavailable (%s)", mid, exc)
+        return ""
+
+
 def fully_blocked_candidates(tier, acl_filter: Optional[AclFilter]) -> Optional[List[str]]:
     """The tier's candidate ids when the ACL denies ALL of them, else None.
 
@@ -2765,6 +2884,7 @@ class ModelRouter:
               legacy_hint: Optional[str] = None,
               no_cloud_egress: bool = False,
               distinct_from_family: Optional[str] = None,
+              require_role: Optional[str] = None,
               budget_state: Optional[str] = None,
               needs_tools: bool = False,
               needs_streaming: bool = False,
@@ -2804,6 +2924,18 @@ class ModelRouter:
             cross-model-review site and the budget governors connect them in
             Phase 6. They exist now so that wiring is a one-line change at the
             call site rather than a signature change here.
+            distinct_from_family is connected by §N.1 step 10: the SDLC
+            manifest judge asks not to be the family that authored the plan
+            it is judging (§M.3b).
+
+        require_role: OPTIONAL (§N.1 step 10, §M.3a) a PREFERENCE for a
+            candidate the administrator tagged with this role — in practice
+            "review". Added because it was previously reachable only through
+            the legacy `solution` hint, via _LEGACY_TO_GOVERNED's `extra`: a
+            call that said `tier=Tier.COMPLEX` got `extra={}` and so could
+            never express "this is a review gate". A preference and not a
+            filter, so a single-model deployment still runs the gate with
+            author and reviewer coinciding (see tier_resolver._survivors).
 
         acl_filter: OPTIONAL (§N.1 step 9) the user's access-control list, as
             a callable taking model ids and returning the permitted subset —
@@ -2844,6 +2976,12 @@ class ModelRouter:
             "no_cloud_egress": _no_cloud,
             "min_context_window": _min_window,
             "distinct_from_family": distinct_from_family,
+            # §M.3a — a preference, resolved in tier_resolver._survivors. When
+            # the caller came in on the legacy "solution" hint,
+            # _LEGACY_TO_GOVERNED's `extra` carries the same key and WINS
+            # (Constraints(**{**constraints_kw, **extra}) below), so the
+            # flag-off shape of that hint is unchanged by this parameter.
+            "require_role": require_role,
             "budget_state": budget_state,
             "needs_tools": needs_tools,
             "needs_streaming": needs_streaming,
@@ -3948,9 +4086,18 @@ class ModelRouter:
                  *, tier: Optional[Tier] = None,
                  legacy_hint: Optional[str] = None,
                  no_cloud_egress: bool = False,
+                 distinct_from_family: Optional[str] = None,
+                 require_role: Optional[str] = None,
                  acl_filter: Optional[AclFilter] = None):
         """Route prompt to the correct gateway. Never raises — returns error str on failure.
         prompt: str OR list[dict] (multi-turn messages array).
+
+        distinct_from_family / require_role:
+            §M constraints, forwarded to route(). Accepted here as of §N.1
+            step 10 — route() has taken distinct_from_family since Phase 5 but
+            generate() never passed it on, so the only caller that needs it
+            (the SDLC manifest judge) had no way to reach it without calling
+            route() itself.
 
         tier:
             OPTIONAL approved application tier (core.tiers.Tier), mutually
@@ -3980,6 +4127,8 @@ class ModelRouter:
                                   tier=tier, legacy_hint=legacy_hint,
                                   no_cloud_egress=no_cloud_egress,
                                   data_classification=data_classification,
+                                  distinct_from_family=distinct_from_family,
+                                  require_role=require_role,
                                   acl_filter=acl_filter)
         except Exception as exc:
             # Only reachable under no_cloud_egress, which is the one constraint
@@ -4070,11 +4219,14 @@ class ModelRouter:
             tier: Optional[Tier] = None,
             legacy_hint: Optional[str] = None,
             no_cloud_egress: bool = False,
+            distinct_from_family: Optional[str] = None,
+            require_role: Optional[str] = None,
             acl_filter: Optional[AclFilter] = None,
     ):
         """Route prompt and yield tokens directly (true token streaming).
         prompt: str OR list[dict] (multi-turn messages array).
         tier: OPTIONAL approved application tier — see generate().
+        distinct_from_family / require_role: §M constraints — see generate().
 
         precleared / precleared_findings:
             Forwarded to the OpenAI / Gemini / proxy gateways so that callers
@@ -4127,6 +4279,8 @@ class ModelRouter:
             decision = self.route(prompt, model_hint=None if tier is not None else model_hint,
                                   tier=tier, legacy_hint=legacy_hint,
                                   no_cloud_egress=no_cloud_egress, needs_streaming=True,
+                                  distinct_from_family=distinct_from_family,
+                                  require_role=require_role,
                                   acl_filter=acl_filter)
         except Exception as exc:
             if type(exc).__name__ != "NoEligibleModel":

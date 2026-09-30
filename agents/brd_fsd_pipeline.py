@@ -99,7 +99,12 @@ def _generate_fsd(epic_key: str, epic_summary: str, brd_sections: dict) -> str:
     Returns the FSD as a markdown string.
     """
     from gateway_claude import claude_gateway
-    from core.model_registry import cli_model_for_tier
+    # §N.1 step 10. The dispatch stays on claude_gateway — it streams tokens and
+    # model_router.stream() is a different contract — but the MODEL now comes
+    # from the administrator's `complex` assignment instead of an .env constant.
+    # Long structured document generation is §D.2 `complex`.
+    from core.model_registry import cli_tier_model_id
+    from core.tiers import Tier
 
     brd_text = _format_brd_for_prompt(brd_sections)
 
@@ -143,7 +148,7 @@ def _generate_fsd(epic_key: str, epic_summary: str, brd_sections: dict) -> str:
     try:
         for token in claude_gateway.generate(
             prompt=prompt,
-            model=cli_model_for_tier("complex"),
+            model=cli_tier_model_id(Tier.COMPLEX, "complex"),
             temperature=0,
             max_tokens=8000,
             stream=True,

@@ -145,6 +145,39 @@ MIGRATED: list[tuple[Tier, str, str]] = [
      "gateway.py:3672 follow-up suggestions; routers/chat_router.py:2347 "
      "chat title"),
     (Tier.MINI,    "mini",    "gateway.py:3346 prompt enhancement (ENHANCE_MODEL_HINT)"),
+
+    # ── step 10: the SDLC pipeline
+    # Two pairs are new here, and both are ones no earlier step could have
+    # produced: "solution" and "deep" are the last two legacy aliases that
+    # mean COMPLEX, and SDLC was their only remaining caller.
+    #
+    # (COMPLEX, "solution") is the row to read carefully. Flag-OFF it is
+    # byte-identical, which is what this file asserts. Flag-ON it is NOT the
+    # same as before: _LEGACY_TO_GOVERNED maps the "solution" STRING to
+    # (COMPLEX, require_role="review"), and asking for the tier directly does
+    # not carry the role (D43). That is the intended narrowing — the reviewer
+    # belongs to the two review gates, not to every hintless SDLC call — and
+    # the limit of what a parity row can tell you about it is exactly the
+    # limit step 9's `simple` row had.
+    (Tier.COMPLEX, "solution",
+     "agents/sdlc_pipeline/_core.py + agents/sdlc_state_machine.py _llm() "
+     "default; agents/sdlc_context.py:363 exploration synthesis; "
+     "agents/react_engine.py synthesis_route; the code_review gate"),
+    # "deep" existed only to be the context-promotion target (§M.2); the
+    # window is a constraint, so the tier is COMPLEX.
+    (Tier.COMPLEX, "deep",
+     "agents/sdlc_pipeline/_phases.py:353 + _core.py:2008 manifest judge"),
+    # Already proved above; the rows name the SDLC sites because this file's
+    # invariant is "every migrated call site's pair has a row that NAMES it".
+    (Tier.SIMPLE,  "haiku",
+     "SDLC locate (sdlc_patch_engine.py:641), normalize "
+     "(sdlc_normalizer.py:118), classify (cli_classify_model)"),
+    (Tier.COMPLEX, "complex",
+     "SDLC coder/plan/implement (the CLI spawns); sdlc_patch_engine.py:362; "
+     "_self_review; brd_fsd_pipeline.py:146; the governance scan + fixer"),
+    (Tier.MEDIUM,  "medium",
+     "both _llm() cross-provider second attempts (_core.py:400, "
+     "sdlc_state_machine.py:100) and _generate_conflict_resolution"),
 ]
 
 _IDS = [f"{t.value}<-{h}" for t, h, _ in MIGRATED]

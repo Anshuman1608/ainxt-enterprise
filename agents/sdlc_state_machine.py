@@ -76,36 +76,47 @@ _CODE_FIRST_LINE_RE = __import__("re").compile(
 
 # ── LLM shortcut ──────────────────────────────────────────────
 
-def _llm(prompt: str, hint: str = "solution") -> str:
+def _llm(prompt: str, hint=None) -> str:
     """
-    SDLC model shortcut. Routes to the caller's tier (the `hint`) — pass a
-    stage-resolved hint, e.g. sdlc_stage_hint("coder"). Default "solution"
-    (Opus 4.7 when ENABLE_OPUS=true, else Sonnet). Cross-provider fallback is
-    GPT-5.4 (medium tier), matching CLAUDE.md and sdlc_pipeline._llm. The hint
-    may legitimately be a local/text tier for mechanical stages.
+    SDLC model shortcut — the state machine's twin of sdlc_pipeline._llm, and
+    kept deliberately identical to it: same default, same second attempt, same
+    accounting. §N.1 step 10 moved both onto sdlc_llm_route() because they had
+    already drifted apart on their default once.
+
+    `hint` is None (the stage's tier — COMPLEX), a dict of routing kwargs from
+    sdlc_stage_route(), or a string (legacy hint / concrete model id). See
+    models.model_router.sdlc_llm_route for why None is no longer "solution",
+    and what that changes.
+
     Tracks tokens and cost for HOD budget deduction via sdlc_budget_tracker.
     """
-    from models.model_router import model_router
-    # Honor the caller's hint (R2 — previously this dead-ignored `hint` and
-    # forced every call onto the solution/Opus tier). GPT-5.4 (medium) fallback.
-    _model_used = hint or "solution"
+    from models.model_router import (
+        model_router, sdlc_llm_route, tier_request as _tier_request,
+        route_label as _route_label, dispatched_model_id as _dispatched_model_id,
+    )
+    from core.tiers import Tier as _Tier
+    _route = sdlc_llm_route(hint)
+    _model_used = _route_label(_route)
     try:
-        result = model_router.generate(prompt, model_hint=_model_used)
+        result = model_router.generate(prompt, **_route)
         if result and result.strip():
             pass
         else:
-            raise ValueError("empty response from Claude")
+            raise ValueError("empty response from the primary tier")
     except Exception as _claude_err:
-        logger.warning(f"[SDLC] primary tier '{_model_used}' unavailable ({_claude_err}) — falling back to GPT-5.4 (medium)")
-        result = model_router.generate(prompt, model_hint="medium")  # GPT-5.4
-        _model_used = "medium"
+        logger.warning(f"[SDLC] primary {_model_used!r} unavailable ({_claude_err}) — "
+                       f"falling back to the 'medium' tier")
+        _fb = _tier_request(_Tier.MEDIUM, "medium")
+        result = model_router.generate(prompt, **_fb)
+        _model_used = _route_label(_fb)
 
     # Token + cost (char/4 estimate, same as sdlc_pipeline._llm for HOD-rollup
     # consistency; rate from the single-source-of-truth helper — R3).
+    # Priced against the model that RAN, not the tier requested (10f).
     from core.model_registry import tier_cost_per_1m
     _tokens_in  = len(prompt) // 4
     _tokens_out = len(result) // 4 if result else 0
-    _rate_in, _rate_out = tier_cost_per_1m(_model_used)
+    _rate_in, _rate_out = tier_cost_per_1m(_dispatched_model_id(model_router, _model_used))
     _cost = (_tokens_in / 1_000_000 * _rate_in) + (_tokens_out / 1_000_000 * _rate_out)
     try:
         from agents.sdlc_pipeline import _cv_run_id as _sm_cv_run_id
@@ -1361,8 +1372,15 @@ class CodingStateMachine:
                 f"{self.working_branch!r}: {_e}"
             )
 
-    def _llm_traced(self, phase: str, prompt: str, hint: str = "complex") -> str:
-        """Call _llm() and record the prompt+output to the replay log for this run."""
+    def _llm_traced(self, phase: str, prompt: str, hint=None) -> str:
+        """Call _llm() and record the prompt+output to the replay log for this run.
+
+        The default was the string "complex" while _llm's own was "solution" —
+        two defaults for one call path, which is the drift §N.1 step 10's
+        shared sdlc_llm_route() removes. Both are None now, which means
+        Tier.COMPLEX: the same destination "complex" named, chosen by an
+        administrator rather than by an .env constant.
+        """
         result = _llm(prompt, hint)
         self._record_replay_entry(phase, prompt, result or "")
         return result

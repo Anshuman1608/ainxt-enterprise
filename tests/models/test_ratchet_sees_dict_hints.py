@@ -108,6 +108,42 @@ def test_a_quoted_hint_in_a_comment_or_docstring_is_not_flagged(rc, tmp_path, mo
                    'x = 1\n') == []
 
 
+def test_the_hint_keyword_form_is_flagged(rc, tmp_path, monkeypatch):
+    """§N.1 step 10 widened the check a second time, for the same class of
+    reason D33 existed: SDLC does not call the router from its stages, it
+    calls its own `_llm(prompt, hint="solution")` shortcut, and the scan read
+    `model_hint=` only. Pointing the ratchet at the largest module in the
+    migration while blind to the keyword that module actually uses would have
+    guarded nothing."""
+    out = _run_on(rc, tmp_path, monkeypatch, '_llm(p, hint="solution")\n')
+    assert len(out) == 1 and "'solution'" in out[0]
+    # …and the message names the keyword that was actually on the line, not
+    # model_hint. A reader sent looking for the wrong keyword is a reader who
+    # concludes the check is broken.
+    assert "hint='solution'" in out[0]
+
+
+def test_the_constructor_hint_forms_are_flagged(rc, tmp_path, monkeypatch):
+    """routers/threads_router.py sat on the migrated list for six steps while
+    passing synthesis_hint="solution" — the tier arrives on a CONSTRUCTOR,
+    under a third name."""
+    for kw in ("synthesis_hint", "iteration_hint"):
+        out = _run_on(rc, tmp_path, monkeypatch,
+                      f'ReactEngine(task=t, {kw}="complex")\n')
+        assert len(out) == 1 and "'complex'" in out[0], f"{kw} is not seen"
+
+
+def test_hint_is_only_read_on_a_ROUTING_entry_point(rc, tmp_path, monkeypatch):
+    """The reason widening to a name as generic as `hint` is safe. The scan is
+    gated on _ROUTER_ENTRY_POINTS, so an unrelated function that happens to
+    take a `hint=` keyword — a UI placeholder, a search hint, a type hint
+    helper — is not reported."""
+    assert _run_on(rc, tmp_path, monkeypatch,
+                   'show_tooltip(text, hint="simple")\n') == []
+    assert _run_on(rc, tmp_path, monkeypatch,
+                   'build_index(corpus, hint="complex")\n') == []
+
+
 def test_the_real_tree_is_clean(rc):
     """The ratchet must pass on the tree as it stands, or the widened check is
     reporting the migration rather than guarding it."""

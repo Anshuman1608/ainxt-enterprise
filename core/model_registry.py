@@ -374,81 +374,84 @@ def models_without_temperature() -> tuple[str, ...]:
     return _MODELS_WITHOUT_TEMPERATURE_DEFAULTS + extra
 
 
-# ---------------- SDLC PER-STAGE MODEL TIERS ----------------
+# ---------------- SDLC PER-STAGE CAPABILITY TIERS ----------------
 #
-# Each SDLC stage maps to a router hint ("haiku" | "medium" | "complex" | "solution").
-# Defaults below encode the recommended split: cheap models for mechanical work,
-# Opus only where deep reasoning matters. Override ANY stage at deploy time with
-#   SDLC_MODEL_<STAGE>=<hint>     e.g.  SDLC_MODEL_CODER=solution
-# without touching code. ENABLE_OPUS=false transparently downgrades solution→complex.
+# §N.1 step 10. Each SDLC stage names the CAPABILITY it needs; an administrator
+# decides which model serves that capability on Admin > Model Governance >
+# Tiers. What this table replaced — SDLC_STAGE_MODEL_DEFAULTS, a stage → router
+# hint map read through sdlc_stage_hint() — chose from .env instead, so the
+# admin screen had no effect on any SDLC stage.
 #
-# Stage guide (CLI-loop rework 2026-06-27 — Sonnet workhorse + 2 Opus gates):
-#   classify / locate      → haiku   (JSON classify, region picking — trivial)
-#   coder / fixer / noncode→ complex (Sonnet — surgical edits against visible code)
-#   analyze / design /
-#   synthesis              → complex (Sonnet WORKHORSE — pull-first loop emits JSON)
-#   solution_review        → solution (Opus PRE-code design-review GATE)
-#   code_review            → solution (Opus POST-code code-review GATE)
-#   cross_model_review     → medium  (GPT — deliberately a different model family)
+# Each entry is (Tier, legacy_hint, constraints).
+#
+#   Tier          what the stage needs, per plan.html §D.2. NOT derived from
+#                 which model happens to be assigned today: an assignment is
+#                 data an administrator edits, and a mapping derived from it
+#                 goes stale the first time they do.
+#   legacy_hint   the hint this stage passed BEFORE migration (D15). Used
+#                 verbatim whenever governance is off or the tier resolves to
+#                 nothing, so turning the flag off is provably a no-op. This is
+#                 why classify/locate/normalize carry "haiku" and not "simple":
+#                 D15 reproduces where a call site WENT, not the tier's name.
+#   constraints   §M constraints the stage — and only the stage — can know.
+#
+# WHY ONLY FIVE STAGES. The old table declared seventeen. Twelve of them had no
+# caller anywhere in the tree (analyze, design, synthesis, diagnose,
+# solution_review, cross_model_review, fixer, exploration, noncode, classify,
+# pre_coding_build) or reached only unreachable code (plan), so the matching
+# SDLC_MODEL_<STAGE> variables did nothing at all — an operator who set
+# SDLC_MODEL_DESIGN=solution believed they had changed something and had not.
+# SDLC_MIXED_MODEL_RUNBOOK.md had already started listing some of them as
+# "no-op vars". They are gone rather than carried forward, because a table the
+# migration exists to make honest should not keep advertising twelve knobs that
+# are not connected to anything. The CLI phases (classify/plan/implement) are
+# not absent from the pipeline — they resolve through cli_tier_model_id() and
+# SDLC_CLI_<PHASE>_MODEL below, which is a different mechanism.
+#
+# ENABLE_OPUS is no longer consulted here. It downgraded solution → complex so
+# callers "never need to special-case Opus availability"; both now resolve to
+# the same tier and the reviewer is a ROLE within it (§M.3a), so an absent
+# reviewer is answered by the resolver preferring the head of the tier instead.
+# ENABLE_OPUS still gates BLOCKED_MODELS above, which is where it belongs.
 
-_SDLC_STAGE_HINTS_ALLOWED = {"haiku", "medium", "complex", "solution", "deep"}
+def _sdlc_stage_tiers() -> dict:
+    """stage → (Tier, legacy_hint, constraints). Built lazily; see SDLC_STAGE_TIERS.
 
-SDLC_STAGE_MODEL_DEFAULTS: dict = {
-    "classify":           "haiku",
-    "locate":             "haiku",
-    "coder":              "complex",
-    "fixer":              "complex",
-    "noncode":            "complex",
-    "exploration":        "complex",
-    # CLI-loop rework (2026-06-27): analyze/design/synthesis are now the Sonnet
-    # WORKHORSE — a single pull-first explore loop gathers context and emits the
-    # JSON itself (no separate always-Opus synthesizer). Opus is reserved for the
-    # TWO review GATES only: solution_review (pre-code design review) and
-    # code_review (post-code review). This is the cost-cascade pattern (cheap
-    # workhorse + expensive eval gates). ENABLE_OPUS=false transparently
-    # downgrades the two solution gates to complex (see sdlc_stage_hint).
-    "analyze":            "complex",
-    "design":             "complex",
-    "plan":               "complex",
-    "solution_review":    "solution",   # PRE-code Opus design-review gate
-    "code_review":        "solution",   # POST-code Opus code-review gate
-    "synthesis":          "complex",
-    "cross_model_review": "medium",
-    "normalize":          "haiku",
-    "diagnose":           "complex",
-    "manifest_validate":  "deep",
-    "pre_coding_build":   "",        # no LLM — falls back to default hint when hint is needed
-}
-
-
-def sdlc_stage_hint(stage: str, default: str = "complex") -> str:
+    Both imports are function-local. core.tiers is a stdlib-only leaf and
+    core.tier_resolver imports only it and core.logger, so neither can cycle
+    back here — but this module is imported by models/model_router.py at module
+    scope, and keeping the dependency inside the function means a future top
+    level import in either of them cannot turn that into a cycle at gateway
+    start (N10-h).
     """
-    Resolve the router hint for an SDLC stage.
+    from core.tiers import Tier
+    from core.tier_resolver import ROLE_REVIEW
+    return {
+        # Region picking: returns a JSON array of line numbers. Bounded
+        # structured extraction that has to parse — §D.2 `simple`.
+        "locate":            (Tier.SIMPLE,  "haiku",    {}),
+        # JSON field extraction from ticket text.
+        "normalize":         (Tier.SIMPLE,  "haiku",    {}),
+        # Surgical edits against visible code — §D.2 `complex`.
+        "coder":             (Tier.COMPLEX, "complex",  {}),
+        # A review GATE. §M.3a: "a stronger model reviews" is a ROLE within the
+        # tier, not a tier of its own — which is what `solution` was. A
+        # preference, not a filter, so a single-model deployment still runs the
+        # gate with author and reviewer coinciding.
+        "code_review":       (Tier.COMPLEX, "solution", {"require_role": ROLE_REVIEW}),
+        # The manifest cross-validator. It JUDGES the plan, so it needs the same
+        # capability that wrote it (§D.2 `complex`, and legacy `deep` maps there
+        # — see models/model_router.py::_LEGACY_TO_GOVERNED). The thing that
+        # made it a GPT model was never the tier: it was "do not let the author
+        # mark its own homework", which is §M.3b's distinct_from_family and is
+        # supplied per-call by the caller that knows who the author was.
+        "manifest_validate": (Tier.COMPLEX, "deep",     {}),
+    }
 
-    Precedence: env SDLC_MODEL_<STAGE>  →  SDLC_STAGE_MODEL_DEFAULTS[stage]  →  default.
-    solution → complex when ENABLE_OPUS is off, so callers never need to
-    special-case Opus availability.
 
-    ``SDLC_MODEL_<STAGE>`` accepts EITHER a router tier name
-    (haiku|medium|complex|solution|deep) OR a concrete model id of any provider.
-    A concrete id is returned verbatim: the model router resolves it via the
-    admin-configured provider registry (``models/model_router.py`` route() step
-    1a), so a harness with no Anthropic provider can pin any stage to its own
-    model. The id is used only as a model-id string (registry lookup / API model
-    param); it is not interpolated into any shell command.
-    """
-    base = SDLC_STAGE_MODEL_DEFAULTS.get(stage, default)
-    env  = (os.getenv(f"SDLC_MODEL_{stage.upper()}") or "").strip()
-    # A non-tier env value is a concrete model id — hand it straight to the router.
-    if env and env.lower() not in _SDLC_STAGE_HINTS_ALLOWED:
-        return env
-    hint = (env or base or default).strip().lower()
-    if hint not in _SDLC_STAGE_HINTS_ALLOWED:
-        hint = base
-    # Read ENABLE_OPUS at call time so deploy-time changes apply without re-import.
-    if hint == "solution" and os.getenv("ENABLE_OPUS", "true").lower() in ("false", "0", "no"):
-        hint = "complex"
-    return hint
+# Public, resolved once. A module-level dict rather than a function call at each
+# site so the ratchet and the tests have a single object to assert against.
+SDLC_STAGE_TIERS: dict = _sdlc_stage_tiers()
 
 # Opus 4.8 is CLI/IDE-only; blocked when either the global Opus switch is off
 # OR the CLI-specific opt-in is off. This guarantees the chat-picker (which does
@@ -516,102 +519,131 @@ def _tier_env_override(tier: str) -> str:
     return (os.getenv(f"SDLC_TIER_{tier.upper()}_MODEL") or "").strip()
 
 
-def cli_model_for(stage: str) -> str:
+# ---------------- TIER → CONCRETE MODEL ID, FOR OUT-OF-PROCESS CONSUMERS ----
+#
+# §N.1 step 10. Everything above this line resolves a tier for an IN-PROCESS
+# call, where the answer is routing kwargs and models/model_router.py does the
+# resolving. The SDLC CLI phases cannot use that: they spawn the `ainxt` binary
+# with `--model <id>`, so the model name leaves the process and the answer has
+# to be a concrete id.
+#
+# What this replaces — cli_model_for_tier()'s `_tier_to_role` — never consulted
+# the tier assignments at all. It mapped a hint to a .env constant through a
+# table that hardcoded ("anthropic", …) for three tiers and ("openai", …) for
+# two, which made the coder, plan and implement phases — the long agentic
+# sessions that write the code — immune to the Admin > Model Governance screen.
+#
+# THE ADDRESSABILITY BAR — and what it is NOT.
+#
+# The first version of this checked a model id PREFIX (claude/gpt/gemini/...),
+# on the theory that the spawned CLI calls back into this platform's own
+# Anthropic-compatible endpoint, where _normalise_model rewrites an unknown
+# prefix to CLAUDE_PRIMARY_MODEL. That theory was wrong twice over, and it
+# suspended a live PLAN phase with "CLI exited with code 1":
+#
+#   1. The `ainxt` binary does not accept arbitrary model ids. It accepts the
+#      ALIASES in its own config (bin/config.toml -> ~/.ainxt/config.toml),
+#      and each alias's underlying `model` value. Anything else is refused
+#      before a request is made: Couldn't set model '<id>': Invalid params:
+#      "unknown model id".
+#   2. On a default install that config points the CLI STRAIGHT AT the
+#      provider with its own key, not at this platform. So the compat router's
+#      rewriting never enters into it.
+#
+# A prefix is therefore necessary and nowhere near sufficient: every id the
+# CLI rejected in that incident began with "claude". The bar has to be the
+# CLI's own vocabulary, so it is read from the CLI's own config.
+#
+# THE CONSEQUENCE, STATED PLAINLY: on a deployment whose config.toml carries
+# one alias, exactly one model is assignable to the SDLC CLI phases — the one
+# it names. Assign anything else and this resolver says so and falls back.
+# Governing those phases from the Tiers screen requires the operator to give
+# the CLI a config that knows the models they intend to use.
+
+def _cli_config_path():
+    """Where the `ainxt` binary reads its model aliases from."""
+    import pathlib as _pl
+    home = (os.getenv("AINXT_HOME") or "").strip()
+    return _pl.Path(home or (_pl.Path.home() / ".ainxt")) / "config.toml"
+
+
+_CLI_MODELS_CACHE: dict = {}
+
+
+def cli_acceptable_model_ids() -> frozenset:
+    """Every value the `ainxt` CLI will accept for --model, or an empty set.
+
+    Parsed from the CLI's own config so the two cannot disagree: the alias
+    names under [model.<alias>], plus each alias's `model` value, which the
+    binary also resolves. Cached on the file's mtime, so `sdlc-setup.sh`
+    regenerating it takes effect without a restart.
+
+    Returns an EMPTY set when the config is absent or unparseable — which is
+    the normal case in the gateway process, because only the SDLC worker
+    mounts it. An empty set means "unknown", and the caller then falls back to
+    the prefix heuristic rather than rejecting everything. That is safe
+    precisely because a process without the config is a process that never
+    spawns the CLI.
     """
-    Resolve a CONCRETE model id for a CLI phase.
+    path = _cli_config_path()
+    try:
+        stat = path.stat()
+    except OSError:
+        return frozenset()
+    key = (str(path), stat.st_mtime_ns)
+    hit = _CLI_MODELS_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        import tomllib
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning(f"[model_registry] could not parse the ainxt CLI config at "
+                       f"{path} ({exc}) — falling back to the prefix heuristic")
+        return frozenset()
+    names = set()
+    for alias, cfg in (data.get("model") or {}).items():
+        names.add(alias)
+        if isinstance(cfg, dict) and isinstance(cfg.get("model"), str):
+            names.add(cfg["model"].strip())
+    _CLI_MODELS_CACHE.clear()          # only ever one live config
+    _CLI_MODELS_CACHE[key] = frozenset(n for n in names if n)
+    return _CLI_MODELS_CACHE[key]
 
-    For CLI usage (--model flag), resolves the tier via sdlc_stage_hint(stage),
-    maps to the concrete model id, and guards against BLOCKED_MODELS.
 
-    If the resolved concrete id is in BLOCKED_MODELS, falls back to the Sonnet
-    workhorse (CLAUDE_PRIMARY_MODEL) instead.
+# Retained ONLY as the fallback for a process that cannot see the CLI config
+# (see cli_acceptable_model_ids). Mirrors the pass-through set in
+# routers/messages_compat_router.py::_normalise_model; a drift test pins them.
+CLI_ADDRESSABLE_MODEL_PREFIXES = (
+    "claude", "gpt", "o1", "o3", "o4", "gemini", "local", "ollama",
+)
 
-    Args:
-        stage: SDLC stage name (typically "plan" or "coder" for CLI)
 
-    Returns:
-        Concrete model id string (e.g., "claude-sonnet-4-6")
+def cli_model_is_addressable(model_id: str) -> bool:
+    """True when the `ainxt` CLI will accept this id for --model.
+
+    Authoritative when the CLI's config is readable; a prefix guess otherwise.
+    The guess is deliberately the weaker answer and never the only one relied
+    on where it matters — the SDLC worker, which is the only process that
+    spawns the CLI, is also the only one that mounts the config.
     """
-    # Resolve tier via the standard SDLC mechanism
-    # Resolve tier via the standard SDLC mechanism, then map + guard.
-    return cli_model_for_tier(sdlc_stage_hint(stage))
+    mid = (model_id or "").strip()
+    if not mid:
+        return False
+    known = cli_acceptable_model_ids()
+    if known:
+        return mid in known
+    return mid.lower().startswith(CLI_ADDRESSABLE_MODEL_PREFIXES)
 
 
-def _cli_model_from_env(env_var: str, default_tier: str) -> str:
-    """Shared resolver for per-phase CLI model env vars (CLASSIFY / PLAN / IMPLEMENT).
+def _legacy_cli_model_for_tier(hint: str) -> str:
+    """The pre-governance answer: hint → .env constant → registry-by-family.
 
-    Accepts, in order of precedence:
-      - a direct concrete model id (e.g. ``claude-sonnet-5``, ``claude-opus-4-8``) —
-        returned as-is unless it is in BLOCKED_MODELS.
-      - a router tier name (haiku|complex|medium|solution|deep) — resolved via
-        ``cli_model_for_tier`` (BLOCKED_MODELS-guarded).
-      - "local" — mapped to CLAUDE_HAIKU (the ainxt CLI has no Ollama bridge).
-      - unset / invalid — falls back to ``default_tier``.
+    Retained verbatim as the D15/D50 fallback — governance off, or the tier
+    resolves to nothing usable — so `TIER_GOVERNANCE_ENABLED=` reproduces
+    today's model id exactly. It is not called on the governed path and it is
+    removed with the rest of the .env model constants in Phase 8.
     """
-    _tiers = {"haiku", "complex", "medium", "solution", "deep"}
-    raw = (os.getenv(env_var) or "").strip()
-    if not raw:
-        return cli_model_for_tier(default_tier)
-    low = raw.lower()
-    if low == "local":
-        return _role_model(CLAUDE_HAIKU, "anthropic", "haiku")
-    if low in _tiers:
-        return cli_model_for_tier(low)
-    # Treat as a direct model id. BLOCKED_MODELS is the only gate — an operator
-    # who names a model explicitly has opted in to it.
-    blocked = set(BLOCKED_MODELS)
-    if raw in blocked:
-        return _role_model(CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-    return raw
-
-
-def cli_classify_model() -> str:
-    """Resolve the concrete CLI model for the CLASSIFY phase.
-
-    Controlled by ``SDLC_CLI_CLASSIFY_MODEL`` (tier name, direct model id, or
-    "local"). Defaults to the haiku tier when unset."""
-    return _cli_model_from_env("SDLC_CLI_CLASSIFY_MODEL", "haiku")
-
-
-def cli_plan_model() -> str:
-    """Resolve the concrete CLI model for the PLAN phase.
-
-    Controlled by ``SDLC_CLI_PLAN_MODEL`` (tier name, direct model id, or
-    "local"). Defaults to the complex (Sonnet) tier when unset.
-
-    Examples::
-
-        SDLC_CLI_PLAN_MODEL=complex          # Sonnet (default)
-        SDLC_CLI_PLAN_MODEL=claude-sonnet-5  # pin Sonnet 5 directly
-        SDLC_CLI_PLAN_MODEL=solution         # Opus (requires ENABLE_OPUS=true)
-        SDLC_CLI_PLAN_MODEL=claude-opus-4-7  # Opus by direct id (explicit opt-in)
-    """
-    return _cli_model_from_env("SDLC_CLI_PLAN_MODEL", "complex")
-
-
-def cli_implement_model() -> str:
-    """Resolve the concrete CLI model for the IMPLEMENT phase.
-
-    Controlled by ``SDLC_CLI_IMPLEMENT_MODEL`` (tier name, direct model id, or
-    "local"). Defaults to the complex (Sonnet) tier when unset.
-
-    Examples::
-
-        SDLC_CLI_IMPLEMENT_MODEL=complex          # Sonnet (default)
-        SDLC_CLI_IMPLEMENT_MODEL=claude-sonnet-5  # pin Sonnet 5 directly
-        SDLC_CLI_IMPLEMENT_MODEL=solution         # Opus (requires ENABLE_OPUS=true)
-        SDLC_CLI_IMPLEMENT_MODEL=claude-opus-4-7  # Opus by direct id (explicit opt-in)
-    """
-    return _cli_model_from_env("SDLC_CLI_IMPLEMENT_MODEL", "complex")
-
-
-def cli_model_for_tier(hint: str) -> str:
-    """Shared tier→concrete-CLI-model resolution (BLOCKED_MODELS-guarded), used by
-    both cli_model_for(stage) and cli_classify_model(). ENABLE_OPUS is re-read at
-    call time so the kill-switch applies without a restart; when Opus is enabled
-    the "solution" tier resolves to Opus for CLI phases too."""
-    # Local-only posture: every tier collapses to the locally served model. Done
-    # before the tier table so no cloud model id can escape to a gateway.
     if is_local_only():
         return LOCAL_LLM_MODEL_NAME
 
@@ -621,9 +653,6 @@ def cli_model_for_tier(hint: str) -> str:
         blocked.add(CLAUDE_OPUS_MODEL)
         blocked.add(CLAUDE_OPUS_48_MODEL)
 
-    # SDLC_TIER_<TIER>_MODEL lets an operator remap any tier to any provider's
-    # model in one place (family-agnostic). Wins over the CLAUDE_*/OPENAI_*
-    # constants below via _role_model's "truthy env_value returned as-is" rule.
     _tier_to_role = {
         "solution":  (_tier_env_override("solution") or CLAUDE_OPUS_MODEL,    "anthropic", "opus"),
         "complex":   (_tier_env_override("complex")  or CLAUDE_PRIMARY_MODEL, "anthropic", "complex"),
@@ -636,11 +665,9 @@ def cli_model_for_tier(hint: str) -> str:
     _key = (hint or "").strip().lower()
     if _key not in _tier_to_role:
         # Not a known tier: treat a non-empty hint as a concrete model id and
-        # return it verbatim (the router resolves it via the provider registry).
-        # BLOCKED_MODELS is the only gate — an operator who names a model has
-        # opted in to it. Mirrors _cli_model_from_env's direct-id branch. The
-        # value is used solely as a model-id string / argv element, never in a
-        # shell, so widening this path introduces no injection surface.
+        # return it verbatim. BLOCKED_MODELS is the only gate — an operator who
+        # names a model has opted in to it. The value is used solely as a
+        # model-id string / argv element, never in a shell.
         if hint and hint.strip() and hint.strip() not in blocked:
             return hint.strip()
         return _role_model(_tier_env_override("complex") or CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
@@ -652,41 +679,163 @@ def cli_model_for_tier(hint: str) -> str:
         return _role_model(_tier_env_override("complex") or CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
     return model_id
 
-def openai_model_for_tier(hint: str) -> tuple[str, bool]:
-    """Resolve a router tier to a CONCRETE OpenAI model id, for gateways that only
-    speak the OpenAI API (e.g. the SDLC manifest cross-validator, which calls
-    ``model_router._get_openai()`` directly).
 
-        deep         → OPENAI_LATEST_MODEL   (gpt-5.5; env-upgradable to gpt-5.6)
-        medium       → OPENAI_CODING_MODEL   (gpt-5.4)
-        mini/simple  → OPENAI_SIMPLE_MODEL   (gpt-5-mini)
+def cli_tier_model_id(tier, legacy_hint: str, override: str = "", *,
+                      override_name: str = "", require_role: str = None) -> str:
+    """Concrete model id for an out-of-process CLI phase (§N.1 step 10).
 
-    A Claude tier (complex/solution/haiku) or an unknown hint has NO OpenAI
-    equivalent — it falls back to OPENAI_LATEST_MODEL and returns fell_back=True so
-    the caller can log a WARNING. Sending a Claude id (or None) to the OpenAI gateway
-    400s, so this fallback is a correctness guard, not a nicety.
+    The concrete-id twin of models.model_router.tier_request(): same precedence,
+    same D15 parity contract, different return type because the caller needs a
+    string to put in argv rather than kwargs to splat into generate().
 
-    Returns (model_id, fell_back).
+    Precedence, highest first:
+
+      0. is_local_only() — the deployment posture wins over everything. Checked
+         before the tier so no cloud model id can escape to a CLI spawn.
+      1. `override` — a non-blank per-phase env var (SDLC_CLI_<PHASE>_MODEL,
+         SDLC_MODEL_<STAGE>, SDLC_GOVERNANCE_*_MODEL). The operator named a
+         model, and governance does not second-guess an explicit name for the
+         same reason it does not second-guess a user's dropdown pick. DEPRECATED
+         (§I, Phase 8) and warned once per variable per process.
+      2. `tier` — the administrator's assignment, when governance is on AND at
+         least one candidate is addressable.
+      3. `legacy_hint` — what this phase resolved before migration, through the
+         untouched .env chain. Reached whenever (2) produces nothing.
+
+    `require_role` is a preference within the tier (§M.3a), matching the
+    resolver's own semantics: a deployment with one model still gets an answer.
     """
+    # 0. Deployment posture. Before the tier, not after: the whole point of
+    #    LLM_PROVIDER=local is that no cloud id can reach a provider, and a
+    #    governed answer is still a cloud id.
     if is_local_only():
-        # A local OpenAI-compatible server serves one model name; that is not a
-        # fallback, so fell_back=False.
-        return LOCAL_LLM_MODEL_NAME, False
+        return LOCAL_LLM_MODEL_NAME
 
-    h = (hint or "").strip().lower()
-    # SDLC_TIER_<TIER>_MODEL overrides the OPENAI_* constant per tier (see
-    # _tier_env_override / cli_model_for_tier). Kept consistent so the manifest
-    # cross-validator honors the same operator remap.
-    _openai_tiers = {
-        "deep":   (_tier_env_override("deep")   or OPENAI_LATEST_MODEL, "deep"),
-        "medium": (_tier_env_override("medium") or OPENAI_CODING_MODEL, "medium"),
-        "mini":   (_tier_env_override("mini")   or OPENAI_SIMPLE_MODEL, "simple"),
-        "simple": (_tier_env_override("mini")   or OPENAI_SIMPLE_MODEL, "simple"),
-    }
-    if h in _openai_tiers:
-        env_value, tag = _openai_tiers[h]
-        return _role_model(env_value, "openai", tag), False
-    return _role_model(OPENAI_LATEST_MODEL, "openai", "deep"), True
+    # 1. Operator override.
+    if override and override.strip():
+        value = override.strip()
+        if override_name and override_name not in _CLI_OVERRIDE_WARNED:
+            _CLI_OVERRIDE_WARNED.add(override_name)
+            logger.warning(
+                f"[model_registry] {override_name}={value!r} is set, so it overrides the "
+                f"tier assignment for this SDLC phase. This variable is DEPRECATED — "
+                f"assign a model on Model Governance > Tiers and unset it."
+            )
+        # A tier NAME is still accepted here: SDLC_CLI_PLAN_MODEL=solution has
+        # always meant "the solution tier", and reading it as a model id would
+        # hand the CLI the literal string "solution".
+        if value.lower() in _LEGACY_CLI_TIER_NAMES:
+            return _legacy_cli_model_for_tier(value.lower())
+        if value.lower() == "local":
+            # Historical: the ainxt CLI has no Ollama bridge, so "local" meant
+            # the cheap Anthropic model, not the in-house one. Preserved.
+            return _role_model(CLAUDE_HAIKU, "anthropic", "haiku")
+        if value in set(BLOCKED_MODELS):
+            return _role_model(_tier_env_override("complex") or CLAUDE_PRIMARY_MODEL,
+                               "anthropic", "complex")
+        return value
+
+    # 2. The administrator's assignment.
+    try:
+        from core.tiers import governance_enabled
+        governed = governance_enabled()
+    except Exception:                                    # noqa: BLE001
+        governed = False
+
+    if governed:
+        rejected: list = []
+        try:
+            from core.tier_resolver import Constraints, resolve_tier_candidates
+            from core.tiers import Tier
+            blocked = set(BLOCKED_MODELS)
+            for cand in resolve_tier_candidates(
+                    Tier(tier), Constraints(require_role=require_role)):
+                if cand.model_id in blocked:
+                    rejected.append(f"{cand.model_id} (blocked on this deployment)")
+                    continue
+                if not cli_model_is_addressable(cand.model_id):
+                    _known = sorted(cli_acceptable_model_ids())
+                    rejected.append(
+                        f"{cand.model_id} (the ainxt CLI refuses this id; it accepts "
+                        + (f"only {', '.join(_known)}" if _known
+                           else f"ids beginning {'/'.join(CLI_ADDRESSABLE_MODEL_PREFIXES)}")
+                        + ")")
+                    continue
+                return cand.model_id
+        except Exception as exc:                          # noqa: BLE001
+            rejected.append(f"tier resolution unavailable ({exc})")
+
+        _warn_cli_tier_fallback(tier, legacy_hint, rejected)
+
+    # 3. The pre-migration answer.
+    return _legacy_cli_model_for_tier(legacy_hint)
+
+
+# Warned once per (tier, reason-set) so a pipeline that resolves the same phase
+# forty times in one run produces one line, not forty.
+_CLI_OVERRIDE_WARNED: set = set()
+_CLI_TIER_FALLBACK_WARNED: set = set()
+_LEGACY_CLI_TIER_NAMES = frozenset({"haiku", "complex", "medium", "solution", "deep"})
+
+
+def _warn_cli_tier_fallback(tier, legacy_hint: str, rejected: list) -> None:
+    name = getattr(tier, "value", tier)
+    key = (str(name), tuple(rejected))
+    if key in _CLI_TIER_FALLBACK_WARNED:
+        return
+    _CLI_TIER_FALLBACK_WARNED.add(key)
+    logger.warning(
+        f"[model_registry] no model assigned to the {name!r} tier can be used by the "
+        f"ainxt CLI — " + ("; ".join(rejected) or "the tier has no candidates") +
+        f". Falling back to the deprecated .env chain for {legacy_hint!r}. To govern "
+        f"this phase from Model Governance > Tiers, assign a model the CLI is "
+        f"configured for (see `ainxt models`, generated into bin/config.toml by "
+        f"sdlc-setup.sh) — the tier assignment cannot widen what the CLI accepts."
+    )
+
+
+# ── Named CLI phases ────────────────────────────────────────────────────────
+#
+# Thin wrappers so the phase → tier decision lives in ONE place per phase
+# rather than at each of the eleven spawn sites, and so the deprecated
+# SDLC_CLI_<PHASE>_MODEL override is applied identically at all of them.
+# The tiers are plan.html §D.2's, chosen from what the phase DOES.
+
+
+def cli_classify_model() -> str:
+    """CLASSIFY — a JSON classification verdict. §D.2 `simple`."""
+    from core.tiers import Tier
+    return cli_tier_model_id(Tier.SIMPLE, "haiku",
+                             os.getenv("SDLC_CLI_CLASSIFY_MODEL", ""),
+                             override_name="SDLC_CLI_CLASSIFY_MODEL")
+
+
+def cli_plan_model() -> str:
+    """PLAN — long-context synthesis of a work item into a plan. §D.2 `complex`."""
+    from core.tiers import Tier
+    return cli_tier_model_id(Tier.COMPLEX, "complex",
+                             os.getenv("SDLC_CLI_PLAN_MODEL", ""),
+                             override_name="SDLC_CLI_PLAN_MODEL")
+
+
+def cli_implement_model() -> str:
+    """IMPLEMENT — agentic code generation against visible code. §D.2 `complex`."""
+    from core.tiers import Tier
+    return cli_tier_model_id(Tier.COMPLEX, "complex",
+                             os.getenv("SDLC_CLI_IMPLEMENT_MODEL", ""),
+                             override_name="SDLC_CLI_IMPLEMENT_MODEL")
+
+
+def cli_coder_model() -> str:
+    """The coder/fixer CLI session. Replaces cli_model_for("coder").
+
+    Honours SDLC_MODEL_CODER, which is the one SDLC_MODEL_<STAGE> variable that
+    reached a CLI spawn rather than an in-process call.
+    """
+    from core.tiers import Tier
+    tier, legacy, _extra = SDLC_STAGE_TIERS["coder"]
+    return cli_tier_model_id(tier, legacy, os.getenv("SDLC_MODEL_CODER", ""),
+                             override_name="SDLC_MODEL_CODER")
 
 
 def veo_model() -> str:

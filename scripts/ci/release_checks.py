@@ -569,6 +569,31 @@ _PHASE6_MIGRATED_MODULES = (
     "services/doc_reviser.py",
     "services/feedback_processor.py",
     "routers/coach_router.py",
+    # §N.1 step 10 — the SDLC pipeline, in-process and CLI.
+    #
+    # Both halves of the sdlc_pipeline package are listed, not just the half
+    # that runs: _core.py and _phases.py duplicate 20 top-level functions
+    # (~1,819 lines) that the 2026-08-04 extraction copied rather than moved,
+    # and step 10 migrated BOTH copies identically. Listing only the live one
+    # would leave the dead one free to drift back to the .env path and then be
+    # re-wired — which is how the two manifest validators came to differ.
+    "agents/sdlc_pipeline/_core.py",
+    "agents/sdlc_pipeline/_phases.py",
+    "agents/sdlc_state_machine.py",
+    "agents/sdlc_patch_engine.py",
+    "agents/sdlc_normalizer.py",
+    "agents/sdlc_context.py",
+    "agents/sdlc_governance/config.py",
+    "agents/sdlc_governance/pipeline.py",
+    "workers/sdlc_worker.py",
+    "agents/brd_fsd_pipeline.py",
+    # Not SDLC. agents/react_engine.py and its one consumer carried the last
+    # "solution"/"complex" literals outside SDLC, and the check could not see
+    # them: they arrived as synthesis_hint=/iteration_hint= on a constructor.
+    # Widening the keyword set below to guard step 10's own `hint=` convention
+    # made them visible, so they are migrated and listed here rather than left
+    # to fail the build.
+    "agents/react_engine.py",
 )
 
 # The eight tier names plus the legacy aliases that MEAN one of them. A raw
@@ -591,12 +616,32 @@ _PHASE6_TIER_HINTS = (
 _ROUTER_ENTRY_POINTS = frozenset({
     "generate", "async_generate", "stream", "async_stream",
     "generate_structured", "route", "run",
+    # §N.1 step 10. SDLC does not call the router directly from its stages —
+    # it calls its own _llm() shortcut, twice defined, and the state machine
+    # wraps that again in _llm_traced(). Those are the routing decision for
+    # every SDLC stage, so the check has to treat them as entry points or it
+    # ratchets nothing in the largest module it is pointed at. ReactEngine is
+    # here for the same reason: the tier arrives on its CONSTRUCTOR.
+    "_llm", "_llm_traced", "ReactEngine",
+})
+
+# The keyword names that carry a routing decision. `model_hint` was the only
+# one until §N.1 step 10 — which is why threads_router.py sat on the migrated
+# list for six steps while still passing synthesis_hint="solution", and why
+# SDLC's own `hint=` convention was invisible. Safe to include a name as
+# generic as "hint" ONLY because the scan is already gated on
+# _ROUTER_ENTRY_POINTS above.
+_ROUTING_KEYWORDS = frozenset({
+    "model_hint", "hint", "synthesis_hint", "iteration_hint",
 })
 
 
-def _tier_hint_message(rel: str, lineno: int, hint: str) -> str:
+def _tier_hint_message(rel: str, lineno: int, hint: str, kw: str = "model_hint") -> str:
+    # `kw` names the keyword that actually carried it. Reporting every finding
+    # as model_hint= sent a reader of a synthesis_hint= regression looking for
+    # a keyword that is not on the line.
     return (
-        f"{rel}:{lineno}: model_hint={hint!r} — this module was migrated in "
+        f"{rel}:{lineno}: {kw}={hint!r} — this module was migrated in "
         f"Phase 6; use tier=Tier.X with legacy_hint={hint!r} so governance "
         f"applies and the flag-off path is unchanged"
     )
@@ -661,12 +706,13 @@ def check_tier_migration(cfg) -> list[str]:
             if callee not in _ROUTER_ENTRY_POINTS:
                 continue
             for kw in node.keywords:
-                # keyword form: generate(..., model_hint="complex")
-                if kw.arg == "model_hint":
+                # keyword form: generate(..., model_hint="complex"),
+                # _llm(..., hint="solution"), ReactEngine(synthesis_hint=…)
+                if kw.arg in _ROUTING_KEYWORDS:
                     if (isinstance(kw.value, ast.Constant)
                             and kw.value.value in _PHASE6_TIER_HINTS):
                         bad.append(_tier_hint_message(rel, node.lineno,
-                                                      kw.value.value))
+                                                      kw.value.value, kw.arg))
                     continue                  # a raw model id, or a variable
     return bad
 

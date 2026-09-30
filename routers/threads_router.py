@@ -179,11 +179,18 @@ def _ainxt_flow(thread_id: str, message_content: str, repo: str, product_id: str
         _t0 = _time.time()
 
         from agents.react_engine import ReactEngine
+        from core.tiers import Tier
+        from models.model_router import tier_request
+        # §N.1 step 10. Was synthesis_hint="solution" / iteration_hint="complex"
+        # — the last two tier literals outside SDLC, and invisible to the CI
+        # ratchet because it reads `model_hint=` and these are neither. Both
+        # ask for `complex`: deep reasoning over a codebase for the synthesis,
+        # and the same capability for the mid-loop analysis.
         _react = ReactEngine(
             task=react_task,
             retrieve_fn=_react_retrieve,
-            synthesis_hint="solution",   # Opus if ENABLE_OPUS=true, else Sonnet
-            iteration_hint="complex",    # Sonnet for reasoning iterations (cost control)
+            synthesis_route=tier_request(Tier.COMPLEX, "solution"),
+            iteration_route=tier_request(Tier.COMPLEX, "complex"),
         )
         _react_result = _react.run()
         fix_analysis       = _react_result.answer

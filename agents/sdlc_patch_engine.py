@@ -25,7 +25,6 @@ from typing import Optional
 
 from agents.compliance_engine import is_compliance_block
 from core.logger import logger, bind_context
-from core.model_registry import sdlc_stage_hint
 
 MAX_PATCH_ATTEMPTS = 3
 
@@ -322,9 +321,10 @@ class PatchEngine:
         issues that could not be localized to a specific file, to avoid spending 3
         attempts on collateral files.
 
-        model_hint selects the patch-generation model tier; defaults to the
-        configurable "coder" stage (sdlc_stage_hint("coder") → Sonnet by default,
-        overridable via SDLC_MODEL_CODER). FIXING passes the "fixer" stage hint.
+        model_hint pins the patch-generation model to one the CALLER named —
+        a concrete id or a legacy hint. Left None (the normal path) the "coder"
+        stage decides, which as of §N.1 step 10 means the tier an administrator
+        assigned on Model Governance > Tiers rather than an .env constant.
 
         Returns:
             {
@@ -359,7 +359,11 @@ class PatchEngine:
             }
 
         _budget = max(1, min(int(max_attempts or MAX_PATCH_ATTEMPTS), MAX_PATCH_ATTEMPTS))
-        _hint   = model_hint or sdlc_stage_hint("coder")
+        # A caller-supplied pin stays a bare hint — route() treats a concrete
+        # model id as an explicit pick, which is what a pin means. Otherwise the
+        # stage's tier decides (§N.1 step 10).
+        from models.model_router import sdlc_stage_route
+        _route  = {"model_hint": model_hint} if model_hint else sdlc_stage_route("coder")
 
         import os as _os_pe
         _cap = int(_os_pe.getenv("SDLC_PATCH_FILE_CHARS", "120000"))
@@ -369,7 +373,7 @@ class PatchEngine:
             solution_text=solution_text, dep_block=dep_block, rag_context=rag_context,
             cs_block=cs_block, prior_block=prior_block, language=language,
             jira_key=jira_key, run_id=run_id, sandbox_image=sandbox_image,
-            model_hint=_hint,
+            route=_route,
         )
 
         # Small/medium files: show the whole file, single attempt-loop (unchanged).
@@ -389,7 +393,7 @@ class PatchEngine:
     def _patch_attempts(
         self, *, path, existing_content, desc, solution_text, dep_block, rag_context,
         cs_block, prior_block, language, jira_key, run_id, sandbox_image,
-        file_view, file_view_note, max_attempts, model_hint="complex",
+        file_view, file_view_note, max_attempts, route=None,
     ) -> dict:
         """
         One generate→parse→apply→validate retry loop against a FIXED view of the file.
@@ -417,7 +421,9 @@ class PatchEngine:
             )
             try:
                 from models.model_router import model_router
-                raw_patch = model_router.generate(patch_prompt, model_hint=model_hint)
+                from models.model_router import sdlc_stage_route
+                raw_patch = model_router.generate(
+                    patch_prompt, **(route or sdlc_stage_route("coder")))
             except Exception as _e:
                 logger.error(f"[PE {run_id}] Patch LLM call failed: {_e}")
                 _record("llm_error", str(_e))
@@ -536,7 +542,7 @@ class PatchEngine:
     def _run_patch_large(
         self, *, path, existing_content, desc, solution_text, dep_block, rag_context,
         cs_block, prior_block, language, jira_key, run_id, sandbox_image,
-        max_attempts, cap, model_hint="complex",
+        max_attempts, cap, route=None,
     ) -> dict:
         """
         For files larger than the prompt cap. Shows the model only the localized
@@ -556,7 +562,7 @@ class PatchEngine:
                 cs_block=cs_block, prior_block=prior_block, language=language,
                 jira_key=jira_key, run_id=run_id, sandbox_image=sandbox_image,
                 file_view=view, file_view_note=note, max_attempts=budget,
-                model_hint=model_hint,
+                route=route,
             )
             agg_attempts += r.get("attempts", 0)
             agg_outcomes.extend(r.get("outcomes", []))
@@ -638,7 +644,8 @@ class PatchEngine:
         try:
             import json as _json
             from models.model_router import model_router
-            raw = model_router.generate(prompt, model_hint=sdlc_stage_hint("locate")) or ""
+            from models.model_router import sdlc_stage_route
+            raw = model_router.generate(prompt, **sdlc_stage_route("locate")) or ""
             m = re.search(r"\[[\d,\s]*\]", raw)
             if not m:
                 return []

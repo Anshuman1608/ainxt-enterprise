@@ -13,13 +13,14 @@ import) at module import time.
 Governance model knobs
 -----------------------
 SDLC_GOVERNANCE_REVIEW_MODEL — concrete model id used by review_model() for the
-    governance SCAN (analyzer skill sessions). Unset/empty → CLAUDE_PRIMARY_MODEL
-    (the platform Sonnet workhorse).
+    governance SCAN (analyzer skill sessions). Unset/empty → the model the
+    administrator assigned to the `complex` tier, preferring one tagged
+    role='review' (§N.1 step 10; §M.3a).
 SDLC_GOVERNANCE_FIX_MODEL — concrete model id used by fix_model() for the
     author-fix CLI session (run_governance_author_fix in agents/sdlc_pipeline.py).
-    Unset/empty → the exact model the fixer used before this knob existed,
-    cli_model_for("coder") from core/model_registry.py, so leaving it unset is a
-    strict no-op. Must never resolve to a BLOCKED_MODELS entry.
+    Unset/empty → the model the administrator assigned to the `complex` tier,
+    via cli_coder_model() (§N.1 step 10). Must never resolve to a
+    BLOCKED_MODELS entry.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from core.logger import logger
 # imports, no I/O) — a top-level import is safe and keeps this module simple.
 from core.model_registry import (
     CLAUDE_PRIMARY_MODEL, CLAUDE_OPUS_MODEL, CLAUDE_OPUS_46_MODEL,
-    BLOCKED_MODELS, cli_model_for, cli_model_for_tier,
+    BLOCKED_MODELS, cli_coder_model, cli_tier_model_id,
 )
 
 
@@ -102,31 +103,35 @@ def review_model() -> str:
     """Concrete model id for the governance SCAN reviewer.
 
     SDLC_GOVERNANCE_REVIEW_MODEL wins (any provider's concrete id). Unset →
-    the "complex" workhorse tier via cli_model_for_tier, which honors the
-    provider-agnostic SDLC_TIER_COMPLEX_MODEL override and the registry
-    fallback, so this resolves on a harness with no Anthropic. Defaults to the
-    platform Sonnet workhorse (CLAUDE_PRIMARY_MODEL) when nothing else is set."""
-    return _env_str("SDLC_GOVERNANCE_REVIEW_MODEL", "").strip() or cli_model_for_tier("complex")
+    the `complex` tier as the administrator assigned it, PREFERRING a candidate
+    tagged role='review' — this is a review gate, and §M.3a makes "a stronger
+    model reviews" a role within the tier rather than a tier of its own. A
+    preference, so a single-model deployment still runs the scan with author
+    and reviewer coinciding. Falls back to the deprecated .env chain when
+    governance is off or nothing assigned is addressable by the CLI."""
+    from core.tiers import Tier
+    from core.tier_resolver import ROLE_REVIEW
+    return cli_tier_model_id(
+        Tier.COMPLEX, "complex", _env_str("SDLC_GOVERNANCE_REVIEW_MODEL", "").strip(),
+        override_name="SDLC_GOVERNANCE_REVIEW_MODEL", require_role=ROLE_REVIEW)
 
 
 def fix_model() -> str:
     """SDLC_GOVERNANCE_FIX_MODEL: concrete model id for the governance
     author-fix CLI session (run_governance_author_fix in sdlc_pipeline.py).
-    Unset/empty → cli_model_for("coder") from core.model_registry — the exact
-    model the fixer used before this knob existed, so leaving it unset is a
-    strict no-op.
+    Unset/empty → cli_coder_model(): the `complex` tier as the administrator
+    assigned it, no role preference — an author-fix session writes code, it
+    does not review it (§N.1 step 10, D43).
 
     Guard: an env-supplied value still cannot resolve to a BLOCKED_MODELS entry.
-    NOTE (conservative choice — ambiguity not covered by the plan): the shared
-    guard helper cli_model_for_tier() (core/model_registry.py) takes a TIER
-    name (e.g. "complex"), not a concrete model id — calling it with a raw env
-    string would look up an unknown key and silently collapse to
-    CLAUDE_PRIMARY_MODEL, discarding a legitimate override. So the guard
-    predicate itself (BLOCKED_MODELS membership, ENABLE_OPUS-aware — mirrors
-    cli_model_for_tier()) is replicated here against the raw concrete id
-    instead of routing through it.
+    NOTE (conservative choice — ambiguity not covered by the plan): the guard
+    predicate (BLOCKED_MODELS membership, ENABLE_OPUS-aware) is replicated here
+    against the raw concrete id rather than routed through the shared resolver,
+    because cli_tier_model_id() takes a TIER plus an override and this function
+    wants to log WHICH source won. Kept as-is through step 10 so the logging
+    contract does not change in the same commit as the resolution does.
     """
-    default_model = cli_model_for("coder")
+    default_model = cli_coder_model()
     raw = _env_str("SDLC_GOVERNANCE_FIX_MODEL", "").strip()
     if not raw:
         logger.info("[SDLC-GOV] Resolved governance fixer model",

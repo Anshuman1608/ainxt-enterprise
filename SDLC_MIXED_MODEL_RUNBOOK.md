@@ -1,5 +1,24 @@
 # Runbook — SDLC pipeline test: CLI phases on Anthropic, in-process phases on OpenAI
 
+> **SUPERSEDED by §N.1 step 10.** This runbook exists because splitting SDLC
+> across two providers used to require setting a dozen env vars correctly and
+> knowing which of them were inert. It is now an admin screen: assign the
+> models you want to the `simple` and `complex` tiers on
+> **Admin → Model Governance → Tiers**, and every SDLC stage — CLI and
+> in-process — follows. `SDLC_MODEL_*`, `SDLC_TIER_*` and `SDLC_CLI_*` still
+> work as per-stage pins and still win over the tiers, but they are deprecated
+> and warn once per process.
+>
+> Two things below are now wrong rather than merely unnecessary:
+> `SDLC_MODEL_PLAN` was never read by anything (the PLAN spawn takes
+> `SDLC_CLI_PLAN_MODEL`), and the "no-op vars" list was incomplete — twelve of
+> the seventeen stage variables had no call site, and they have been removed.
+>
+> One constraint the tiers do NOT remove: a model assigned to a tier the CLI
+> phases use must have an id beginning `claude`/`gpt`/`o1`/`o3`/`o4`/`gemini`/
+> `local`/`ollama`, because the endpoint the CLI calls back into dispatches by
+> prefix. Anything else is skipped with a log line naming it.
+
 Goal for this session:
 1. Install & bring up the stack.
 2. Run the SDLC pipeline in a **mixed** model setup — the `ainxt` **CLI phases stay
@@ -31,17 +50,21 @@ Getting this wrong sends an OpenAI id to the Claude-only CLI and suspends the ph
   patch-engine `coder`/`fixer` path.
 
 **⚠️ DO-NOT-TOUCH env vars** (they leak into a CLI/Claude spawn):
-- `SDLC_MODEL_PLAN` → feeds `cli_model_for("plan")` (a CLI spawn). Leave **unset**.
-- `SDLC_MODEL_CODER` → feeds the governance-fix CLI spawn. Leave **unset**.
+- `SDLC_MODEL_PLAN` → **does nothing** (no call site; removed in §N.1 step 10).
+  The PLAN spawn reads `SDLC_CLI_PLAN_MODEL`.
+- `SDLC_MODEL_CODER` → feeds the governance-fix CLI spawn AND the in-process
+  patch engine. Leave **unset**; assign the `complex` tier instead.
 - `SDLC_TIER_COMPLEX_MODEL`, `SDLC_TIER_SOLUTION_MODEL`, `SDLC_TIER_SIMPLE_MODEL` →
   these remap the tiers the **CLI phases** resolve through. Leave **unset** for this
   mixed test (setting them would push the CLI phases onto OpenAI too).
 - `SDLC_CLI_CLASSIFY_MODEL`, `SDLC_CLI_PLAN_MODEL`, `SDLC_CLI_IMPLEMENT_MODEL` →
   leave **unset** so they default to Claude tiers (haiku/complex).
 
-**No-op vars:** `SDLC_MODEL_ANALYZE/DESIGN/SYNTHESIS/DIAGNOSE/SOLUTION_REVIEW/`
-`CROSS_MODEL_REVIEW` have no live call site in the current 3-phase CLI pipeline —
-setting them does nothing. Don't rely on them.
+**Removed vars (§N.1 step 10):** `SDLC_MODEL_ANALYZE`, `_DESIGN`, `_SYNTHESIS`,
+`_DIAGNOSE`, `_SOLUTION_REVIEW`, `_CROSS_MODEL_REVIEW`, `_FIXER`, `_EXPLORATION`,
+`_NONCODE`, `_CLASSIFY`, `_PRE_CODING_BUILD` and `_PLAN` had no live call site.
+They are gone from `.env.example` and from the stage table. Setting one never did
+anything and still does not.
 
 ---
 

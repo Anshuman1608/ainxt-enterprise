@@ -360,7 +360,14 @@ def run_exploration_phase(
                 f"Name ACTUAL class names, function names, import paths from the code. "
                 f"Max 400 words. Narrative format (no JSON)."
             )
-            summary_text = _mr.generate(synth_prompt, model_hint="solution")
+            # §N.1 step 10. Was model_hint="solution", which under governance
+            # resolved to `complex` PREFERRING the review-role model — but this
+            # is exploration synthesis, not a review gate, and it should not be
+            # consuming the reviewer (D43). Asks for the tier plain.
+            from core.tiers import Tier as _Tier
+            from models.model_router import tier_request as _tier_request
+            summary_text = _mr.generate(
+                synth_prompt, **_tier_request(_Tier.COMPLEX, "solution"))
             result["patterns_summary"] = summary_text or ""
             logger.info(
                 f"[IDE] Exploration complete — {len(file_contents)} files read, "

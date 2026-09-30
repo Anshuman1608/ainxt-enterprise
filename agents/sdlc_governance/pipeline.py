@@ -865,10 +865,10 @@ def trigger_domain_fix(run_id: str, domain: str, actor: str,
 
         # ── 5. run CLI fixer (profile="code") ──────────────────────────────────
         from agents.sdlc_cli_engine import run_cli, CliEngineConfig
-        from core.model_registry import cli_model_for
+        from core.model_registry import cli_coder_model
         fix_result = run_cli(
             config=CliEngineConfig.from_env(), workspace_root=workspace,
-            prompt=fix_prompt, profile="code", model=cli_model_for("coder"),
+            prompt=fix_prompt, profile="code", model=cli_coder_model(),
             max_turns=60, run_id=run_id,
         )
         if fix_result.status == "suspended":

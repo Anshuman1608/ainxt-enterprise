@@ -820,7 +820,7 @@ def run_governance_review_job(payload: dict) -> str:
     from agents.sdlc_governance import config as gov_config, engine as gov_engine
     from agents.sdlc_pipeline import run_governance_scan_snapshot
     from agents.sdlc_cli_engine import run_cli, CliEngineConfig
-    from core.model_registry import cli_model_for
+    from core.model_registry import cli_coder_model
     from store.sdlc_artifacts import _store_artifact, compute_input_hash
 
     workspace: str = ""
@@ -935,7 +935,7 @@ def run_governance_review_job(payload: dict) -> str:
                     workspace_root=workspace,
                     prompt=gov_engine.build_fix_prompt(result.get("open_findings") or [], workspace),
                     profile="code",
-                    model=cli_model_for("coder"),
+                    model=cli_coder_model(),
                     max_turns=gov_config.review_turns(),
                     run_id=run_id or dedup_key,
                 )
