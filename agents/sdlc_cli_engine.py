@@ -186,6 +186,10 @@ class CliResult:
     session_id: str = ""
     transient: bool = False                      # retryable upstream/proxy blip (502/api_error)
     num_turns: int = -1                           # v3 envelope's num_turns; -1 = unknown/unavailable
+    # v3's structuredOutputError. Distinct from `subtype`: the binary reports
+    # BOTH "error_max_turns" and this on a run that was cancelled for failing to
+    # emit the requested schema, and only this one says which actually happened.
+    structured_output_error: str = ""
 
     @property
     def completed(self) -> bool:
@@ -568,6 +572,44 @@ def _reason_for_exit_code(exit_code: int) -> str:
     return _EXIT_CODE_REASONS.get(exit_code, f"CLI exited with code {exit_code}")
 
 
+def _suspend_reason(exit_code: int, result: "CliResult",
+                    max_turns: Optional[int] = None) -> str:
+    """The operator-facing reason a CLI phase suspended.
+
+    The exit code alone is not one. A v3 cancellation exits 0, so the honest
+    envelope — schema missed, turns exhausted, upstream error — was being
+    reported as "CLI exited with code 0": literally true, and it names neither
+    the cause nor anything to do about it. That string is what a suspended run
+    shows in the UI and writes to sdlc_runs.error, so it is the whole of what
+    most people will ever see about the failure.
+
+    Ordered most specific first; falls back to the exit-code text so nothing
+    that used to produce a reason now produces none.
+    """
+    soe = (getattr(result, "structured_output_error", "") or "").strip()
+    turns = getattr(result, "num_turns", -1)
+    _of = f" after {turns} of {max_turns} turns" if (
+        isinstance(turns, int) and turns >= 0 and isinstance(max_turns, int)
+    ) else (f" after {turns} turns" if isinstance(turns, int) and turns >= 0 else "")
+
+    if soe:
+        return (f"the model did not return the requested structured output{_of} "
+                f"({soe})")
+    sub = (getattr(result, "subtype", "") or "").strip()
+    if sub == "error_max_turns":
+        if isinstance(turns, int) and turns >= 0 and isinstance(max_turns, int) \
+                and turns < max_turns:
+            # The mislabel this function exists to stop propagating.
+            return (f"the CLI cancelled the run{_of} — reported as turn exhaustion "
+                    f"but the budget was not reached")
+        return f"the CLI exhausted its turn budget{_of}"
+    if sub in ("empty_output", "unparseable_json"):
+        return f"the CLI returned no usable result envelope ({sub})"
+    if sub:
+        return f"the CLI stopped early: {sub}{_of}"
+    return _reason_for_exit_code(exit_code)
+
+
 # ── Transient upstream-failure detection ────────────────────────────────────
 # The external CLI's exit code / envelope subtype for a mid-stream gateway 502 is NOT
 # reliably a clean 5xx: the gateway commits a 200 + SSE headers before the proxy call,
@@ -610,6 +652,7 @@ def _transient_subtypes() -> set:
 def _is_transient_failure(
     exit_code: int, subtype: str, buffers: str,
     num_turns: int = -1, max_turns: Optional[int] = None,
+    structured_output_error: str = "",
 ) -> bool:
     """True iff a suspended CLI outcome looks like a RETRYABLE upstream/proxy blip
     (502/503/api_error/connection reset), by exclusion. Deterministic failures
@@ -625,21 +668,42 @@ def _is_transient_failure(
         return True
     if exit_code == 4:             # platform maps exit 4 → gateway/network 5xx
         return True
-    # Spurious low-turn cancellation: v3 maps ANY non-EndTurn stopReason (not just a
-    # genuine --max-turns exhaustion) to subtype "error_max_turns" (see
-    # _parse_cli_envelope). Observed live (run d2b05274, PLAN, 4/4 reproductions):
-    # the binary reports stopReason "Cancelled" after exactly 1 turn — with
-    # structuredOutputError "model did not produce structured output" — while
-    # max-turns was 60. A run cannot legitimately exhaust a 60-turn budget in 1-2
-    # turns, so this is the binary/harness cancelling early, not real exhaustion.
+    # Spurious cancellation reported as turn exhaustion. v3 maps ANY non-EndTurn
+    # stopReason (not just a genuine --max-turns exhaustion) to subtype
+    # "error_max_turns" (see _parse_cli_envelope), so the subtype alone cannot
+    # tell "ran out of turns" from "was cancelled for some other reason".
+    #
+    # Two discriminators, in order of confidence:
+    #
+    #   structuredOutputError  Unambiguous. The binary is telling us the run
+    #                          ended because the model did not emit the
+    #                          requested schema. That is a different failure
+    #                          from exhausting a budget, whatever the subtype
+    #                          says, and it is worth one bounded retry.
+    #   num_turns < max_turns  Arithmetic. A run cancelled BEFORE reaching its
+    #                          cap did not hit the cap.
+    #
+    # Both are required together: a structured-output error on a run that
+    # genuinely used its whole budget is a budget problem, and should be
+    # treated as one.
+    #
     # Retrying is safe: PLAN/CLASSIFY callers that opt into transient_retries are
     # read-only (wrote nothing), and IMPLEMENT reads .transient to continue the
     # same session rather than treat it as a real budget exhaustion.
-    if (
-        sub == "error_max_turns" and 0 <= num_turns <= 2
-        and isinstance(max_turns, int) and max_turns >= 10
-    ):
-        return True
+    #
+    # History: this started as `0 <= num_turns <= 2` after run d2b05274 (PLAN,
+    # 4/4 reproductions, cancelled after ONE turn). That window was too narrow
+    # — run 3f95f90c hit the identical envelope after EIGHT of sixty turns, so
+    # the heuristic did not fire, the two configured retries went unused, and
+    # the phase suspended reporting "CLI exited with code 0". The turn count was
+    # never the signal; the mismatch between it and the cap is.
+    if sub == "error_max_turns" and isinstance(max_turns, int) and max_turns >= 10:
+        if (structured_output_error or "").strip() and 0 <= num_turns < max_turns:
+            return True
+        # Retained for envelopes that carry no structuredOutputError at all:
+        # a 60-turn budget cannot be exhausted in one or two turns.
+        if 0 <= num_turns <= 2:
+            return True
     # Match both the raw buffers AND the subtype string against the upstream-error
     # signatures — the real in-band 502 may surface as an api_error subtype, an
     # api_error SSE line in stdout, or a 502/reset in stderr.
@@ -961,7 +1025,7 @@ def run_cli(
         )
 
         if exit_code != 0 or result.is_error:
-            reason = _reason_for_exit_code(exit_code)
+            reason = _suspend_reason(exit_code, result, max_turns)
             # Dump the RAW CLI output so a suspend (esp. unparseable_json / a real
             # in-CLI error) can be diagnosed straight from the worker log without
             # re-running on the host.
@@ -976,6 +1040,7 @@ def run_cli(
             _transient = _is_transient_failure(
                 exit_code, result.subtype, (stdout or "") + "\n" + (stderr or ""),
                 num_turns=result.num_turns, max_turns=max_turns,
+                structured_output_error=result.structured_output_error,
             )
             # Read-only callers (profile="plan") opt into a bounded FRESH re-spawn: they
             # wrote nothing so a clean re-run is safe. IMPLEMENT (profile="code") passes
@@ -1196,6 +1261,9 @@ def _parse_cli_envelope(stdout: str, *, exit_code: int) -> CliResult:
     session_id = envelope.get("session_id") or envelope.get("sessionId") or ""
     if not isinstance(session_id, str):
         session_id = str(session_id)
+    structured_output_error = envelope.get("structuredOutputError") or ""
+    if not isinstance(structured_output_error, str):
+        structured_output_error = str(structured_output_error)
     try:
         num_turns = int(envelope.get("num_turns"))
     except (TypeError, ValueError):
@@ -1225,6 +1293,7 @@ def _parse_cli_envelope(stdout: str, *, exit_code: int) -> CliResult:
         status="completed", result_text=result_text, structured_output=structured,
         is_error=is_error, subtype=subtype, exit_code=exit_code, usage=usage,
         total_cost_usd=total_cost_usd, session_id=session_id, num_turns=num_turns,
+        structured_output_error=structured_output_error,
     )
 
 
