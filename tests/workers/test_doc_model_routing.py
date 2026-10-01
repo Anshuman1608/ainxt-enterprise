@@ -26,7 +26,7 @@ import pathlib
 import pytest
 
 from core.tiers import Tier
-from models.model_router import _HINT_MAP
+from core.tiers import LEGACY_INBOUND_ALIASES
 import workers.doc_worker as dw
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -109,11 +109,11 @@ def test_a_modality_tier_name_is_not_treated_as_governed(monkeypatch):
 
 def test_every_legacy_hint_the_pipeline_emits_is_a_real_hint_map_key():
     """The assertion that would have caught step 6's first wrong assumption:
-    ModelRouter._coerce_tier RAISES on a legacy_hint outside _HINT_MAP, so a
+    ModelRouter._coerce_tier RAISES on a legacy_hint outside core.tiers.LEGACY_INBOUND_ALIASES, so a
     plausible-looking hint is a crash with governance off, not a fallback."""
     emitted = {"complex", "haiku", "mini", "simple", "medium"}
-    missing = sorted(h for h in emitted if h not in _HINT_MAP)
-    assert not missing, f"not _HINT_MAP keys: {missing}"
+    missing = sorted(h for h in emitted if h not in LEGACY_INBOUND_ALIASES)
+    assert not missing, f"not known aliases: {missing}"
 
 
 # ── 4. The threading (8b) — what a source scan cannot check ───────────────

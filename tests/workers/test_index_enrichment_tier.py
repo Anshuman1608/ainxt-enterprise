@@ -10,7 +10,7 @@ complexity-classified on its own.
 
 The assertion that would have caught the bug in the first draft of this work
 is test_the_legacy_hint_is_a_real_hint: `_coerce_tier` raises ValueError unless
-`legacy_hint` is a key of `_HINT_MAP`, and the falsy-key guard at
+`legacy_hint` is a known alias (core.tiers.LEGACY_INBOUND_ALIASES), and the falsy-key guard at
 model_router.py:800 strips `""`. So `legacy_hint=""` — the obvious way to say
 "it used to pass nothing" — would have raised on the first enriched chunk of
 the first indexed repo.
@@ -72,19 +72,17 @@ def test_simple_and_not_mini():
 
 
 def test_the_legacy_hint_is_a_real_hint():
-    """_coerce_tier raises unless legacy_hint is a key of _HINT_MAP, and the
-    falsy-key guard strips "". The first draft of this change passed
+    """_coerce_tier raises unless legacy_hint is a known alias
+    (core.tiers.LEGACY_INBOUND_ALIASES). The first draft of this change passed
     legacy_hint="" to mean "it used to pass nothing" — that would have raised
     ValueError on the first enriched chunk."""
+    from core.tiers import LEGACY_INBOUND_ALIASES
     m = re.search(r'"legacy_hint":\s*"([^"]*)"', _src(WORKER))
     assert m, "the enrichment call passes no legacy_hint — D15 needs one"
     hint = m.group(1)
-    assert hint, "legacy_hint is empty; _HINT_MAP has no falsy keys (model_router.py:800)"
-
-    router = _src(ROUTER)
-    block = router[router.index("_HINT_MAP = {"):router.index("# ── Falsy-key guard")]
-    assert f'"{hint}":' in block, (
-        f"legacy_hint={hint!r} is not a literal key of _HINT_MAP — "
+    assert hint, "legacy_hint is empty; no alias is falsy"
+    assert hint in LEGACY_INBOUND_ALIASES, (
+        f"legacy_hint={hint!r} is not a known alias — "
         f"_coerce_tier raises ValueError for exactly this")
 
 

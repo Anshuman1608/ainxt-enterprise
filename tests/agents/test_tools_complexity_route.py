@@ -10,7 +10,7 @@ mapping that replaced it, and one trap in particular.
 ``agents/tools.py``'s no-repo-context downgrade assigns
 ``os.getenv("DOWNGRADE_MODEL", "")``. An empty hint means "classify this
 prompt yourself" — ``route()`` gates its hint branch on ``if model_hint:`` —
-and there is no tier and no ``_HINT_MAP`` key that says that. ``_coerce_tier``
+and there is no tier and no alias that says that. ``_coerce_tier``
 RAISES on a ``legacy_hint`` it does not recognise and strips falsy ones, so
 coercing the empty case would have raised on the first no-context turn. That
 is the same assumption that bit step 6 on ``ENRICH_MODEL``, which is why it
@@ -25,7 +25,8 @@ import pathlib
 import pytest
 
 from core.tiers import Tier
-from models.model_router import _HINT_MAP, chat_complexity_route
+from core.tiers import LEGACY_INBOUND_ALIASES
+from models.model_router import chat_complexity_route
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -55,9 +56,9 @@ def test_the_legacy_hint_is_the_verdicts_own_word(verdict):
 @pytest.mark.parametrize("verdict", ["simple", "medium", "complex"])
 def test_every_emitted_hint_is_a_real_hint_map_key(verdict):
     """The assertion that caught step 6's first wrong assumption: a
-    legacy_hint that is not a _HINT_MAP key makes _coerce_tier raise, and it
+    legacy_hint that is not a known alias makes _coerce_tier raise, and it
     raises at DISPATCH time, on a live turn, not at import."""
-    assert chat_complexity_route(verdict)["legacy_hint"] in _HINT_MAP
+    assert chat_complexity_route(verdict)["legacy_hint"] in LEGACY_INBOUND_ALIASES
 
 
 def test_the_verdict_is_normalised():

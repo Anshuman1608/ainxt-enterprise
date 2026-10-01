@@ -16,9 +16,8 @@ explicit-pick rungs stay.
 Two properties are asserted, and the first one is the point of the file:
 
   **D52 — the governed/pick split is DERIVED, never restated.** A hint is a
-  capability request iff ``_HINT_MAP[hint]`` is a key of
-  ``_LEGACY_TO_GOVERNED``. These tests read those two tables rather than
-  listing hints, so the day someone adds a tier alias the partition follows
+  capability request iff ``core.tiers.LEGACY_INBOUND_ALIASES`` maps it to a
+  Tier. These tests read that table rather than listing hints, so the day someone adds a tier alias the partition follows
   automatically. A second hand-written list is how ``threads_router.py`` sat
   on the migrated-module list for six steps still passing
   ``synthesis_hint="solution"``.
@@ -94,12 +93,12 @@ def _pin_candidates(monkeypatch, candidates):
 
 
 def test_every_governed_alias_is_treated_as_a_capability(helper, governed, monkeypatch):
-    """Derived from the router's own tables. If someone adds an alias to
-    _LEGACY_TO_GOVERNED, this test starts covering it with no edit here."""
-    from models.model_router import _HINT_MAP, _LEGACY_TO_GOVERNED
+    """Derived from core.tiers.LEGACY_INBOUND_ALIASES: every alias that names a
+    Tier is a capability request, with no edit here when one is added."""
+    from core.tiers import LEGACY_INBOUND_ALIASES, Tier
 
     _pin_candidates(monkeypatch, [_Cand("some-model", "anthropic")])
-    governed_hints = [h for h, t in _HINT_MAP.items() if t in _LEGACY_TO_GOVERNED]
+    governed_hints = [h for h, t in LEGACY_INBOUND_ALIASES.items() if isinstance(t, Tier)]
     assert governed_hints, "the router exposes no governed aliases at all"
 
     for hint in governed_hints:
@@ -109,16 +108,14 @@ def test_every_governed_alias_is_treated_as_a_capability(helper, governed, monke
 
 
 def test_every_non_governed_alias_is_left_alone(helper, governed, monkeypatch):
-    """§G. model_router.py:1836-1851 records why each of these is absent from
-    _LEGACY_TO_GOVERNED — they are SKUs a user chose from a dropdown, and
-    resolving them through a tier would substitute a different model for the
-    one that was asked for."""
-    from models.model_router import _HINT_MAP, _LEGACY_TO_GOVERNED
+    """§G. SKU aliases are a user's pick; resolving them through a tier would
+    substitute a different model for the one that was asked for."""
+    from core.tiers import EXPLICIT_MODEL, LEGACY_INBOUND_ALIASES
 
     _pin_candidates(monkeypatch, [_Cand("some-model", "anthropic")])
-    picks = [h for h, t in _HINT_MAP.items() if t not in _LEGACY_TO_GOVERNED]
-    assert "gemini" in picks and "local" in picks, \
-        "the fixture's assumption about the router's tables no longer holds"
+    picks = [h for h, t in LEGACY_INBOUND_ALIASES.items() if t == EXPLICIT_MODEL]
+    assert "gemini" in picks and "opus-5" in picks, \
+        "the fixture's assumption about the alias table no longer holds"
 
     for hint in picks:
         assert helper.fn(hint) == (None, ""), (
@@ -135,7 +132,7 @@ def test_no_hint_is_a_capability_request(helper, governed, monkeypatch):
 
 
 def test_an_unknown_model_id_is_a_pick(helper, governed, monkeypatch):
-    """A raw model id is not in _HINT_MAP, so it is the user naming a model
+    """A raw model id is not an alias, so it is the user naming a model
     and must survive untouched — the same rule the ratchet applies."""
     _pin_candidates(monkeypatch, [_Cand("assigned-model", "anthropic")])
     assert helper.fn("some-vendor/some-model-v3") == (None, "")

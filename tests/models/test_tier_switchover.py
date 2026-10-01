@@ -81,9 +81,6 @@ def world(monkeypatch):
                         lambda self, family, model_id: gw)
     for acc in ("_get_local", "_get_openai", "_get_claude", "_get_gemini"):
         monkeypatch.setattr(ModelRouter, acc, lambda self, _g=gw: _g)
-    monkeypatch.setattr(mr, "_resolve_tier_model",
-                        lambda env_value, family, tag: f"ENV:{family}/{tag}")
-    monkeypatch.setattr(mr, "_tier_label", lambda t: f"LABEL[{t}]")
 
     def assign(tier, row_id, priority=100, role=None):
         assignments.append({"tier": tier.value, "model_row_id": row_id,
@@ -119,30 +116,48 @@ def test_a_capability_hint_selects_the_assignment(world, hint, tier):
     assert d.requested_tier is tier
 
 
-# ── 2. The nine tiers governance must NOT touch ─────────────────────────────
+# ── 2. Every hint resolves without env (D108) ───────────────────────────────
 
-@pytest.mark.parametrize("hint", ["gemini", "opus-4-8", "opus-5", "sonnet-5",
-                                  "tera", "luna", "local", "simple", "local_mini"])
-def test_a_users_sku_pick_is_never_resolved_through_a_tier(world, hint):
-    """Governance decides what the PLATFORM picks, never what a user picked.
-
-    Each of these names a specific model or a deployment topology. Resolving
-    them through a tier would substitute something else for what was asked
-    for — and would do it silently, which is the exact defect the tier model
-    is meant to remove.
-    """
-    world.models.append(_model("a", modality=["text"], privacy_class=_EXTERNAL))
+@pytest.mark.parametrize("hint,model_id,family", [
+    ("opus-5", "claude-opus-5", "anthropic"), ("opus-4-8", "claude-opus-4-8", "anthropic"),
+    ("sonnet-5", "claude-sonnet-5", "anthropic"), ("tera", "gpt-5.6-terra", "openai"),
+    ("luna", "gpt-5.6-luna", "openai"), ("gemini-lite", "gemini-3.1-flash-lite", "gemini"),
+])
+def test_a_sku_alias_is_served_as_the_registry_model_it_names(world, hint, model_id, family):
+    """Governance decides what the PLATFORM picks, never what a user named."""
+    world.models.append(_model("named", family=family, model_id=model_id, privacy_class=_EXTERNAL))
+    world.models.append(_model("other", family=family, modality=["text"], privacy_class=_EXTERNAL))
     for t in Tier:
-        world.assign(t, "a")
+        world.assign(t, "other")
     d = ModelRouter().route("q", model_hint=hint)
-    assert d.tier != mr.TIER_GOVERNED, f"{hint} must not be governed"
+    assert d.tier == mr.TIER_REGISTRY and d.provider_model_override == model_id
 
 
-def test_the_governed_set_is_exactly_the_seven_capability_tiers():
-    assert set(mr._LEGACY_TO_GOVERNED) == {
-        mr.TIER_MINI, mr.TIER_HAIKU, mr.TIER_MEDIUM, mr.TIER_COMPLEX,
-        mr.TIER_SOLUTION, mr.TIER_DEEP, mr.TIER_VISION,
-    }
+def test_a_sku_alias_with_no_registered_model_is_refused(world):
+    world.models.append(_model("a", modality=["text"], privacy_class=_EXTERNAL))
+    from core.tier_resolver import NoEligibleModel
+    with pytest.raises(NoEligibleModel, match="no enabled registry model"):
+        ModelRouter().route("q", model_hint="opus-5")
+
+
+@pytest.mark.parametrize("hint,tier,no_cloud", [
+    ("simple", Tier.SIMPLE, False), ("local", Tier.SIMPLE, True),
+    ("local_mini", Tier.INTENT_CLASSIFICATION, True),
+])
+def test_topology_aliases_resolve_through_their_tier(world, hint, tier, no_cloud):
+    world.models.append(_model("cloud", modality=["text"], privacy_class=_EXTERNAL))
+    world.models.append(_model("onprem", family="ollama", modality=["text"], privacy_class=_LOCAL))
+    world.assign(tier, "cloud", priority=1)
+    world.assign(tier, "onprem", priority=2)
+    d = ModelRouter().route("q", model_hint=hint)
+    assert d.requested_tier is tier
+    assert d.provider_model_override == ("model-onprem" if no_cloud else "model-cloud")
+
+
+def test_the_alias_extras_are_the_review_and_in_house_ones():
+    assert mr._ALIAS_EXTRAS["solution"] == mr._ALIAS_EXTRAS["opus"] == {"require_role": tr.ROLE_REVIEW}
+    assert all(v == {"no_cloud_egress": True} for k, v in mr._ALIAS_EXTRAS.items()
+               if k not in ("solution", "opus"))
 
 
 def test_the_role_constant_matches_the_resolvers(world):
@@ -331,3 +346,37 @@ def test_a_per_model_breaker_inherits_its_providers_tuning():
     assert _defaults_for("local:llama3.2:1b") == _BREAKER_DEFAULTS["local"]
     # An unknown provider still gets the documented generic default.
     assert _defaults_for("acme-inc:some-model") == (10, 30)
+
+
+# ── 10. Auto and the async entry point (D108) ───────────────────────────────
+
+@pytest.mark.parametrize("verdict,tier", [
+    ("simple", Tier.SIMPLE), ("medium", Tier.MEDIUM), ("complex", Tier.COMPLEX),
+    ("deep", Tier.COMPLEX), ("something-new", Tier.MEDIUM),
+])
+def test_an_auto_verdict_resolves_through_its_tier(world, monkeypatch, verdict, tier):
+    import models.classifier as clf
+    monkeypatch.setattr(clf, "classify_with_confidence_llm", lambda p: (verdict, 0.95), raising=True)
+    monkeypatch.setattr(clf, "detect_query_domain", lambda p: "chat", raising=True)
+    world.models.append(_model("a", modality=["text"], privacy_class=_EXTERNAL))
+    world.assign(tier, "a")
+    assert ModelRouter().route("q").requested_tier is tier
+
+
+def test_async_generate_keeps_the_tier(monkeypatch):
+    import anyio
+    seen = {}
+    monkeypatch.setattr(ModelRouter, "generate",
+                        lambda self, prompt, **kw: seen.update(kw) or "ok")
+    out = anyio.run(lambda: ModelRouter().async_generate("q", tier=Tier.SIMPLE, legacy_hint="simple"))
+    assert out == "ok" and seen["tier"] is Tier.SIMPLE and "model_hint" not in seen
+
+
+def test_a_registry_id_is_served_as_itself_not_classified(world):
+    """An id no alias names (an admin-added model) is the user's pick (§G)."""
+    world.models.append(_model("custom", model_id="my-custom-model", privacy_class=_EXTERNAL))
+    world.models.append(_model("auto", modality=["text"], privacy_class=_EXTERNAL))
+    for t in Tier:
+        world.assign(t, "auto")
+    d = ModelRouter().route("q", model_hint="my-custom-model")
+    assert d.tier == mr.TIER_REGISTRY and d.provider_model_override == "my-custom-model"

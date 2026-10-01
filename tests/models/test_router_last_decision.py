@@ -174,4 +174,9 @@ def test_every_routing_entry_point_records_its_selection(entry):
         and isinstance(n.func, ast.Attribute)
         and n.func.attr == "_record_selection"
     ]
-    assert calls, f"{entry}() no longer calls _record_selection()"
+    # Delegating to generate() records through it (async_generate since Phase 8).
+    delegates = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "generate"
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "self"
+                    for n in ast.walk(fn))
+    assert calls or delegates, f"{entry}() no longer calls _record_selection()"

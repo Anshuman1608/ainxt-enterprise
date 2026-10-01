@@ -71,19 +71,10 @@ def test_the_models_that_could_not_be_blocked_now_resolve(model_id):
 
 
 @pytest.mark.parametrize("model_id", THE_FIVE)
-def test_the_old_helper_really_did_answer_falsy_for_them(model_id):
-    """The counterpart. Without this the test above is a tautology — it would
-    pass just as well if the defect had never existed, and nobody reading it
-    later would know what was fixed.
-
-    hint_to_model_id is NOT being asserted as broken-forever: it is still the
-    right answer on the governance-off path, which is why step 9 narrowed
-    where it is consulted rather than deleting it.
-    """
-    assert not hint_to_model_id(model_id), (
-        f"hint_to_model_id({model_id!r}) now returns a value — if the .env "
-        f"constants were populated, re-measure the five and update this table"
-    )
+def test_the_old_helper_now_agrees(model_id):
+    """hint_to_model_id used to answer from .env constants and returned nothing
+    for these five. Since Phase 8 it reads the registry too, so both agree."""
+    assert hint_to_model_id(model_id) == model_id
 
 
 def test_a_registry_id_wins_over_the_alias_table():
@@ -184,13 +175,13 @@ def test_a_registry_id_is_not_counted_as_a_legacy_alias(monkeypatch):
 
 
 def test_a_broken_registry_does_not_block_the_turn(monkeypatch):
-    """Fails open to the legacy answer. An access-control lookup that cannot
-    run must not become a 403 — governance never takes down chat."""
+    """Fails open: an access-control lookup that cannot run returns no pick
+    (the caller falls through) rather than becoming a 403."""
     def boom(**kw):
         raise RuntimeError("db down")
     monkeypatch.setattr("core.llm_provider_registry.get_enabled_models", boom)
-    assert resolve_pick_to_model_id("claude-sonnet-4-6") == \
-        hint_to_model_id("claude-sonnet-4-6")
+    monkeypatch.setattr("core.llm_provider_registry.get_model", lambda mid: boom(), raising=True)
+    assert not resolve_pick_to_model_id("claude-sonnet-4-6")
 
 
 # ── the filter factory the four entry points share ────────────────────────

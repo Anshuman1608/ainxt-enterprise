@@ -283,7 +283,8 @@ def _build_model_alias_map() -> dict[str, str]:
     """
     try:
         from core.model_registry import CLAUDE_HAIKU
-        from models.model_router import _HINT_MAP, hint_to_model_id
+        from core.tiers import LEGACY_INBOUND_ALIASES as _HINTS
+        from models.model_router import hint_to_model_id
     except ImportError:
         return {}
 
@@ -297,11 +298,10 @@ def _build_model_alias_map() -> dict[str, str]:
         ws_aliases = {}
 
     # ── every router hint → its canonical model id ───────────────────────
-    # hint_to_model_id() returns None for "simple"/"local" (no concrete cloud
-    # id — those rows are already logged as "local:<id>") and for hints whose
-    # env constant is unset; both are correctly absent from the alias table.
+    # hint_to_model_id() returns None for a hint nothing resolves to (an
+    # unassigned tier, an unregistered SKU); those are absent from the table.
     aliases: dict[str, str] = {}
-    for _hint in _HINT_MAP:
+    for _hint in _HINTS:
         _canonical = hint_to_model_id(_hint)
         if _canonical and _canonical != _hint.lower():
             aliases[_hint.lower()] = _canonical

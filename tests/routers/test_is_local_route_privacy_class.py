@@ -129,11 +129,8 @@ def test_an_unresolvable_tier_predicts_billable(monkeypatch):
     assert is_local_route(None, {"tier": Tier.MEDIUM}) is False
 
 
-def test_the_legacy_hint_path_is_unchanged_with_governance_off():
-    """D15. With the flag off there is no resolution to inspect, so the hint
-    string is all there is — and it must keep meaning what it meant, or
-    turning governance off would not be a true rollback."""
-    assert is_local_route(None, {"model_hint": "simple"}) is True
+def test_the_in_house_hint_names_are_local():
+    """"local" carries no_cloud_egress; "simple" is whatever an admin assigns (Phase 8)."""
     assert is_local_route(None, {"model_hint": "local"}) is True
     assert is_local_route(None, {"model_hint": "local:foo"}) is True
     assert is_local_route(None, {"model_hint": "complex"}) is False

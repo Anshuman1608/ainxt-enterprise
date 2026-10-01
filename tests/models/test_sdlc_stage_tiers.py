@@ -88,13 +88,13 @@ def test_no_stage_asks_for_a_tier_that_does_not_exist():
 
 def test_every_legacy_hint_is_one_the_router_understands():
     """D15/D50. `legacy_hint` is dispatched verbatim with governance off, and
-    _coerce_tier RAISES on a hint that is not a _HINT_MAP key — so a typo here
+    _coerce_tier RAISES on a hint that is not a known alias — so a typo here
     is not a wrong model, it is an exception on the first SDLC run of a
     flag-off deployment."""
-    from models.model_router import _HINT_MAP
+    from core.tiers import LEGACY_INBOUND_ALIASES
 
     for stage, (_tier, hint, _c) in SDLC_STAGE_TIERS.items():
-        assert hint in _HINT_MAP, f"{stage}: {hint!r} is not a router hint"
+        assert hint in LEGACY_INBOUND_ALIASES, f"{stage}: {hint!r} is not a router hint"
 
 
 def test_the_constraints_are_things_the_resolver_actually_reads():

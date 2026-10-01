@@ -856,7 +856,7 @@ def check_tier_migration(cfg) -> list[str]:
 # The list lives in core/legacy_env.py and is read by AST, not imported, so this
 # script keeps running without the app's dependencies. Measured at Rev 21; lower
 # it as modules stop reading a variable, and set it to 0 when Phase 8 lands.
-_LEGACY_ENV_REF_BASELINE = 1480
+_LEGACY_ENV_REF_BASELINE = 1288
 _LEGACY_ENV_GLOBS = ("*.py", "*.sh", "*.yml", "*.yaml", ".env.example")
 _LEGACY_ENV_EXCLUDED = ("core/legacy_env.py", "scripts/ci/release_checks.py", "db/phase8_env_prices.py")
 

@@ -6,8 +6,8 @@ distinct_from_family constraints". Neither was reachable from a `tier=` call
 before this step, for two different reasons:
 
   require_role           route() did not have the parameter AT ALL. The
-                         constraint existed only as `extra` on
-                         _LEGACY_TO_GOVERNED[TIER_SOLUTION], and route()'s
+                         constraint existed only as the legacy "solution"
+                         hint's extra (now _ALIAS_EXTRAS), and route()'s
                          explicit-tier branch passes `extra={}` — so a call
                          saying tier=Tier.COMPLEX could not express "this is a
                          review gate" no matter what it did.
@@ -30,16 +30,13 @@ import pytest
 
 from core.tier_resolver import ROLE_REVIEW
 from core.tiers import Tier
-from models.model_router import _LEGACY_TO_GOVERNED, ModelRouter, model_router
+from models.model_router import _ALIAS_EXTRAS, ModelRouter, model_router
 
 
 @pytest.fixture
 def captured(monkeypatch):
     """Capture the Constraints handed to the resolver by one route() call."""
-    # A LIST, not a dict. Raising out of the resolver makes route() fall
-    # through to the legacy-hint branch, which resolves a SECOND time with
-    # _LEGACY_TO_GOVERNED's extras applied — so a single captured value would
-    # silently be the fallback's constraints, not the ones under test.
+    # A LIST, so a test can assert the resolver was asked exactly once.
     seen = []
 
     def _resolve(tier, c=None, **kw):
@@ -138,12 +135,11 @@ def test_the_solution_hint_still_carries_the_review_role(captured):
 
 def test_the_legacy_extra_wins_over_an_explicit_argument(captured):
     """Constraints(**{**constraints_kw, **extra}) — `extra` last. That
-    ordering predates this step and is load-bearing: it is what keeps the
-    flag-off shape of a legacy hint fixed regardless of what a caller adds.
+    ordering predates this step: an alias's own constraint is not overridden by a caller's.
     Pinned so a future refactor of the merge does not silently invert it."""
     _route(model_hint="solution", require_role=None)
     assert captured[0]["constraints"].require_role == ROLE_REVIEW
-    assert _LEGACY_TO_GOVERNED["solution"] == (Tier.COMPLEX, {"require_role": ROLE_REVIEW})
+    assert _ALIAS_EXTRAS["solution"] == {"require_role": ROLE_REVIEW}
 
 
 def test_a_plain_complex_tier_does_NOT_get_the_review_role(captured):

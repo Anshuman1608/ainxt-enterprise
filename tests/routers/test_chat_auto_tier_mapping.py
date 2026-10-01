@@ -159,14 +159,10 @@ def test_gateway_no_longer_walks_chat_fallback_chain(trees):
     assert "_AUTO_FALLBACK_CHAIN" not in _code_names(trees["gateway.py"])
 
 
-def test_the_constant_itself_survives_for_the_legacy_chain():
-    """Not deleted, only unimported here. models/model_router.py:3271 walks it
-    on the legacy TIER_MINI streaming path, which is the flag-off fallback
-    D15 depends on — so it dies with the shim in Phase 10, not now."""
+def test_the_legacy_fallback_walk_is_gone():
+    """CHAT_FALLBACK_CHAIN's walk went with the legacy TIER_MINI chain (Rev 22 8.3)."""
     mr = (ROOT / "models" / "model_router.py").read_text(encoding="utf-8")
-    assert "for _hop in CHAT_FALLBACK_CHAIN:" in mr
-    registry = (ROOT / "core" / "model_registry.py").read_text(encoding="utf-8")
-    assert "CHAT_FALLBACK_CHAIN: list[str] = [" in registry
+    assert "CHAT_FALLBACK_CHAIN" not in mr
 
 
 def test_the_gov_local_only_double_meaning_is_gone(trees):

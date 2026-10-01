@@ -66,7 +66,9 @@ def test_the_router_has_no_env_fallback_left():
     import models.model_router as mr
     for name in ("_governance_enabled", "_warn_env_fallback", "_ENV_FALLBACK_WARNED",
                  "_NO_ENV_FALLBACK", "_promote_for_context", "_TIER_CONTEXT_WINDOW",
-                 "_CONTEXT_PROMOTION_LADDER"):
+                 "_CONTEXT_PROMOTION_LADDER", "_HINT_MAP", "_LEGACY_TO_GOVERNED",
+                 "_LEGACY_CHAIN", "_TIER_TO_LEGACY_HINT", "_resolve_tier_model",
+                 "TIER_MEDIUM", "TIER_SOLUTION", "TIER_GEMINI"):
         assert not hasattr(mr, name), name
 
 

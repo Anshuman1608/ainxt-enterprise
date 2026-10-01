@@ -3132,8 +3132,8 @@ from core.kv_cache_hoist import (          # noqa: E402
 # repeated here, because the two must agree by construction: this gate is the
 # ONLY consumer of task_complexity for routing, so a label the classifier can
 # emit and this set does not contain is a turn that silently falls back to
-# the flat "medium" default. Intersecting with the router's canonical
-# _HINT_MAP is kept so a rename there still cannot drift the gate.
+# the flat "medium" default. Intersecting with the boundary alias table
+# (core.tiers.LEGACY_INBOUND_ALIASES) keeps a rename there from drifting the gate.
 #
 # "deep" and "solution" left the vocabulary with that change; a stale cached
 # UnifiedIntent can still carry them, so they are COLLAPSED onto "complex"
@@ -3147,7 +3147,7 @@ except Exception:  # noqa: BLE001
     _CIL_COMPLEXITY = {"simple", "medium", "complex"}
     _CIL_RETIRED_COMPLEXITY = {"deep": "complex", "solution": "complex"}
 try:
-    from models.model_router import _HINT_MAP as _MR_HINT_MAP
+    from core.tiers import LEGACY_INBOUND_ALIASES as _MR_HINT_MAP
     _PV2_TIER_HINTS = set(_CIL_COMPLEXITY) & set(_MR_HINT_MAP)
     if not _PV2_TIER_HINTS:  # unexpected shape — use the known-good set
         _PV2_TIER_HINTS = set(_CIL_COMPLEXITY)
@@ -3155,8 +3155,7 @@ except Exception:  # noqa: BLE001
     _PV2_TIER_HINTS = set(_CIL_COMPLEXITY)
 
 # ── §N.1 step 9 — the tier vocabulary, at module scope ─────────────────────
-# core.tiers is a stdlib-only leaf, and models.model_router is already
-# imported here (line above) for _HINT_MAP, so neither widens this module's
+# core.tiers is a stdlib-only leaf, so it does not widen this module's
 # import graph. Aliased with a leading underscore to match the convention the
 # rest of gateway.py's ~16k lines use for imported names.
 from core.tiers import Tier as _Tier
@@ -10917,15 +10916,11 @@ def _oai_tool_channel(model_hint: Optional[str], explicit_id: str = "") -> tuple
       * the hint is a USER'S PICK rather than a capability request;
       * nothing assigned to the tier can be addressed by the tools channel.
 
-    The pick-vs-capability split is not a list maintained here. It is
-    ``_LEGACY_TO_GOVERNED`` membership, read through ``_HINT_MAP``:
-    ``claude`` → complex, plus ``solution``, ``haiku``, ``deep`` and ``mini``
-    are capability requests the platform governs, while ``gemini``, ``local``,
-    ``opus-4-8``, ``opus-5``, ``sonnet-5``, ``tera`` and ``luna`` are SKUs a
-    user chose and §G says are never second-guessed. model_router.py:1836-1851
-    already records why each absent entry is absent; a second copy of that
-    judgement here is how routers/threads_router.py sat on the migrated list
-    for six steps still passing synthesis_hint="solution".
+    The pick-vs-capability split is not a list maintained here: a hint is a
+    capability request iff ``core.tiers.resolve_legacy_alias`` maps it to a
+    Tier (``claude``, ``solution``, ``haiku``, ``deep``, ``mini``, …). SKU
+    aliases (``opus-5``, ``tera``, ``gemini``, …) are a user's pick and §G
+    says those are never second-guessed.
 
     No hint at all means Auto, which on a tool-call turn is agentic code
     generation against visible context — §D.2's `complex`.
@@ -10952,17 +10947,16 @@ def _oai_tool_channel(model_hint: Optional[str], explicit_id: str = "") -> tuple
         from core.tiers import Tier as _TCh
         from core.tier_resolver import resolve_tier_candidates as _rtc
         from core.model_registry import is_blocked_model as _is_blocked
-        from models.model_router import _HINT_MAP as _hm, _LEGACY_TO_GOVERNED as _l2g
+        from core.tiers import resolve_legacy_alias as _alias_tier
     except Exception as exc:                      # noqa: BLE001
         logger.debug("[IDE-TOOLS] tier resolution unavailable (%s) — using .env", exc)
         return None, ""
 
     key = (model_hint or "").strip().lower()
     if key:
-        pair = _l2g.get(_hm.get(key))
-        if pair is None:
+        tier = _alias_tier(key)
+        if not isinstance(tier, _TCh):
             return None, ""                       # the user's pick — §G
-        tier, _extra = pair
     else:
         tier = _TCh.COMPLEX
 

@@ -1,19 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Phase 1 of the LLM tier governance migration — vocabulary + zero-drift guard.
+"""The tier vocabulary and the router's tier= parameter.
 
-Two things are under test:
-
-1. ``core.tiers`` is a closed, total, eight-member vocabulary.
-2. Introducing it changed NOTHING. Every legacy ``model_hint`` string still
-   routes exactly where ``_HINT_MAP`` says it should, and the new ``tier=``
-   parameter cannot be reached by a legacy string.
-
-The second point is the whole contract of Phase 1, and
-``test_simple_collision_guarded`` is its sharpest edge: the legacy hint
-``"simple"`` means LOCAL, while ``Tier.SIMPLE`` means "cheap, short output".
-If those two ever converge before the per-call-site migration in Phase 6,
-~18 call sites that run on the in-house GPU today would silently start
-egressing to a cloud provider.
+``core.tiers`` is a closed, total, eight-member vocabulary, and a legacy
+string can never reach the ``tier=`` parameter. Phase 1's zero-drift guards
+against ``_HINT_MAP`` went with that table in Phase 8 (Rev 22 stage 8.3).
 
 House patterns followed here (see tests/models/test_model_router_async_stream.py
 and tests/router_policy/test_privacy_floor_live.py):
@@ -39,8 +29,6 @@ from core.tiers import (
     resolve_legacy_alias,
 )
 from models.model_router import (
-    _HINT_MAP,
-    _TIER_TO_LEGACY_HINT,
     TIER_SIMPLE,
     ModelRouter,
 )
@@ -79,12 +67,6 @@ _MUST_NOT_BE_TIERS = [
     "luna",
 ]
 
-# _HINT_MAP is keyed by both string literals and env-var constants. The
-# constants default to "" and are stripped by the falsy-key guard in
-# model_router, so only the literals are stable enough to assert on.
-_LITERAL_HINTS = sorted(k for k in _HINT_MAP if k and not k.isupper())
-
-
 # ── 1. The vocabulary is closed and total ────────────────────────────────────
 
 
@@ -108,7 +90,6 @@ def test_tier_enum_rejects_non_tiers(name: str) -> None:
     [
         (TIER_FALLBACK_LADDER, "TIER_FALLBACK_LADDER"),
         (MODALITY_REQUIREMENT, "MODALITY_REQUIREMENT"),
-        (_TIER_TO_LEGACY_HINT, "_TIER_TO_LEGACY_HINT"),
     ],
 )
 def test_tier_keyed_mappings_are_total(mapping: dict, label: str) -> None:
@@ -137,14 +118,6 @@ def test_fallback_ladder_terminates() -> None:
 
 
 # ── 2. The legacy alias table is total at both client boundaries ─────────────
-
-
-@pytest.mark.parametrize("hint", _LITERAL_HINTS)
-def test_legacy_alias_map_covers_every_hint_map_key(hint: str) -> None:
-    """Every hint the router accepts must be translatable at a boundary."""
-    resolved = resolve_legacy_alias(hint)
-    assert resolved is not None, f"{hint!r} has no LEGACY_INBOUND_ALIASES entry"
-    assert isinstance(resolved, Tier) or resolved == EXPLICIT_MODEL
 
 
 def test_legacy_alias_values_are_tier_or_sentinel() -> None:
@@ -208,18 +181,6 @@ def test_tier_kwarg_rejects_legacy_strings(bogus: str) -> None:
     router = ModelRouter()
     with pytest.raises(ValueError):
         router.route("hi", tier=bogus)
-
-
-# ── 5. An explicit in-house pick stays in-house ──────────────────────────────
-
-
-def test_local_hint_still_pins_local(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``"local"`` is an explicit in-house choice and must never leave the box."""
-    router = ModelRouter()
-    monkeypatch.setattr(
-        "core.llm_provider_registry.get_model", lambda _mid: None, raising=False
-    )
-    assert router.route("anything", model_hint="local").tier == TIER_SIMPLE
 
 
 # ── 6. Phase 1 is additive: nothing in production uses the new vocabulary ────
@@ -314,72 +275,3 @@ def test_note_legacy_alias_never_raises() -> None:
     note_legacy_alias("", surface="cli")
     note_legacy_alias("   ", surface="ide")
     note_legacy_alias(None, surface="cli")  # type: ignore[arg-type]
-
-
-# Tiers with no legacy equivalent, so no legacy_hint to give. Their Phase-1
-# entries in _TIER_TO_LEGACY_HINT are explicitly labelled stubs — image-output
-# and video-generation both map onto "vision", which analyses images and
-# cannot make one. A call site asking for these is new behaviour by
-# definition, not a migrated one, so D15 has nothing to preserve.
-_NO_LEGACY_EQUIVALENT = {"IMAGE_INPUT", "IMAGE_OUTPUT", "VIDEO_GENERATION"}
-
-
-def test_every_production_tier_call_carries_its_legacy_hint() -> None:
-    """Phase 6 / D15 — migrating a call site must not change what it does.
-
-    This replaces the Phase-1 guard that asserted `tier=` was unused in
-    production code. Phase 6 is the phase that makes it used, so the question
-    changed from "is anyone passing a tier?" to "is anyone passing one
-    WITHOUT saying what it used to do?".
-
-    Why that matters: `_TIER_TO_LEGACY_HINT` is not the inverse of the
-    migration. `Tier.SIMPLE` coerces to "haiku" — cloud Claude Haiku — while
-    the call sites becoming `Tier.SIMPLE` pass model_hint="simple" today,
-    which is the LOCAL model. A migration that forgets `legacy_hint` silently
-    moves that call site local -> cloud on every deployment that has not
-    opted into governance, and TIER_GOVERNANCE_ENABLED=false stops being a
-    rollback. The three modality tiers are exempt: they have no legacy
-    behaviour to preserve.
-
-    AST rather than regex, because these calls span several lines and a
-    keyword can sit anywhere in the argument list.
-    """
-    import ast
-    import pathlib
-
-    root = pathlib.Path(__file__).resolve().parents[2]
-    skip = {"tests", "venv", ".git", "node_modules", "AgentStudio", "build", "dist"}
-    # The router IS the mechanism — it forwards `tier=tier` between its own
-    # entry points, which is plumbing rather than a call site.
-    self_exempt = {"models/model_router.py"}
-
-    offenders: list[str] = []
-    for path in sorted(root.rglob("*.py")):
-        rel = path.relative_to(root)
-        if skip & set(rel.parts) or str(rel) in self_exempt:
-            continue
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
-        except SyntaxError:                       # pragma: no cover - vendored
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            kw = {k.arg: k.value for k in node.keywords if k.arg}
-            tier_arg = kw.get("tier")
-            # Only a literal `Tier.X` is a migrated call site; `tier=tier` is
-            # a passthrough in a helper and is checked at ITS call sites.
-            if not (isinstance(tier_arg, ast.Attribute)
-                    and isinstance(tier_arg.value, ast.Name)
-                    and tier_arg.value.id == "Tier"):
-                continue
-            if tier_arg.attr in _NO_LEGACY_EQUIVALENT:
-                continue
-            if "legacy_hint" not in kw:
-                offenders.append(f"{rel}:{node.lineno} tier=Tier.{tier_arg.attr}")
-
-    assert not offenders, (
-        "these call sites request a tier without declaring what they did "
-        "before, so turning governance off no longer restores their previous "
-        "model (D15):\n  " + "\n  ".join(offenders)
-    )
