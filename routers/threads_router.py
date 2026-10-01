@@ -13,10 +13,7 @@ from pydantic import BaseModel
 from core.config import REDIS_HOST as _REDIS_HOST, REDIS_PORT as _REDIS_PORT
 from core.logger import logger
 from auth.dependencies import get_current_user
-from core.model_registry import (
-    OPENAI_CODING_MODEL as _OPENAI_CODING,
-    MODEL_COST_PER_1M as _MODEL_COST_PER_1M,
-)
+from core.model_registry import MODEL_COST_PER_1M as _MODEL_COST_PER_1M
 from core.security_validation import (
     validate_create_thread_request,
     validate_thread_message_request,

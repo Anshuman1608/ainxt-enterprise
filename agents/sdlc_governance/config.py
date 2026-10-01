@@ -34,7 +34,7 @@ from core.logger import logger
 # core.model_registry only defines env-var-backed string constants (no heavy
 # imports, no I/O) — a top-level import is safe and keeps this module simple.
 from core.model_registry import (
-    CLAUDE_PRIMARY_MODEL, CLAUDE_OPUS_MODEL, CLAUDE_OPUS_46_MODEL,
+    CLAUDE_OPUS_MODEL, CLAUDE_OPUS_46_MODEL,
     BLOCKED_MODELS, cli_coder_model, cli_tier_model_id,
 )
 

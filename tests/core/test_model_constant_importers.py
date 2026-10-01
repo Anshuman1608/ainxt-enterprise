@@ -16,24 +16,22 @@ modules §N.1 migrated — but it looks for ``{"model_hint": "<tier>"}`` dict
 literals and nothing else. A module on that list may therefore import as many
 SKU constants as it likes and stay green.
 
-It does — **six times**, not once. ``agents/review_engine.py`` is the clearest
-case: it is in ``_PHASE6_MIGRATED_MODULES`` and still picks its cross-model
-review pair from two SKU constants (``:99-100``), with an env-var fallback
-naming the same two (``:109-110``). §M.3 is the section that covers that call
-site; it was migrated for its ``model_hint`` and not for its model choice.
-Five more are listed in ``MIGRATED_STILL_IMPORTING`` below. This file is what
-notices.
+It did — six times when this file was written. Four have since been fixed as
+Phase 8 prerequisites (the constants are deleted there, and each would have
+become ``""`` rather than an error). The two left in
+``MIGRATED_STILL_IMPORTING`` below are Phase 8's own work, with the reason
+recorded against each.
 
 WHY A RATCHET AND NOT A ZERO-RULE
 ---------------------------------
-Measured: **17 modules, 122 import sites**. Four of them account for 101, and
-all four are Phase 8's own targets — deleting the constants is that phase's
-entire job, so a zero-rule today would be a rule nobody can satisfy until
-after the phase that makes it satisfiable. The ratchet is the convention this
+Measured: **13 modules, 116 import sites** (was 17 / 122). Four hold most of
+it and all four are Phase 8's own targets — deleting the constants is that
+phase's entire job, so a zero-rule today would be a rule nobody can satisfy
+until after the phase that makes it satisfiable. The ratchet is the convention this
 repository already uses for exactly this situation
 (``release_checks._MODEL_LITERAL_BASELINE``): the count may fall, never rise.
 
-The tail of 13 modules with one to three imports each is what it actually
+The tail of modules with one to three imports each is what it actually
 guards, and the tail is where a new coupling would appear.
 """
 
@@ -131,39 +129,28 @@ ALLOWLIST = {
         "separate on purpose because core/ may be unimportable there (D63).",
 }
 
-#: Measured 2026-09-30. May fall, never rise.
-BASELINE_MODULES = 17
-BASELINE_SITES = 122
+#: Measured 2026-09-30. May fall, never rise. Was 17 / 122; lowered when the
+#: four Phase-8-prerequisite modules stopped naming vendors.
+BASELINE_MODULES = 13
+BASELINE_SITES = 116
 
 #: Modules that release_checks._PHASE6_MIGRATED_MODULES calls migrated and
-#: that still reach a vendor by its constant. Recorded rather than fixed:
-#: every one is a production change, and Phase 9 is a test phase — a routing
-#: change hidden in a green test diff is the failure mode this whole migration
-#: exists to remove. Each is owned work before Phase 8 deletes the constant
-#: out from under it.
+#: that still reach a vendor by its constant. Both remaining entries belong to
+#: Phase 8 itself, for the reason recorded against each.
 #:
 #: This set may SHRINK and may not GROW. A module arriving here is a module
 #: that was declared migrated while still choosing its own vendor.
 MIGRATED_STILL_IMPORTING = {
-    "agents/review_engine.py":
-        "§M.3 cross-provider review. Picks both reviewers by SKU "
-        "(CLAUDE_HAIKU, GEMINI_TEXT_MODEL) and falls back to the same two "
-        "env vars. Should ask for a tier plus a cross-family constraint.",
     "agents/sdlc_governance/config.py":
-        "the SDLC approved-model policy names three Claude SKUs. Arguably an "
-        "audit/policy surface (§P permits those), but it is read at "
-        "selection time, so it is listed until that is settled.",
-    "agents/sdlc_state_machine.py":
-        "one CLAUDE_PRIMARY_MODEL, used as the stage default.",
+        "CLAUDE_OPUS_MODEL / CLAUDE_OPUS_46_MODEL, added to a DENY-list when "
+        "ENABLE_OPUS is off. §I assigns ENABLE_OPUS and the BLOCKED_MODELS "
+        "narrowing to Phase 8; removing these early re-enables Opus for the "
+        "governance fixer. Phase 8's own work, not a prerequisite for it.",
     "routers/chat_router.py":
-        "GEMINI_IMAGE_MODEL and VEO_MODEL. §P already carries a separate item "
-        "for this file's hard-pinned provider; the image/video pins are the "
-        "same defect in constant form.",
-    "routers/projects_router.py":
-        "one OPENAI_CODING_MODEL.",
-    "routers/threads_router.py":
-        "one OPENAI_CODING_MODEL. Twin of the above — the two were migrated "
-        "together in §N.1 step 4 and share the residue.",
+        "GEMINI_IMAGE_MODEL is only a MODEL_COST_PER_1M key — a cost table, "
+        "which §P permits. VEO_MODEL is a warn-once deprecated override whose "
+        "primary path is already resolve_media_model(VIDEO_GENERATION). Both "
+        "die with the variables in Phase 8.",
 }
 
 
@@ -299,8 +286,8 @@ def test_no_new_migrated_module_imports_a_sku_constant(importers):
     """The regression this file was written for.
 
     "Migrated" has meant "no tier string in a model_hint" and nothing more.
-    Six modules on that list still choose their own vendor by constant; they
-    are recorded in MIGRATED_STILL_IMPORTING with what each does. The rule is
+    Modules on that list that still choose their own vendor by constant are
+    recorded in MIGRATED_STILL_IMPORTING with what each does. The rule is
     that the set may shrink and may not grow — fixing one is a production
     change and belongs in its own commit, but declaring a NEW module migrated
     while it still names a vendor is the mistake this catches.

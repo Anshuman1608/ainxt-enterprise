@@ -10,7 +10,7 @@ DESIGN
 ------
 Phase 1 (M):
   - Run same review prompt on 2 models in parallel (ThreadPoolExecutor)
-  - Default: [CLAUDE_HAIKU, GEMINI_FLASH] (cost-efficient)
+  - Default: two `simple`-tier models of different families (§M.3b)
   - Parse both into structured ReviewResult
   - Flag claims in one but not the other
   - Return {agreed: [...], disagreed: [...], consensus_score: float}
@@ -84,32 +84,17 @@ class ReviewEngine:
         """
         Run the same review prompt on 2 models in parallel and compute consensus.
 
+        Each future dispatches on its OWN model id; before this they all ran
+        the same tier request, so the score compared a model with itself.
+
         review_type: "security" | "quality" | "performance" | "general"
-        models: list of model identifiers (default: [CLAUDE_HAIKU, GEMINI_FLASH])
+        models: concrete model ids; default is two `simple`-tier models of
+                different families, or one when only one family is configured
 
         Returns ConsensusResult with agreed/disagreed issues and consensus_score.
         """
         if models is None:
-            try:
-                # GEMINI_FLASH does not exist in core.model_registry, so this
-                # import raised ImportError on EVERY call and the fallback below
-                # always won -- the review engine used gemini-2.0-flash whatever
-                # the deployment had configured. GEMINI_TEXT_MODEL is the real
-                # constant.
-                from core.model_registry import CLAUDE_HAIKU, GEMINI_TEXT_MODEL
-                models = [CLAUDE_HAIKU, GEMINI_TEXT_MODEL]
-            except Exception:
-                # Last-resort fallback: read the same env vars the registry uses.
-                # No hardcoded model IDs — if the vars are unset the list is
-                # filtered to non-empty strings so callers get an empty list
-                # rather than a broken model name.
-                import os as _os
-                models = [
-                    m for m in (
-                        _os.getenv("CLAUDE_HAIKU", ""),
-                        _os.getenv("GEMINI_TEXT_MODEL", ""),
-                    ) if m
-                ]
+            models = self._default_reviewer_pair()
 
         prompt = self._build_review_prompt(code, review_type, language)
 
@@ -179,19 +164,52 @@ class ReviewEngine:
             f"Code:\n```{language}\n{code[:3000]}\n```"
         )
 
+    def _default_reviewer_pair(self) -> List[str]:
+        """Two reviewers from the `simple` tier, of different families (§M.3b).
+
+        Returns one id when the deployment has only one family — an honest
+        single-reviewer review beats two calls to the same model.
+        """
+        from core.tiers import Tier
+        from core.tier_resolver import Constraints, NoEligibleModel
+        from core.tier_resolver import resolve_tier_candidates
+        try:
+            cands = resolve_tier_candidates(Tier.SIMPLE)
+        except NoEligibleModel as exc:
+            logger.warning(f"ReviewEngine: no model serves 'simple' ({exc})")
+            return []
+        first = cands[0]
+        for c in cands[1:]:
+            if c.family and c.family != first.family:
+                return [first.model_id, c.model_id]
+        try:
+            other = resolve_tier_candidates(
+                Tier.SIMPLE, Constraints(distinct_from_family=first.family))
+            return [first.model_id, other[0].model_id]
+        except NoEligibleModel:
+            logger.info(
+                "ReviewEngine: only the %r family serves 'simple' — reviewing "
+                "with one model rather than asking the same one twice",
+                first.family,
+            )
+            return [first.model_id]
+
     def _run_review(self, model: str, prompt: str) -> ReviewResult:
         """Run a review prompt on a single model."""
         try:
-            # Phase 6 §N.1 step 3 / §D.2 "Review-engine verdicts" — the
-            # output is JSON parsed by the caller, so a parse failure breaks
-            # the caller outright. Reliability matters more than minimum
-            # cost, which is `simple` rather than `mini`. temperature=0.0 is
-            # unchanged. legacy_hint keeps today's routing with the flag off.
+            # §D.2 "Review-engine verdicts": output is JSON the caller parses,
+            # so reliability beats minimum cost — `simple`, not `mini`.
+            # `model` is a concrete id from _default_reviewer_pair or the
+            # caller; the tier is the fallback when it is blank.
             from core.tiers import Tier
             from models.model_router import get_router
-            raw = get_router().generate(
-                prompt, tier=Tier.SIMPLE, legacy_hint="simple",
-                temperature=0.0).strip()
+            if model:
+                raw = get_router().generate(
+                    prompt, model_hint=model, temperature=0.0).strip()
+            else:
+                raw = get_router().generate(
+                    prompt, tier=Tier.SIMPLE, legacy_hint="simple",
+                    temperature=0.0).strip()
 
             # Parse JSON response
             import json

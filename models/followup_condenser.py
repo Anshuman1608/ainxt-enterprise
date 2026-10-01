@@ -46,7 +46,7 @@
 #
 # Design mirrors models/query_rewriter.py's existing conventions:
 #   - Redis-backed cache (same KV backend, same TTL style)
-#   - model_router.generate() with a cheap model_hint
+#   - model_router.generate() asking for the `simple` capability tier
 #   - fail-safe: any error falls back to the original question, never raises
 #
 # Callers: gateway.py's ask_ai() KB fast-path, called on EVERY turn that has
@@ -75,23 +75,11 @@ CONDENSE_CACHE_TTL = 86400  # 24h — same rationale as query_rewriter's 7-day
 _MAX_STANDALONE_LEN   = 300
 _MAX_STANDALONE_NEWLINES = 0
 
-# Condensation model chain — tried in order, first one to produce a valid
-# standalone question wins. Every hop is a CHEAP/FAST model chosen only for
-# this small rewrite task; none of them is ever the user's selected chat
-# model (q.model) — that selection is reserved entirely for the actual
-# answer the user sees, generated later in gateway.py using the RAG chunks
-# this condensed question retrieves. Kept as an explicit configured chain
-# (not model_router's own built-in Haiku fallback, which lands on a PAID
-# model — GPT-5.4) so a hop failure degrades along a chain WE control instead
-# of incurring unplanned cloud cost for what is just a short rewrite task.
-#
-# Configured via KB_FOLLOWUP_CONDENSE_MODEL_CHAIN in core/config.py (env var
-# KB_FOLLOWUP_CONDENSE_MODEL_CHAIN, comma-separated) — retune per-environment
-# with no code change. Default chain: "local:gpt-oss-120b,haiku" — try the
-# in-house model first (zero marginal cost), Claude Haiku as the cloud
-# fallback. See core/config.py's KB_FOLLOWUP_CONDENSE_MODEL_CHAIN docstring
-# for the full rationale and format.
-_CONDENSE_MODEL_CHAIN = KB_FOLLOWUP_CONDENSE_MODEL_CHAIN
+# The condense rewrite asks for the `simple` tier. Still never the user's
+# chosen chat model (q.model) — that serves the actual answer in gateway.py.
+# _CONDENSE_OVERRIDE is the deprecated env pin, empty unless set; first entry
+# only, since ordering is the tier assignment's job. Removed in Phase 8.
+_CONDENSE_OVERRIDE = (KB_FOLLOWUP_CONDENSE_MODEL_CHAIN or [""])[0]
 
 
 def _cache_key(history_text: str, question: str) -> str:
@@ -207,83 +195,63 @@ def condense_followup(
             "decision, and no acknowledgement of these instructions."
         )
 
-        from models.model_router import model_router
+        from core.tiers import Tier
+        from models.model_router import model_router, tier_request
+
+        _asked = _CONDENSE_OVERRIDE or Tier.SIMPLE.value
         standalone = None
-        for _hop_model in _CONDENSE_MODEL_CHAIN:
-            try:
-                raw = model_router.generate(prompt, model_hint=_hop_model)
-            except Exception as _hop_exc:
-                logger.warning(
-                    f"followup_condenser: hop {_hop_model!r} raised ({_hop_exc}), "
-                    f"trying next hop chat_id={chat_id}"
-                )
-                continue
-
-            # IMPORTANT: model_router.generate() has its OWN internal
-            # fallback chains that activate silently on failure — e.g. if
-            # real Claude Haiku is down, "haiku" transparently serves the
-            # response via GPT-5.4 instead and returns it as a normal
-            # (non-"Error"-prefixed) string. Checked-in isolation, that looks
-            # like a successful "haiku" call — but it's actually a PAID model
-            # we deliberately excluded from this chain (see
-            # _CONDENSE_MODEL_CHAIN's docstring). The same applies to the
-            # local hop, which can silently fall through to GPT-5 mini or
-            # Claude Sonnet if the in-house model is unavailable.
-            #
-            # model_router.last_model_label always reflects which model
-            # ACTUALLY served the request (thread-local, safe to read right
-            # after generate() returns), and every internal-fallback path in
-            # model_router.py consistently tags its label with "[fallback]".
-            # So: if that marker is present, the model we asked for was NOT
-            # the one that answered — treat this hop as failed and move on,
-            # even though the text itself looks like a valid response.
-            _actual_label = model_router.last_model_label or ""
-            if "[fallback]" in _actual_label:
-                logger.warning(
-                    f"followup_condenser: hop {_hop_model!r} silently served by "
-                    f"a different model ({_actual_label!r}) — treating as failed, "
-                    f"trying next hop chat_id={chat_id}"
-                )
-                continue
-
-            candidate = (raw or "").strip().strip('"').strip()
-
-            # model_router.generate() never raises — it returns an "Error..."
-            # string on failure (e.g. "Error: no gateway available"). Treat
-            # that as a failed hop, same as the sanity checks below.
-            if not candidate or candidate.startswith("Error"):
-                logger.warning(
-                    f"followup_condenser: hop {_hop_model!r} returned no usable "
-                    f"output, trying next hop chat_id={chat_id}"
-                )
-                continue
-            if len(candidate) > _MAX_STANDALONE_LEN:
-                logger.warning(
-                    f"followup_condenser: hop {_hop_model!r} output too long "
-                    f"({len(candidate)} chars), trying next hop chat_id={chat_id}"
-                )
-                continue
-            if candidate.count("\n") > _MAX_STANDALONE_NEWLINES:
-                logger.warning(
-                    f"followup_condenser: hop {_hop_model!r} multi-line output, "
-                    f"trying next hop chat_id={chat_id}"
-                )
-                continue
-
-            standalone = candidate
-            if _hop_model != _CONDENSE_MODEL_CHAIN[0]:
-                logger.info(
-                    f"followup_condenser: primary hop failed, fell back to "
-                    f"{_hop_model!r} chat_id={chat_id}"
-                )
-            break
-
-        if not standalone:
+        try:
+            raw = model_router.generate(prompt, **tier_request(
+                Tier.SIMPLE, "haiku", _CONDENSE_OVERRIDE,
+                override_name="KB_FOLLOWUP_CONDENSE_MODEL_CHAIN"))
+        except Exception as _exc:
             logger.warning(
-                f"followup_condenser: all hops in {_CONDENSE_MODEL_CHAIN} failed, "
-                f"falling back to original question chat_id={chat_id}"
+                f"followup_condenser: {_asked!r} raised ({_exc}), falling back "
+                f"to the original question chat_id={chat_id}"
             )
             return question
+
+        # Cost guard: a within-tier choice is the admin's decision, but the
+        # resolver walking TIER_FALLBACK_LADDER leaves `simple` altogether and
+        # can bill a heavy model for a one-sentence rewrite. Replaces the old
+        # "[fallback]" label check, which only the legacy path ever sets.
+        _fi = getattr(model_router, "last_decision", None)
+        if _fi is not None and getattr(_fi, "fallback_occurred", False):
+            logger.warning(
+                f"followup_condenser: {_asked!r} was served from outside its "
+                f"tier ({_fi.from_tier!r} -> {_fi.to_tier!r}, {_fi.to_label!r}) "
+                f"— rejecting rather than paying heavier-tier cost for a "
+                f"rewrite, falling back to the original question "
+                f"chat_id={chat_id}"
+            )
+            return question
+
+        candidate = (raw or "").strip().strip('"').strip()
+
+        # model_router.generate() never raises — it returns an "Error..."
+        # string on failure (e.g. "Error: no gateway available"). Treat that
+        # exactly like the sanity failures below.
+        if not candidate or candidate.startswith("Error"):
+            logger.warning(
+                f"followup_condenser: {_asked!r} returned no usable output, "
+                f"falling back to the original question chat_id={chat_id}"
+            )
+            return question
+        if len(candidate) > _MAX_STANDALONE_LEN:
+            logger.warning(
+                f"followup_condenser: {_asked!r} output too long "
+                f"({len(candidate)} chars), falling back to the original "
+                f"question chat_id={chat_id}"
+            )
+            return question
+        if candidate.count("\n") > _MAX_STANDALONE_NEWLINES:
+            logger.warning(
+                f"followup_condenser: {_asked!r} multi-line output, falling "
+                f"back to the original question chat_id={chat_id}"
+            )
+            return question
+
+        standalone = candidate
 
         try:
             redis_client.setex(cache_key, CONDENSE_CACHE_TTL, standalone)

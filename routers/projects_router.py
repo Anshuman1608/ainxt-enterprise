@@ -13,10 +13,7 @@ from pydantic import BaseModel
 
 from core.logger import logger, set_request_id, set_chat_context, bind_context, set_span_id
 from auth.dependencies import get_current_user
-from core.model_registry import (
-    OPENAI_CODING_MODEL as _OPENAI_CODING,
-    MODEL_COST_PER_1M as _MODEL_COST_PER_1M,
-)
+from core.model_registry import MODEL_COST_PER_1M as _MODEL_COST_PER_1M
 from core.security_validation import (
     validate_security,
     validate_description,
@@ -368,9 +365,12 @@ def ask_project(
         finally:
             latency = round(time.time() - start, 2)
             try:
-                from models.model_router import model_router as _mr
+                from models.model_router import (
+                    model_router as _mr, dispatched_model_id as _dmid,
+                )
                 # Use snapshotted label (set before eval threads start) — avoids race condition
-                model   = getattr(local_agent, "last_run_model_label", None) or getattr(_mr, "last_model_label", _OPENAI_CODING)
+                model   = (getattr(local_agent, "last_run_model_label", None)
+                           or _dmid(_mr, "") or "unknown")
                 _real_in  = getattr(_mr, "last_input_tokens",  0) or 0
                 _real_out = getattr(_mr, "last_output_tokens", 0) or 0
                 if _real_in > 0 or _real_out > 0:
@@ -380,13 +380,17 @@ def ask_project(
                     in_tok  = int(len(question.split()) * 1.3)
                     out_tok = int(len(full.split()) * 1.3)
             except Exception:
-                model   = _OPENAI_CODING
+                model   = "unknown"
                 in_tok  = int(len(question.split()) * 1.3)
                 out_tok = int(len(full.split()) * 1.3)
 
             # Local/Ollama models are free — check before applying paid rates
             _ml = (model or "").lower()
-            if "ollama" in _ml or "local" in _ml or "llama" in _ml:
+            if _ml in ("", "unknown"):
+                # Don't bill a run we couldn't identify at a guessed paid rate.
+                logger.warning("ProjectAsk: model unidentified — recording 0 cost")
+                cost = 0.0
+            elif "ollama" in _ml or "local" in _ml or "llama" in _ml:
                 cost = 0.0
             else:
                 rates = _MODEL_COST_PER_1M.get(model, (2.00, 8.00))

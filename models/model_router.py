@@ -1575,19 +1575,22 @@ class FallbackInfo:
     reason : str
         Short machine-readable reason tag.
         "primary"       — normal path, no fallback.
+        "tier_fallback" — the RESOLVER walked TIER_FALLBACK_LADDER: nothing
+                          assigned to the requested tier survived the
+                          constraints, so a weaker tier supplied the model.
         "unavailable"   — primary gateway was None / circuit breaker open.
         "error"         — primary call raised an exception.
         "empty"         — primary returned an empty or Error: response.
-        "not_set"       — sentinel: generate() was never called on this thread.
+        "not_set"       — sentinel: no routed call yet on this thread.
 
     Notes
     -----
-    * Set by generate() after every blocking call.
-    * NOT set by stream() — stream() does not collect a complete response, so
-      we cannot reliably detect the fallback point mid-stream.  last_decision
-      is left as the previous call's value (or the thread-local default) during
-      streaming.  If you need fallback tracking for streaming, check
-      last_model_label for the "[fallback]" suffix.
+    * Set by _record_selection() — generate(), stream(), async_generate() and
+      async_stream(). Reports the RESOLVER walking TIER_FALLBACK_LADDER.
+    * Does NOT report a gateway failing over mid-call; that stays visible only
+      through last_model_label's "[fallback]" suffix, on generate() only.
+    * generate_structured() does not call _record_selection(), so it leaves
+      this and the §L.5 fields untouched (pre-existing).
     * Thread-safe: backed by threading.local() on ModelRouter._tl.
     """
     fallback_occurred: bool
@@ -2445,7 +2448,28 @@ class ModelRouter:
         self._tl.last_requested_tier = v
 
     def _record_selection(self, decision: "RoutingDecision") -> None:
-        """Record the §L.5 provenance of this decision for the audit row."""
+        """Record the §L.5 provenance of this decision, and publish last_decision.
+
+        last_decision (FallbackInfo) had a property and setter but no assignment
+        anywhere, so every reader saw the not_set sentinel. Set here rather than
+        in generate() because it reports the RESOLVER walking the ladder, which
+        is known at route() time and so is equally valid while streaming.
+        """
+        top = decision.resolved[0] if decision.resolved else None
+        _via = bool(getattr(decision, "fallback", False))
+        _req = (top.requested_tier.value
+                if top is not None and top.requested_tier is not None else "")
+        _got = (top.tier.value
+                if top is not None and top.tier is not None else "")
+        self.last_decision = FallbackInfo(
+            fallback_occurred=_via,
+            from_tier=_req or str(decision.tier or ""),
+            from_label=_req or str(decision.tier or ""),
+            to_tier=_got or _req or str(decision.tier or ""),
+            to_label=decision.model or "",
+            reason="tier_fallback" if _via else "primary",
+        )
+
         if decision.resolved:
             top = decision.resolved[0]
             self.last_selection_mode = top.selection_mode
@@ -4587,6 +4611,19 @@ class ModelRouter:
 # ============================================================
 
 model_router = ModelRouter()
+
+
+def get_router() -> ModelRouter:
+    """The router singleton.
+
+    Four call sites in three modules already did `from models.model_router
+    import get_router` — agents/review_engine.py (x2),
+    agents/advanced_reasoning.py and memory/postgres_memory.py — and it did
+    not exist, so every one of them raised ImportError into a bare
+    `except Exception` and silently returned its failure value. Adding the
+    accessor they expect repairs all four rather than rewriting each.
+    """
+    return model_router
 
 
 def resolve_media_model(tier: Tier, *, channel: Optional[str] = None):

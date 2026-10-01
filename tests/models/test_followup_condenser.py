@@ -72,39 +72,45 @@ def test_build_history_text_skips_empty_content():
     assert text.count("\n") == 0  # only one non-empty line
 
 
-# ── model chain — configurability (core/config.py wiring) ───────────────────
+# ── the condense model request (core/config.py wiring) ──────────────────────
 
-def test_condense_model_chain_default_matches_config():
-    """The module-level chain must come from core.config's
-    KB_FOLLOWUP_CONDENSE_MODEL_CHAIN (not a hardcoded literal in this
-    module) — this is what makes the chain configurable via the
-    KB_FOLLOWUP_CONDENSE_MODEL_CHAIN env var with no code change."""
+def test_condense_override_default_is_empty():
+    """Empty by default, and that is load-bearing: a value here is passed as
+    tier_request(override=), which outranks the tier assignment. A non-empty
+    default would make governance unreachable for this call site."""
     from core.config import KB_FOLLOWUP_CONDENSE_MODEL_CHAIN
-    assert fc._CONDENSE_MODEL_CHAIN == KB_FOLLOWUP_CONDENSE_MODEL_CHAIN
+    assert KB_FOLLOWUP_CONDENSE_MODEL_CHAIN == []
+    assert fc._CONDENSE_OVERRIDE == ""
 
 
-def test_condense_model_chain_default_value():
-    """Default chain (no env var set): local:gpt-oss-120b first (zero
-    marginal cost in-house model), haiku as the cloud fallback."""
-    assert fc._CONDENSE_MODEL_CHAIN == ["local:gpt-oss-120b", "haiku"]
+def test_condense_override_takes_only_the_first_entry():
+    """The remaining hops are the tier assignment's job now."""
+    parsed = [m.strip() for m in "a,b,c".split(",") if m.strip()]
+    assert (parsed or [""])[0] == "a"
 
 
-def test_condense_model_chain_env_var_override(monkeypatch):
-    """Setting KB_FOLLOWUP_CONDENSE_MODEL_CHAIN must change the resolved
-    chain with no code change — verified by re-importing core.config's
-    module-level constant construction logic directly (the env var is read
-    at import time, so we simulate that by re-running the same os.getenv
-    parsing the module performs, rather than reloading the whole module
-    tree — reloading core.config mid-test-suite risks other modules that
-    already cached the old constant)."""
-    monkeypatch.setenv("KB_FOLLOWUP_CONDENSE_MODEL_CHAIN", "haiku,local:kimi-k2.7-code,local:glm-5.2")
-    import os as _os
-    _parsed = [
-        m.strip() for m in _os.getenv(
-            "KB_FOLLOWUP_CONDENSE_MODEL_CHAIN", "local:gpt-oss-120b,haiku"
-        ).split(",") if m.strip()
-    ]
-    assert _parsed == ["haiku", "local:kimi-k2.7-code", "local:glm-5.2"]
+def test_the_condenser_asks_for_a_tier_not_a_sku(monkeypatch, fake_redis):
+    """rule 1: application code may not name a LEGACY_INBOUND_ALIASES key.
+
+    The old default was "haiku", which is one.
+    """
+    from core.tiers import Tier, LEGACY_INBOUND_ALIASES
+    seen = {}
+
+    def _capture(prompt, **kw):
+        seen.update(kw)
+        return "standalone q"
+
+    monkeypatch.setattr(fc, "_CONDENSE_OVERRIDE", "")
+    monkeypatch.setattr("models.model_router.model_router.generate", _capture)
+    fc.condense_followup("what about step 3?", _history())
+
+    assert seen.get("tier") is Tier.SIMPLE
+    assert "model_hint" not in seen
+    assert seen.get("legacy_hint") == "haiku", (
+        "legacy_hint keeps flag-off routing identical (D15) and must survive"
+    )
+    assert LEGACY_INBOUND_ALIASES.get("haiku") is Tier.SIMPLE
 
 
 # ── condense_followup — happy path ──────────────────────────────────────────
@@ -112,7 +118,7 @@ def test_condense_model_chain_env_var_override(monkeypatch):
 def test_condense_followup_returns_llm_output(monkeypatch, fake_redis):
     monkeypatch.setattr(
         "models.model_router.model_router.generate",
-        lambda prompt, model_hint=None: "What is the UPI settlement confirmation step?",
+        lambda prompt, **kw: "What is the UPI settlement confirmation step?",
     )
     result = fc.condense_followup("what about step 3?", _history(), chat_id="chat-1")
     assert result == "What is the UPI settlement confirmation step?"
@@ -121,7 +127,7 @@ def test_condense_followup_returns_llm_output(monkeypatch, fake_redis):
 def test_condense_followup_caches_result(monkeypatch, fake_redis):
     calls = {"n": 0}
 
-    def _fake_generate(prompt, model_hint=None):
+    def _fake_generate(prompt, **kw):
         calls["n"] += 1
         return "standalone question"
 
@@ -159,21 +165,21 @@ def test_condense_followup_falls_back_on_llm_exception(monkeypatch, fake_redis):
 
 
 def test_condense_followup_falls_back_on_empty_llm_output(monkeypatch, fake_redis):
-    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, model_hint=None: "")
+    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, **kw: "")
     result = fc.condense_followup("what about step 3?", _history())
     assert result == "what about step 3?"
 
 
 def test_condense_followup_falls_back_on_too_long_output(monkeypatch, fake_redis):
     too_long = "x" * (fc._MAX_STANDALONE_LEN + 50)
-    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, model_hint=None: too_long)
+    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, **kw: too_long)
     result = fc.condense_followup("what about step 3?", _history())
     assert result == "what about step 3?"
 
 
 def test_condense_followup_falls_back_on_multiline_output(monkeypatch, fake_redis):
     multiline = "line one\nline two\nline three"
-    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, model_hint=None: multiline)
+    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, **kw: multiline)
     result = fc.condense_followup("what about step 3?", _history())
     assert result == "what about step 3?"
 
@@ -181,7 +187,7 @@ def test_condense_followup_falls_back_on_multiline_output(monkeypatch, fake_redi
 def test_condense_followup_strips_surrounding_quotes(monkeypatch, fake_redis):
     monkeypatch.setattr(
         "models.model_router.model_router.generate",
-        lambda p, model_hint=None: '"What is the settlement step?"',
+        lambda p, **kw: '"What is the settlement step?"',
     )
     result = fc.condense_followup("what about step 3?", _history())
     assert result == "What is the settlement step?"
@@ -192,7 +198,7 @@ def test_condense_followup_redis_get_failure_does_not_raise(monkeypatch, fake_re
         raise ConnectionError("redis down")
 
     monkeypatch.setattr(fake_redis, "get", _raise_get)
-    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, model_hint=None: "standalone q")
+    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, **kw: "standalone q")
 
     result = fc.condense_followup("what about step 3?", _history())
     assert result == "standalone q"  # still works, just skips the cache
@@ -203,219 +209,118 @@ def test_condense_followup_redis_setex_failure_does_not_raise(monkeypatch, fake_
         raise ConnectionError("redis down")
 
     monkeypatch.setattr(fake_redis, "setex", _raise_setex)
-    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, model_hint=None: "standalone q")
+    monkeypatch.setattr("models.model_router.model_router.generate", lambda p, **kw: "standalone q")
 
     result = fc.condense_followup("what about step 3?", _history())
     assert result == "standalone q"  # cache write failure is non-fatal
 
 
-# ── condense_followup — model fallback chain ────────────────────────────────
+# ── the deprecated explicit override ────────────────────────────────────────
 #
-# The chain is CONFIGURABLE (core/config.py's KB_FOLLOWUP_CONDENSE_MODEL_CHAIN,
-# env var KB_FOLLOWUP_CONDENSE_MODEL_CHAIN) and independent of the user's
-# chosen chat model (q.model in gateway.py) — this is a small internal
-# utility call, never the model the user picked for their actual answer. See
-# _CONDENSE_MODEL_CHAIN's docstring in followup_condenser.py.
-#
-# Tests below read the configured chain from fc._CONDENSE_MODEL_CHAIN rather
-# than hardcoding specific model names, so they stay correct regardless of
-# which models are configured as the default (only the ORDER/FALLBACK
-# BEHAVIOR is under test here, not any particular model choice).
+# KB_FOLLOWUP_CONDENSE_MODEL_CHAIN used to be an ordered hop chain walked by
+# this module. It is now a single pin handed to tier_request(override=), which
+# warns once per process. Phase 8 removes it. Ordering is the admin's priority
+# order on the `simple` tier, walked by resolve_tier_candidates().
 
-_PRIMARY = fc._CONDENSE_MODEL_CHAIN[0]
-_SECONDARY = fc._CONDENSE_MODEL_CHAIN[1]
+def test_an_explicit_override_wins_over_the_tier(monkeypatch, fake_redis):
+    seen = {}
 
+    def _capture(prompt, **kw):
+        seen.update(kw)
+        return "standalone q"
 
-def test_condense_followup_uses_primary_hop_when_it_succeeds(monkeypatch, fake_redis):
-    calls = []
-
-    def _fake_generate(prompt, model_hint=None):
-        calls.append(model_hint)
-        return "standalone question"
-
-    monkeypatch.setattr("models.model_router.model_router.generate", _fake_generate)
-    result = fc.condense_followup("what about step 3?", _history())
-
-    assert result == "standalone question"
-    assert calls == [_PRIMARY]  # only the primary hop was called — no fallback needed
-
-
-def test_condense_followup_falls_back_to_local_model_on_error_string(monkeypatch, fake_redis):
-    calls = []
-
-    def _fake_generate(prompt, model_hint=None):
-        calls.append(model_hint)
-        if model_hint == _PRIMARY:
-            return "Error: no gateway available"  # model_router's failure shape
-        return "What is the settlement confirmation step?"
-
-    monkeypatch.setattr("models.model_router.model_router.generate", _fake_generate)
-    result = fc.condense_followup("what about step 3?", _history())
-
-    assert result == "What is the settlement confirmation step?"
-    assert calls == [_PRIMARY, _SECONDARY]  # fell through to the secondary hop
-
-
-def test_condense_followup_falls_back_to_local_model_on_exception(monkeypatch, fake_redis):
-    calls = []
-
-    def _fake_generate(prompt, model_hint=None):
-        calls.append(model_hint)
-        if model_hint == _PRIMARY:
-            raise RuntimeError("primary hop circuit breaker open")
-        return "standalone from secondary hop"
-
-    monkeypatch.setattr("models.model_router.model_router.generate", _fake_generate)
-    result = fc.condense_followup("what about step 3?", _history())
-
-    assert result == "standalone from secondary hop"
-    assert calls == [_PRIMARY, _SECONDARY]
-
-
-def test_condense_followup_falls_back_to_local_model_on_bad_output(monkeypatch, fake_redis):
-    calls = []
-
-    def _fake_generate(prompt, model_hint=None):
-        calls.append(model_hint)
-        if model_hint == _PRIMARY:
-            return "line one\nline two\nline three"  # malformed — multi-line
-        return "standalone from secondary hop"
-
-    monkeypatch.setattr("models.model_router.model_router.generate", _fake_generate)
-    result = fc.condense_followup("what about step 3?", _history())
-
-    assert result == "standalone from secondary hop"
-    assert calls == [_PRIMARY, _SECONDARY]
-
-
-def test_condense_followup_returns_original_when_all_hops_fail(monkeypatch, fake_redis):
-    calls = []
-
-    def _fake_generate(prompt, model_hint=None):
-        calls.append(model_hint)
-        return "Error: no gateway available"  # every hop fails
-
-    monkeypatch.setattr("models.model_router.model_router.generate", _fake_generate)
-    result = fc.condense_followup("what about step 3?", _history())
-
-    assert result == "what about step 3?"  # falls back to original, never raises
-    assert calls == [_PRIMARY, _SECONDARY]  # tried every hop before giving up
-
-
-def test_condense_followup_never_calls_a_model_outside_the_configured_chain(monkeypatch, fake_redis):
-    """The fallback chain must stay within the CONFIGURED hops only — never
-    GPT-5.4 or Claude Sonnet, which is model_router's OWN built-in
-    fallback-on-primary-hop-failure that we deliberately bypass by catching
-    the failure ourselves."""
-    calls = []
-
-    def _fake_generate(prompt, model_hint=None):
-        calls.append(model_hint)
-        return "Error: no gateway available"
-
-    monkeypatch.setattr("models.model_router.model_router.generate", _fake_generate)
+    monkeypatch.setattr(fc, "_CONDENSE_OVERRIDE", "some-pinned-model")
+    monkeypatch.setattr("models.model_router.model_router.generate", _capture)
     fc.condense_followup("what about step 3?", _history())
 
-    assert "gpt-5.4" not in [c.lower() if c else c for c in calls]
-    assert "claude sonnet" not in [c.lower() if c else c for c in calls]
-    assert all(c in fc._CONDENSE_MODEL_CHAIN for c in calls)
+    assert seen == {"model_hint": "some-pinned-model"}
 
 
-def test_condense_followup_caches_only_the_winning_hops_output(monkeypatch, fake_redis):
-    calls = []
-
-    def _fake_generate(prompt, model_hint=None):
-        calls.append(model_hint)
-        if model_hint == _PRIMARY:
-            return "Error: no gateway available"
-        return "standalone from secondary hop"
-
-    monkeypatch.setattr("models.model_router.model_router.generate", _fake_generate)
-
-    first = fc.condense_followup("what about step 3?", _history())
-    second = fc.condense_followup("what about step 3?", _history())
-
-    assert first == second == "standalone from secondary hop"
-    # Only 2 calls total (both hops on the FIRST invocation) — the second
-    # invocation must hit the cache and make zero further LLM calls.
-    assert calls == [_PRIMARY, _SECONDARY]
+def test_the_override_warns_that_it_is_deprecated(monkeypatch, fake_redis, caplog):
+    import models.model_router as _mr
+    monkeypatch.setattr(_mr, "_TIER_OVERRIDE_WARNED", set())
+    monkeypatch.setattr(fc, "_CONDENSE_OVERRIDE", "some-pinned-model")
+    monkeypatch.setattr("models.model_router.model_router.generate",
+                        lambda p, **kw: "standalone q")
+    with caplog.at_level("WARNING"):
+        fc.condense_followup("what about step 3?", _history())
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "KB_FOLLOWUP_CONDENSE_MODEL_CHAIN" in joined
+    assert "DEPRECATED" in joined.upper()
 
 
-# ── condense_followup — detecting model_router's OWN silent internal
-# fallback (the "[fallback]" label marker) ──────────────────────────────────
+# ── the cost guard ──────────────────────────────────────────────────────────
 #
-# model_router.generate() can silently substitute a DIFFERENT model than the
-# one requested (e.g. the primary hop secretly served by GPT-5.4, or the
-# secondary hop secretly served by GPT-5 mini / Claude Sonnet) and still
-# return a normal, non-"Error"-prefixed string. The only way to detect this
-# is via model_router.last_model_label, which always carries a "[fallback]"
-# suffix when this happens (consistent across every internal fallback path
-# in models/model_router.py). These tests simulate that by setting
-# last_model_label alongside the mocked generate() return value.
+# A within-tier choice is the administrator's decision and is accepted. The
+# resolver walking TIER_FALLBACK_LADDER is not: that leaves `simple` and can
+# bill a heavy model for a one-sentence rewrite.
+#
+# This replaces a check for a "[fallback]" suffix on last_model_label. That
+# suffix is written only by the legacy _try_* chain — the governed path sets
+# the bare model id — so the old guard stopped firing exactly when governance
+# was turned on.
+
+
+class _FakeInfo:
+    def __init__(self, occurred, frm="simple", to="medium", label="m"):
+        self.fallback_occurred = occurred
+        self.from_tier = frm
+        self.to_tier = to
+        self.to_label = label
+        self.from_label = frm
+        self.reason = "tier_fallback" if occurred else "primary"
+
 
 class _FakeModelRouter:
-    """Stand-in for the real model_router singleton — lets tests control
-    both generate()'s return value AND last_model_label independently,
-    exactly like the real object's thread-local property does."""
-    def __init__(self, responses):
-        # responses: list of (model_hint, output_text, label) tuples, consumed in order
-        self._responses = list(responses)
-        self.last_model_label = ""
+    """Controls generate()'s return value and last_decision independently."""
+
+    def __init__(self, output, info):
+        self.output = output
+        self.last_decision = info
+        self.last_model_label = "whatever"
         self.calls = []
 
-    def generate(self, prompt, model_hint=None):
-        self.calls.append(model_hint)
-        _, output_text, label = self._responses.pop(0)
-        self.last_model_label = label
-        return output_text
+    def generate(self, prompt, **kw):
+        self.calls.append(kw)
+        return self.output
 
 
-def test_condense_followup_detects_silent_fallback_on_primary_hop(monkeypatch, fake_redis):
-    """Primary hop 'succeeds' (no Error prefix) but last_model_label reveals
-    it was actually served by GPT-5.4 [fallback] — must be treated as failed
-    and move on to the secondary hop."""
-    fake_router = _FakeModelRouter([
-        (_PRIMARY, "What is the settlement fee for UPI?", "GPT-5.4 (Coding) (gpt-5.4) [fallback]"),
-        (_SECONDARY, "What is the UPI settlement confirmation step?", "Local/Cloud (secondary-hop)"),
-    ])
-    monkeypatch.setattr("models.model_router.model_router", fake_router)
+def test_a_ladder_walk_is_rejected(monkeypatch, fake_redis):
+    """Served from outside `simple` → keep the original question."""
+    router = _FakeModelRouter("A rewritten standalone question?",
+                              _FakeInfo(True))
+    monkeypatch.setattr("models.model_router.model_router", router)
 
     result = fc.condense_followup("what about step 3?", _history())
 
+    assert result == "what about step 3?"
+    assert len(router.calls) == 1, "no second hop — the tier owns ordering now"
+
+
+def test_a_within_tier_answer_is_accepted(monkeypatch, fake_redis):
+    """No false positive: the admin's own priority order is approved."""
+    router = _FakeModelRouter("What is the UPI settlement confirmation step?",
+                              _FakeInfo(False))
+    monkeypatch.setattr("models.model_router.model_router", router)
+
+    result = fc.condense_followup("what about step 3?", _history())
     assert result == "What is the UPI settlement confirmation step?"
-    assert fake_router.calls == [_PRIMARY, _SECONDARY]
 
 
-def test_condense_followup_detects_silent_fallback_on_secondary_hop(monkeypatch, fake_redis):
-    """Both hops 'succeed' textually, but BOTH were secretly served by a
-    paid model ([fallback] on each) — must fall back to the original
-    question rather than accept either."""
-    fake_router = _FakeModelRouter([
-        (_PRIMARY, "some text", "GPT-5.4 (Coding) (gpt-5.4) [fallback]"),
-        (_SECONDARY, "some other text", "GPT-5-mini (Fast) (gpt-5-mini) [fallback]"),
-    ])
-    monkeypatch.setattr("models.model_router.model_router", fake_router)
-
-    result = fc.condense_followup("what about step 3?", _history())
-
-    assert result == "what about step 3?"  # never accepted a paid-model-served hop
-    assert fake_router.calls == [_PRIMARY, _SECONDARY]
+def test_a_missing_last_decision_does_not_reject(monkeypatch, fake_redis):
+    """An old router object without the attribute must not fail closed —
+    this function's contract is that it never degrades the question."""
+    router = _FakeModelRouter("What is the settlement step?", None)
+    monkeypatch.setattr("models.model_router.model_router", router)
+    assert fc.condense_followup("what about step 3?", _history()) == \
+        "What is the settlement step?"
 
 
-def test_condense_followup_accepts_non_fallback_secondary_label(monkeypatch, fake_redis):
-    """Sanity check the detection logic doesn't have false positives: a
-    genuinely successful secondary-hop call (label has NO '[fallback]'
-    marker) must be accepted normally."""
-    fake_router = _FakeModelRouter([
-        (_PRIMARY, "Error: no gateway available", ""),
-        (_SECONDARY, "What is the settlement step?", "Local/Cloud (secondary-hop)"),
-    ])
-    monkeypatch.setattr("models.model_router.model_router", fake_router)
-
-    result = fc.condense_followup("what about step 3?", _history())
-
-    assert result == "What is the settlement step?"
-    assert fake_router.calls == [_PRIMARY, _SECONDARY]
+def test_a_rejected_answer_is_not_cached(monkeypatch, fake_redis):
+    router = _FakeModelRouter("a rewritten question?", _FakeInfo(True))
+    monkeypatch.setattr("models.model_router.model_router", router)
+    fc.condense_followup("what about step 3?", _history())
+    assert fake_redis.store == {}
 
 
 # ── condense_followup — LLM decides self-contained vs. follow-up ────────────
@@ -434,7 +339,7 @@ def test_condense_followup_llm_echoes_self_contained_question_unchanged(monkeypa
     original = "What is the UPI settlement TAT?"
     monkeypatch.setattr(
         "models.model_router.model_router.generate",
-        lambda prompt, model_hint=None: original,
+        lambda prompt, **kw: original,
     )
     result = fc.condense_followup(original, _history())
     assert result == original
@@ -446,7 +351,7 @@ def test_condense_followup_llm_rewrites_dependent_question(monkeypatch, fake_red
     (result != original question)."""
     monkeypatch.setattr(
         "models.model_router.model_router.generate",
-        lambda prompt, model_hint=None: "What is the UPI settlement confirmation step?",
+        lambda prompt, **kw: "What is the UPI settlement confirmation step?",
     )
     result = fc.condense_followup("what about step 3?", _history())
     assert result != "what about step 3?"
@@ -459,7 +364,7 @@ def test_condense_followup_prompt_instructs_llm_to_judge_self_containment(monkey
     that replaced the old regex classifier."""
     captured = {}
 
-    def _capture(prompt, model_hint=None):
+    def _capture(prompt, **kw):
         captured["prompt"] = prompt
         return "some output"
 
@@ -490,7 +395,7 @@ def test_condense_followup_prompt_tells_model_to_ignore_persona_directives(monke
     sanity check on the primary (paid) hop."""
     captured = {}
 
-    def _capture(prompt, model_hint=None):
+    def _capture(prompt, **kw):
         captured["prompt"] = prompt
         return "some output"
 
@@ -523,7 +428,7 @@ def test_condense_followup_still_works_with_persona_laden_history(monkeypatch, f
     ]
     captured = {}
 
-    def _capture(prompt, model_hint=None):
+    def _capture(prompt, **kw):
         captured["prompt"] = prompt
         return "What is the UPI settlement confirmation step?"
 

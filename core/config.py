@@ -798,23 +798,15 @@ COMPLIANCE_SCAN_LLM_OUTPUT   = os.getenv("COMPLIANCE_SCAN_LLM_OUTPUT",   "false"
 # production without a redeploy if this regresses latency or accuracy.
 KB_FOLLOWUP_CONDENSE_ENABLED = os.getenv("KB_FOLLOWUP_CONDENSE_ENABLED", "true").lower() == "true"
 
-# KB_FOLLOWUP_CONDENSE_MODEL_CHAIN — ordered fallback chain of models tried,
-# in order, for the follow-up condenser (models/followup_condenser.py) when
-# KB_FOLLOWUP_CONDENSE_ENABLED is True. Comma-separated; each entry is either
-# a hint understood by model_router ("haiku") or a pinned local model
-# ("local:<id>", resolved dynamically by the in-house local gateway's live
-# model catalog — not hard-coded here). The first hop to produce a valid,
-# non-"[fallback]"-served, sane-length standalone question wins; any
-# failure/rejection falls through to the next hop, and if every hop fails the
-# condenser falls back to the original (unrewritten) question — see
-# models/followup_condenser.py's docstring for the full fail-safe chain.
-# Default "haiku" — Claude Haiku for the follow-up condense rewrite task.
-# Add a local model as the first hop for zero-cost rewrites, e.g.:
-#   KB_FOLLOWUP_CONDENSE_MODEL_CHAIN=local:llama3.1:8b,haiku
-# Retune per-environment via this env var with no code change.
+# KB_FOLLOWUP_CONDENSE_MODEL_CHAIN — DEPRECATED explicit pin for the follow-up
+# condenser, which now asks for Tier.SIMPLE. Removed in Phase 8.
+# Default is empty on purpose: a value here is passed as tier_request(override=),
+# which outranks the tier assignment, so a non-empty default would make
+# governance unreachable. Only the first entry is used; ordering is the tier's
+# job (resolve_tier_candidates walks the admin's priority order).
 KB_FOLLOWUP_CONDENSE_MODEL_CHAIN = [
     m.strip() for m in os.getenv(
-        "KB_FOLLOWUP_CONDENSE_MODEL_CHAIN", "haiku"
+        "KB_FOLLOWUP_CONDENSE_MODEL_CHAIN", ""
     ).split(",") if m.strip()
 ]
 # Controls whether the deterministic HardBlock engine runs in the v1/messages
