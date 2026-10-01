@@ -171,9 +171,8 @@ def _is_ui_model(model_id: str) -> bool:
 # 32K cap silently overshot the total context window of smaller-window models
 # (DeepSeek-Coder at 64K, Qwen/GLM/Llama at 128K) once the prompt itself was
 # non-trivial, and the proxy hard-rejected the whole request with a 400
-# ContextWindowExceededError. Two tables in gateway.py already carry the
-# real per-model numbers we need (window, reserved output) — reuse them here
-# instead of inventing a parallel constant.
+# ContextWindowExceededError. The window comes from gateway.py's table and the
+# output figure from the model's registry row.
 _ESTIMATE_CHARS_PER_TOKEN = 4
 _MAX_TOKENS_SAFETY_MARGIN = 512  # headroom for chat-template / special tokens
 
@@ -183,24 +182,21 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // _ESTIMATE_CHARS_PER_TOKEN)
 
 
-def _desired_output_tokens(selected: str) -> int:
-    """Per-model-family default output budget (Tier 5 reserved-output table),
-    not a flat constant. Falls back to a conservative 8_000 on any error —
-    e.g. if `gateway` cannot be imported (should not happen in prod; the two
-    modules are already mutually referenced via lazy imports elsewhere)."""
+def _desired_output_tokens(selected: str) -> Optional[int]:
+    """The model's registry output figure; None means "whatever fits the window"."""
     try:
-        from gateway import _reserved_output_for
-        return _reserved_output_for(selected)
+        from gateway import _registry_reserved_output
+        return _registry_reserved_output(selected)
     except Exception:
-        return 8_000
+        return None
 
 
 def _resolve_max_tokens(selected: str, prompt_tokens: int, requested: Optional[int]) -> int:
     """Clamp the completion's `max_tokens` to what `selected` can actually
     serve, given how many tokens the prompt already consumed.
 
-    `requested` is the caller-supplied cap (None → use the model-family
-    default from `_desired_output_tokens`). Either way, the result is capped
+    `requested` is the caller-supplied cap (None → the model's registry
+    figure from `_desired_output_tokens`, or whatever fits when it has none). Either way, the result is capped
     to `context_window - prompt_tokens - safety_margin` so the request can
     never push the total (prompt + completion) past the model's real context
     window — the actual condition vLLM/TGI reject with HTTP 400.
@@ -212,7 +208,7 @@ def _resolve_max_tokens(selected: str, prompt_tokens: int, requested: Optional[i
         window = 128_000  # conservative default if gateway import fails
     desired   = requested if requested is not None else _desired_output_tokens(selected)
     available = max(256, window - prompt_tokens - _MAX_TOKENS_SAFETY_MARGIN)
-    return max(1, min(desired, available))
+    return max(1, available if desired is None else min(desired, available))
 
 
 # ── Size heuristic ─────────────────────────────────────────────

@@ -496,6 +496,26 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
       pass "llm models have modality" "all have modality"
     fi
 
+    # Output limits are recorded at registration; a row without one is capped at the platform limit.
+    no_max_out="$(run_sql "SELECT count(*) FROM ainxt.llm_models WHERE enabled = TRUE AND capabilities->>'max_output_tokens' IS NULL" | tr -d ' \r')"
+    if [[ -n "$no_max_out" && "$no_max_out" -gt 0 ]]; then
+      warno "llm models have output limit" "$no_max_out model(s) missing max_output_tokens" \
+            "re-run 'Sync models' or set it on the model; until then editors cap these at the platform limit"
+    else
+      pass "llm models have output limit" "all have max_output_tokens"
+    fi
+
+    # Phase 8 removes these env vars; the gateway knows which ones it was started with.
+    legacy_raw="$(docker exec ainxt-gateway python -c 'from core.legacy_env import legacy_vars_set as l; print("OK " + ", ".join(l()))' 2>/dev/null | grep '^OK' | tail -1)"
+    if [[ -z "$legacy_raw" ]]; then
+      skip "legacy model env vars" "gateway not reachable or predates the check"
+    elif [[ "$legacy_raw" != "OK" ]]; then
+      warno "legacy model env vars" "still set: ${legacy_raw#OK }" \
+            "Phase 8 removes these; move each to Admin > LLM Providers / Model Governance and unset it (docker-compose defaults included)"
+    else
+      pass "legacy model env vars" "none set"
+    fi
+
     # Having a modality is not the same as having the RIGHT one. Almost every
     # row's modality was guessed from its model id by
     # core.tiers.modality_for_model_id — no provider's list-models API reports

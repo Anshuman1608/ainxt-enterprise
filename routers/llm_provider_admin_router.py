@@ -158,6 +158,109 @@ def _provider_api_key(provider: LLMProvider) -> Optional[str]:
     return get_credential_value(_credential_name(provider.slug))
 
 
+def _token_caps(context_window, max_output) -> dict:
+    """Vendor-reported limits as capability keys; absent or non-positive values are skipped.
+
+    Only Gemini passes a window: new window sources would move CLI compaction (Rev 21)."""
+    out = {}
+    for key, val in (("context_window", context_window), ("max_output_tokens", max_output)):
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            out[key] = val
+    return out
+
+
+def _ollama_token_caps(base_url: str, name: str) -> dict:
+    """Ollama has no output limit of its own; output is bounded by the context length."""
+    try:
+        resp = httpx.post(f"{base_url}/api/show", json={"model": name}, timeout=_HTTP_TIMEOUT)
+        resp.raise_for_status()
+        info = resp.json().get("model_info") or {}
+        ctx = next((v for k, v in info.items() if k.endswith(".context_length")), None)
+        return _token_caps(None, ctx)
+    except Exception as exc:
+        logger.info(f"[llm-provider-admin] ollama /api/show failed for {name}: {exc}")
+        return {}
+
+
+# The 400 a provider returns for an impossible max_tokens states the real limit.
+_PROBE_TOKENS = 100_000_000
+_PROBE_PATTERNS = (
+    (re.compile(r"at most (\d+) completion tokens"), ("max_output_tokens",)),
+    (re.compile(r"maximum context length is (\d+)"), ("max_output_tokens",)),
+)
+
+
+def _probe_max_output(provider: LLMProvider, model_id: str) -> dict:
+    """Ask an OpenAI-shaped provider for its output limit; {} on any failure."""
+    base_url = (provider.base_url or _DEFAULT_BASE_URL.get(provider.family, "")).rstrip("/")
+    param = "max_completion_tokens" if provider.family == "openai" else "max_tokens"
+    try:
+        resp = httpx.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {_provider_api_key(provider) or ''}"},
+            json={"model": model_id, "messages": [{"role": "user", "content": "ok"}], param: _PROBE_TOKENS},
+            timeout=5.0,
+        )
+    except Exception as exc:
+        logger.info(f"[llm-provider-admin] max-token probe failed for {model_id}: {exc}")
+        return {}
+    if resp.status_code != 400:
+        return {}
+    for pattern, keys in _PROBE_PATTERNS:
+        hit = pattern.search(resp.text)
+        if hit:
+            return {k: int(hit.group(1)) for k in keys}
+    return {}
+
+
+def _fill_probed_limits(provider: LLMProvider, discovered: List[dict], existing: dict) -> None:
+    """Probe only the OpenAI-shaped models that still have no output limit."""
+    if provider.family not in ("openai", "openai_compatible"):
+        return
+    def _known(d):
+        stored = existing.get(d["model_id"])
+        return d["capabilities"].get("max_output_tokens") or (
+            stored is not None and (stored.capabilities or {}).get("max_output_tokens"))
+    todo = [d for d in discovered if not _known(d)]
+    if not todo:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for d, caps in zip(todo, pool.map(lambda d: _probe_max_output(provider, d["model_id"]), todo)):
+            for k, v in caps.items():
+                d["capabilities"].setdefault(k, v)
+
+
+def _registration_limits(provider: LLMProvider, model_id: str) -> dict:
+    """Limits for one hand-added model, from the same vendor sources sync uses."""
+    base_url = (provider.base_url or _DEFAULT_BASE_URL.get(provider.family, "")).rstrip("/")
+    try:
+        if provider.family == "anthropic":
+            resp = httpx.get(
+                f"{base_url}/v1/models/{model_id}",
+                headers={"x-api-key": _provider_api_key(provider) or "",
+                         "anthropic-version": _ANTHROPIC_API_VERSION},
+                timeout=_HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+            m = resp.json()
+            return _token_caps(None, m.get("max_tokens"))
+        if provider.family == "gemini":
+            resp = httpx.get(f"{base_url}/models/{model_id}",
+                             params={"key": _provider_api_key(provider) or ""}, timeout=_HTTP_TIMEOUT)
+            resp.raise_for_status()
+            m = resp.json()
+            return _token_caps(m.get("inputTokenLimit"), m.get("outputTokenLimit"))
+        if provider.family == "ollama":
+            return _ollama_token_caps(base_url, model_id)
+    except Exception as exc:
+        logger.info(f"[llm-provider-admin] limit lookup failed for {model_id}: {exc}")
+        return {}
+    probe = [{"model_id": model_id, "capabilities": {}}]
+    _fill_probed_limits(provider, probe, {})
+    return probe[0]["capabilities"]
+
+
 def _discover_models(provider: LLMProvider) -> List[dict]:
     """Call the provider's list-models API. Raises HTTPException(502) on failure."""
     base_url = (provider.base_url or _DEFAULT_BASE_URL.get(provider.family, "")).rstrip("/")
@@ -167,12 +270,14 @@ def _discover_models(provider: LLMProvider) -> List[dict]:
         if provider.family == "anthropic":
             resp = httpx.get(
                 f"{base_url}/v1/models",
+                params={"limit": 1000},   # default page is 20
                 headers={"x-api-key": api_key or "", "anthropic-version": _ANTHROPIC_API_VERSION},
                 timeout=_HTTP_TIMEOUT,
             )
             resp.raise_for_status()
             return [
-                {"model_id": m["id"], "display_name": m.get("display_name", m["id"]), "capabilities": {}}
+                {"model_id": m["id"], "display_name": m.get("display_name", m["id"]),
+                 "capabilities": _token_caps(None, m.get("max_tokens"))}
                 for m in resp.json().get("data", []) if m.get("id")
             ]
 
@@ -200,6 +305,8 @@ def _discover_models(provider: LLMProvider) -> List[dict]:
                 caps = {}
                 if m.get("context_length"):   # OpenRouter-style extra field
                     caps["context_window"] = m["context_length"]
+                # vLLM: no separate output limit, output is bounded by the window.
+                caps.update(_token_caps(None, m.get("max_model_len")))
                 out.append({"model_id": mid, "display_name": mid, "capabilities": caps})
             return out
 
@@ -212,11 +319,7 @@ def _discover_models(provider: LLMProvider) -> List[dict]:
                 mid = name.rsplit("/", 1)[-1] if name else None
                 if not mid:
                     continue
-                caps = {}
-                if m.get("inputTokenLimit"):
-                    caps["context_window"] = m["inputTokenLimit"]
-                if m.get("outputTokenLimit"):
-                    caps["reserved_output"] = m["outputTokenLimit"]
+                caps = _token_caps(m.get("inputTokenLimit"), m.get("outputTokenLimit"))
                 out.append({"model_id": mid, "display_name": m.get("displayName", mid), "capabilities": caps})
             return out
 
@@ -228,7 +331,8 @@ def _discover_models(provider: LLMProvider) -> List[dict]:
             # capabilities.billing_tier (e.g. GET /all-models' price tier badge)
             # falls back to "paid", showing a free local model as billable.
             return [
-                {"model_id": m["name"], "display_name": m["name"], "capabilities": {"billing_tier": "free"}}
+                {"model_id": m["name"], "display_name": m["name"],
+                 "capabilities": {"billing_tier": "free", **_ollama_token_caps(base_url, m["name"])}}
                 for m in resp.json().get("models", []) if m.get("name")
                 and not any(s in m["name"].lower() for s in _OLLAMA_NON_CHAT_SUBSTRINGS)
             ]
@@ -796,6 +900,7 @@ def _upsert_discovered_models(provider: LLMProvider, discovered: List[dict], db:
     'Sync models' click, matching what install.sh's bootstrap script already
     does for providers seeded from .env."""
     existing = {m.model_id: m for m in db.query(LLMModel).filter_by(provider_id=provider.id).all()}
+    _fill_probed_limits(provider, discovered, existing)
 
     # privacy_class is a property of the PROVIDER (family + base_url), so it is
     # derived once here rather than per model. It is applied only when absent:
@@ -991,6 +1096,9 @@ def create_model(
         )
 
     capabilities = dict(body.capabilities or {})
+    if not capabilities.get("max_output_tokens"):
+        for k, v in _registration_limits(provider, body.model_id).items():
+            capabilities.setdefault(k, v)
     if provider.family == "ollama" and "billing_tier" not in capabilities:
         capabilities["billing_tier"] = "free"   # self-hosted — never billable
     # Same reason as the discovery path: a model added by hand with no

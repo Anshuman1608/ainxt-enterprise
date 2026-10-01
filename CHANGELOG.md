@@ -73,3 +73,37 @@ than the release named in its entry.
   **Nothing changes yet.** Every alias still works exactly as before. The
   translation happens at the boundary only, is never exposed by the governance
   API, and does not affect routing.
+
+- **Model environment variables** — the 93 listed in `core/legacy_env.py::PHASE8_REMOVED_VARS`.
+
+  **What is deprecated.** Variables that name a model (`OPENAI_CODING_MODEL`,
+  `CLAUDE_PRIMARY_MODEL`, `GEMINI_TEXT_MODEL`, …), its display label
+  (`*_DISPLAY`), a per-feature model override (`CIL_INTENT_MODEL`,
+  `FACTORY_MODEL`, `SDLC_TIER_<TIER>_MODEL`, …) or a per-SKU switch
+  (`ENABLE_OPUS`, `ENABLE_SONNET_5`, `VEO_ENABLED`, …), and the matching
+  `docker-compose.yml` defaults.
+
+  **What to use instead.** Register providers and models in Admin → LLM
+  Providers, and assign them to tiers in Admin → Model Governance. Infrastructure,
+  credentials and policy variables (`LLM_PROXY_URL`, `*_API_KEY`,
+  `PRIVACY_FLOOR_ENFORCE`, `LOCAL_HIDDEN_MODELS`, …) are not affected.
+
+  **How to tell whether you use them.** The gateway logs one warning at startup
+  naming every listed variable it was started with, and `doctor.sh` reports the
+  same list under "legacy model env vars".
+
+  **When it is removed.** Two minor releases after the release that dates this
+  section, on the same terms as the aliases above.
+
+  **Nothing changes yet.** Every variable is still read exactly as before.
+
+### Changed
+
+- **Max output tokens come from the provider.** Registering a provider or a model
+  now records each model's output limit from the vendor (Anthropic `max_tokens`,
+  Gemini `outputTokenLimit`, vLLM `max_model_len`, Ollama `context_length`;
+  OpenAI by a rejected probe request). The Agent and Workflow editors, the CLI's
+  `max_completion_tokens` and chat compaction read it from the model row. A model
+  with no recorded limit gets the platform limit rather than 4096, and Auto gets
+  the smallest limit among the models you may use. Run **Sync models** on
+  existing providers to record limits for rows added before this change.

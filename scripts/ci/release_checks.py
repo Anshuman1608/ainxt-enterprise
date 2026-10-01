@@ -541,10 +541,8 @@ def check_model_literals(cfg) -> list[str]:
 #     line. A ratchet that counts a few explanatory mentions is honest; one that
 #     can be evaded by commenting code out is not.
 _FRONTEND_LITERAL_ALLOWED = {
-    # Nothing yet. AgentStudio/frontend/src/utils/modelMaxTokens.js holds 16 of
-    # the remaining 37 and is the §F row plan.html:1302 assigns to Phase 7's
-    # max-tokens item, deliberately deferred (D58) — it is counted, not
-    # exempted, so migrating it shows up as the number falling.
+    # Nothing. modelMaxTokens.js held 16 of these until Rev 21 moved its caps
+    # onto the registry row (D100).
 }
 
 # Measured after Phase 7's picker cleanup: 44 before, 38 after. Comments
@@ -563,7 +561,9 @@ _FRONTEND_LITERAL_ALLOWED = {
 # The 38th literal is an explanatory mention, not a coupling — but the rule is
 # the rule, and exempting the mention would be exempting the very file this
 # check was written to protect.
-_FRONTEND_LITERAL_BASELINE = 38
+#
+# Rev 21: 38 -> 22, the 16 in modelMaxTokens.js's deleted table.
+_FRONTEND_LITERAL_BASELINE = 22
 
 _FRONTEND_LITERAL_RE = re.compile(
     r"""['"](claude-[a-z0-9.\-]+"""
@@ -851,6 +851,57 @@ def check_tier_migration(cfg) -> list[str]:
     return bad
 
 
+# ── Phase 8 prep: references to the env vars Phase 8 removes may only fall ──
+#
+# The list lives in core/legacy_env.py and is read by AST, not imported, so this
+# script keeps running without the app's dependencies. Measured at Rev 21; lower
+# it as modules stop reading a variable, and set it to 0 when Phase 8 lands.
+_LEGACY_ENV_REF_BASELINE = 1504
+_LEGACY_ENV_GLOBS = ("*.py", "*.sh", "*.yml", "*.yaml", ".env.example")
+_LEGACY_ENV_EXCLUDED = ("core/legacy_env.py", "scripts/ci/release_checks.py")
+
+
+def _phase8_vars() -> list[str]:
+    tree = ast.parse((ROOT / "core" / "legacy_env.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "PHASE8_REMOVED_VARS":
+            return [e.value for e in node.value.elts]
+    return []
+
+
+def legacy_env_refs() -> dict[str, int]:
+    names = _phase8_vars()
+    if not names:
+        return {}
+    pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, names)) + r")\b")
+    per_file: dict[str, int] = {}
+    for f in tracked(*_LEGACY_ENV_GLOBS):
+        if f in _LEGACY_ENV_EXCLUDED or f.startswith(("tests/", "docs/")) or "/tests/" in f:
+            continue
+        try:
+            n = len(pattern.findall((ROOT / f).read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
+        if n:
+            per_file[f] = n
+    return per_file
+
+
+def check_legacy_env_refs(cfg) -> list[str]:
+    """References to the env vars Phase 8 removes may fall, never rise."""
+    per_file = legacy_env_refs()
+    total = sum(per_file.values())
+    if total <= _LEGACY_ENV_REF_BASELINE:
+        return []
+    worst = sorted(per_file.items(), key=lambda kv: -kv[1])[:5]
+    detail = ", ".join(f"{f} ({n})" for f, n in worst)
+    return [
+        f"references to Phase 8's removed env vars rose to {total}, above the "
+        f"baseline of {_LEGACY_ENV_REF_BASELINE}. Resolve the model through a tier "
+        f"or the registry instead (core/legacy_env.py lists them). Highest: {detail}"
+    ]
+
+
 CHECKS = {
     "docs-tracked":         check_docs_tracked,
     "readme-links":         check_readme_links,
@@ -866,6 +917,7 @@ CHECKS = {
     "docs-panel-coverage":  check_docs_panel_coverage,
     "readme-feature-table": check_readme_feature_table,
     "tier-migration":       check_tier_migration,
+    "legacy-env-refs":      check_legacy_env_refs,
 }
 
 

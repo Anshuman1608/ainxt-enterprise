@@ -458,6 +458,12 @@ async def list_llm_models(
     return response
 
 
+def max_tokens_limit() -> int:
+    """The `le` bound on LLMConfig.max_tokens: the platform limit, the same for every model."""
+    from app.models import LLMConfig
+    return next(m.le for m in LLMConfig.model_fields["max_tokens"].metadata if hasattr(m, "le"))
+
+
 async def resolve_available_models(current_user) -> dict:
     """Resolve the full model catalogue available to ``current_user``.
 
@@ -501,6 +507,7 @@ async def resolve_available_models(current_user) -> dict:
         "providers": filtered_providers,
         "models": filtered_flat,
         "default_model": default_model,
+        "max_tokens_limit": max_tokens_limit(),
     }
     if proxy_error:
         response["llm_proxy_error"] = proxy_error

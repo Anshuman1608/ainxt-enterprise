@@ -226,35 +226,6 @@ MODEL_COST_PER_1M: dict[str, tuple[float, float]] = {
 }
 
 
-# ---------------- MAX OUTPUT TOKENS (per model, HARD ceiling) ----------------
-#
-# Anthropic (and some other providers) reject `max_tokens` values above a
-# per-model ceiling that is INDEPENDENT of the model's context window — e.g.
-# Claude Haiku 4.5 has a 256K context window but only a 64K output ceiling.
-# The ainxt-cli defaults `max_tokens` by clamping to the model's
-# `context_window` only (see ainxt-sampler/src/client.rs
-# `default_messages_max_tokens`), so a model whose context window is larger
-# than its real output ceiling needs an explicit entry here or the CLI will
-# send an oversized `max_tokens` that the provider hard-rejects with a 400 on
-# every single request (and, with the current stream-error propagation, the
-# CLI retries that same doomed request until it exhausts its retry budget —
-# see gaps.md "Haiku max_tokens 400" incident).
-#
-# Only models with an output ceiling BELOW their context window need an entry.
-# Consulted by CLI-facing catalog endpoints (`/ainxt/v1/api/models`,
-# `/v1/models`, `/v1/all-models`) so `max_completion_tokens` is served to the
-# CLI/IDE and the client never has to guess.
-MODEL_MAX_OUTPUT_TOKENS: dict[str, int] = {
-    CLAUDE_HAIKU: 64_000,   # hard ceiling — see https://docs.anthropic.com model card
-}
-
-
-def max_output_tokens_for(model_id: str) -> int | None:
-    """Return the hard output-token ceiling for `model_id`, or None when the
-    model has no ceiling narrower than its context window (the common case)."""
-    return MODEL_MAX_OUTPUT_TOKENS.get(model_id)
-
-
 # ---------------- PER-SECOND COST TABLE (video models) ----------------
 #
 # Video-generation models (Veo) are billed per output second, not per token.

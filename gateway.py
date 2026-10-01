@@ -446,31 +446,13 @@ _DEFAULT_CONTEXT_WINDOWS = {
     "local":   128_000,   # generic fallback for any unrecognised local model
 }
 
-# Phase C1 (Tier 5 — output reservation): built-in fallback dict.
-_DEFAULT_RESERVED_OUTPUT = {
-    "claude":  8_000,
-    "sonnet":  8_000,
-    "opus":    8_000,
-    "haiku":   4_000,
-    "gpt-5":   16_000,
-    "gpt-4":   4_000,
-    "gpt":     4_000,
-    "gemini":  8_000,
-    # ── In-house / local vLLM models ─────────────────────────────────────────
-    "kimi":    8_000,   # kimi-k2.7-code — larger reserve for long agentic outputs
-    "glm":     4_000,   # GLM-4 / GLM-5 family
-    "qwen":    4_000,   # Qwen-2.x / Qwen-3.x family
-    "deepseek": 4_000,  # DeepSeek family
-    "llama":   4_000,   # Llama-3.x family
-    "gemma":   4_000,   # Gemma family
-    "mistral": 4_000,   # Mistral / Mixtral family
-    "gpt-oss": 4_000,   # in-house gpt-oss-120b
-    "local":   2_000,   # generic fallback
-}
+# Phase C1 (Tier 5): reserve when the registry has no figure for the model.
+# Platform-wide, not per model; per-model values come from capabilities.
+_PLATFORM_RESERVED_OUTPUT = 2_000
 
 
-def _load_context_config() -> "tuple[dict, dict]":
-    """Load context window and reserved-output tables from a JSON config file.
+def _load_context_config() -> dict:
+    """Load the context window table from a JSON config file.
 
     Tries MODEL_CONTEXT_CONFIG env var first, then the bundled
     config/model_context_windows.json.  Falls back silently to the built-in
@@ -485,14 +467,12 @@ def _load_context_config() -> "tuple[dict, dict]":
         with open(_config_path, encoding="utf-8") as _f:
             _data = _json.load(_f)
         _cw = {str(k): int(v) for k, v in _data.get("context_windows", {}).items()}
-        _ro = {str(k): int(v) for k, v in _data.get("reserved_output",  {}).items()}
-        if _cw and _ro:
+        if _cw:
             logger.info(
-                "gateway: loaded model context config from %r "
-                "(%d context-window entries, %d reserved-output entries)",
-                _config_path, len(_cw), len(_ro),
+                "gateway: loaded model context config from %r (%d context-window entries)",
+                _config_path, len(_cw),
             )
-            return _cw, _ro
+            return _cw
     except FileNotFoundError:
         pass   # bundled file missing — use built-in defaults (normal for bare checkouts)
     except Exception as _ctx_err:
@@ -501,10 +481,10 @@ def _load_context_config() -> "tuple[dict, dict]":
             "using built-in defaults (no behaviour change)",
             _config_path, _ctx_err,
         )
-    return _DEFAULT_CONTEXT_WINDOWS, _DEFAULT_RESERVED_OUTPUT
+    return _DEFAULT_CONTEXT_WINDOWS
 
 
-_MODEL_CONTEXT_WINDOW, _MODEL_RESERVED_OUTPUT = _load_context_config()
+_MODEL_CONTEXT_WINDOW = _load_context_config()
 
 
 def _context_window_for(model_hint: Optional[str]) -> int:
@@ -517,14 +497,29 @@ def _context_window_for(model_hint: Optional[str]) -> int:
  return 128_000  # conservative default for auto / unknown routing
 
 
+def _registry_reserved_output(model_hint: Optional[str]) -> Optional[int]:
+ """Admin-set reserved_output, else the provider's max_output_tokens; None if unknown."""
+ _id = (model_hint or "").strip()
+ if _id.startswith("local:"):
+     _id = _id[len("local:"):]
+ if not _id:
+     return None
+ try:
+     from core.llm_provider_registry import get_model as _get_model
+     _row = _get_model(_id)
+ except Exception:
+     return None
+ _caps = (_row or {}).get("capabilities") or {}
+ for _key in ("reserved_output", "max_output_tokens"):
+     _val = _caps.get(_key)
+     if isinstance(_val, int) and _val > 0:
+         return _val
+ return None
+
+
 def _reserved_output_for(model_hint: Optional[str]) -> int:
- """Tokens reserved for the model's answer (Tier 5). Conservative default."""
- _m = (model_hint or "").lower().strip()
- if _m:
-     for _key, _res in _MODEL_RESERVED_OUTPUT.items():
-         if _key in _m:
-             return _res
- return 2_000
+ """Tokens reserved for the model's answer (Tier 5)."""
+ return _registry_reserved_output(model_hint) or _PLATFORM_RESERVED_OUTPUT
 
 
 # Phase C1 (Tier 2 — model-aware usable budget). Fraction of the window we fill
@@ -1845,6 +1840,13 @@ async def startup():
         _audit_blocked_but_enabled()
     except Exception as _bm_err:
         logger.warning("Blocked-model audit failed: %s", _bm_err)
+
+    # Phase 8 notice: which of the env vars it removes this deployment still sets.
+    try:
+        from core.legacy_env import warn_legacy_env_once
+        warn_legacy_env_once()
+    except Exception as _le_err:
+        logger.warning("Legacy env audit failed: %s", _le_err)
 
     # ------------------------------------------------------------
     # PLATFORM VERSION

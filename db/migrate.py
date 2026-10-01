@@ -8008,9 +8008,8 @@ def _part_ac1_llm_provider_seed_2026_09_01():
         with open(_ctx_path) as _f:
             _ctx_cfg = _json.load(_f)
         _ctx_windows = _ctx_cfg.get("context_windows", {})
-        _ctx_reserved = _ctx_cfg.get("reserved_output", {})
     except Exception:
-        _ctx_windows, _ctx_reserved = {}, {}
+        _ctx_windows = {}
 
     def _safe_getattr_dict(mod, name: str) -> dict:
         """A module-level constant table that may not exist on older builds."""
@@ -8026,18 +8025,15 @@ def _part_ac1_llm_provider_seed_2026_09_01():
 
     def _capabilities_for(model_id: str) -> dict:
         low = model_id.lower()
-        ctx, reserved = None, None
+        ctx = None
         for family_key, window in _ctx_windows.items():
             if family_key in low:
                 ctx = window
-                reserved = _ctx_reserved.get(family_key)
                 break
         cost = _mr.MODEL_COST_PER_1M.get(model_id)
         cap = {}
         if ctx is not None:
             cap["context_window"] = ctx
-        if reserved is not None:
-            cap["reserved_output"] = reserved
         if cost is not None:
             cap["cost_per_1m_input"], cap["cost_per_1m_output"] = cost
 
@@ -8056,10 +8052,6 @@ def _part_ac1_llm_provider_seed_2026_09_01():
         per_second = _safe_getattr_dict(_mr, "MODEL_COST_PER_SECOND").get(model_id)
         if per_second is not None:
             cap["cost_per_second"] = per_second
-
-        max_out = _safe_getattr_dict(_mr, "MODEL_MAX_OUTPUT_TOKENS").get(model_id)
-        if max_out is not None:
-            cap["max_output_tokens"] = max_out
 
         # Anthropic's newer generations 400 outright on `temperature` rather
         # than clamping it. Only record the negative case: absent means "no

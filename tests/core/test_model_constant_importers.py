@@ -88,7 +88,7 @@ PERMITTED = frozenset({
     # cost / normalisation
     "MODEL_COST_PER_1M", "MODEL_COST_PER_SECOND", "VEO_COST_PER_SECOND",
     # capability metadata (§I.4) — a property of a model, not a choice of one
-    "MODEL_MAX_OUTPUT_TOKENS", "CLI_ADDRESSABLE_MODEL_PREFIXES",
+    "CLI_ADDRESSABLE_MODEL_PREFIXES",
     "LOCAL_VISION_MODELS",
     # deny-list at the egress point (§I.5, kept deliberately)
     "BLOCKED_MODELS",

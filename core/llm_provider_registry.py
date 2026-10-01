@@ -367,7 +367,8 @@ def get_cli_style_models(channel: Optional[str] = None) -> list[dict]:
     "LLM Providers" screen (DB row, no matching env var) showed up on the web
     Chat picker but not on the CLI, Agent Studio, or any IDE plugin.
 
-    Returns ``[{"id", "hint", "provider", "label", "tag", "billing_tier"}, ...]``.
+    Returns ``[{"id", "hint", "provider", "label", "tag", "billing_tier"}, ...]``,
+    plus ``context_window`` / ``max_output_tokens`` when the row carries them.
     In-house (ollama) ids are prefixed ``local:`` to match the prefix
     convention those three callers already use for locally-discovered models,
     so registry-sourced and live-discovered local entries dedupe cleanly.
@@ -401,6 +402,8 @@ def get_cli_style_models(channel: Optional[str] = None) -> list[dict]:
         # here, not the whole answer.
         if caps.get("context_window"):
             entry["context_window"] = caps["context_window"]
+        if caps.get("max_output_tokens"):
+            entry["max_output_tokens"] = caps["max_output_tokens"]
         out.append(entry)
     return out
 

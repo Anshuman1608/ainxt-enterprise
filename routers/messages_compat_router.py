@@ -3699,20 +3699,10 @@ def _finish_list_models_compat(models: list) -> dict:
     """Attach per-model metadata and wrap in the CLI's response envelope.
     Shared tail for both the registry-backed and env-var-fallback paths of
     list_models_compat."""
-    # Attach the hard per-model output-token ceiling when one exists (e.g.
-    # Claude Haiku 4.5 caps at 64K output tokens despite a 256K context
-    # window). The CLI's `max_tokens` default only clamps against
-    # `context_window` (see ainxt-sampler's `default_messages_max_tokens`),
-    # so without this the CLI sends an oversized `max_tokens` that the
-    # provider hard-rejects with a 400 on every retry. See
-    # core.model_registry.MODEL_MAX_OUTPUT_TOKENS for the source of truth.
-    try:
-        from core.model_registry import max_output_tokens_for as _max_out_for
-    except Exception:
-        _max_out_for = lambda _m: None  # noqa: E731 — fail-open on import error
-
+    # The provider's output ceiling, recorded on the registry row at
+    # registration. Without it the CLI clamps max_tokens to context_window only.
     def _with_max_output(m: dict) -> dict:
-        ceiling = _max_out_for(m["id"])
+        ceiling = m.get("max_output_tokens")
         if ceiling:
             return {**m, "max_completion_tokens": ceiling}
         return m

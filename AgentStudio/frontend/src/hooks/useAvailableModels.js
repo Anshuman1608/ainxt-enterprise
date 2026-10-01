@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { API_BASE, PLATFORM_API_BASE } from '../config/api';
 import { RECOMMENDED_MODEL } from '../config/models';
+import { registerModelCatalogue } from '../utils/modelMaxTokens';
 
 /**
  * Status values exposed by useAvailableModels. Exported so consumers can
@@ -116,6 +117,7 @@ export default function useAvailableModels() {
     // failure must fail open).
     const [governanceLoaded, setGovernanceLoaded] = useState(false);
     const [usingPlatformFallback, setUsingPlatformFallback] = useState(false);
+    const [maxTokensLimit, setMaxTokensLimit] = useState(null);
 
     // Track which fetches have settled so we can move from LOADING to
     // READY/EMPTY only once both have responded (or definitively failed).
@@ -131,6 +133,9 @@ export default function useAvailableModels() {
             : allModelProviders,
         [allModelProviders, allowedModels, governanceLoaded, usingPlatformFallback],
     );
+
+    // Registered during render so the editors' max-token caps read this catalogue.
+    useMemo(() => registerModelCatalogue(providers, maxTokensLimit), [providers, maxTokensLimit]);
 
     // Derived: flat list of model IDs from the filtered catalogue.
     const models = useMemo(() => _flattenProviderIds(providers), [providers]);
@@ -159,6 +164,7 @@ export default function useAvailableModels() {
                 if (cancelled) return;
                 if (d && Array.isArray(d.providers) && d.providers.length > 0) {
                     setUsingPlatformFallback(false);
+                    setMaxTokensLimit(d.max_tokens_limit ?? null);
                     setAllModelProviders(d.providers);
                     return;
                 }
