@@ -45,6 +45,7 @@ import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
 from core.logger import logger
+from core.model_registry import require_model
 # Load .env from this directory (services/llm_proxy/.env) so credentials
 # are available without needing them in the OS environment at launch time.
 try:
@@ -431,7 +432,7 @@ class GenerateRequest(BaseModel):
     prompt:         Optional[str] = None  # flat-string prompt; mutually exclusive with content_blocks/messages
     messages:       Optional[list] = None # OpenAI-format multi-turn messages [{role, content}, ...]
     content_blocks: Optional[list] = None # structured blocks [{text, cache}]; claude only
-    model:          Optional[str] = None  # override model (Claude only currently)
+    model:          Optional[str] = None  # required: the backend resolves it from the tier
     request_id:     Optional[str] = None  # caller's request_id for log correlation
     chat_id:        Optional[str] = None  # caller's chat_id for conversation correlation
     conv_id:        Optional[str] = None  # stable per-conversation ID (x-ainxt-conv-id)
@@ -462,25 +463,23 @@ class GenerateImageRequest(BaseModel):
     # as before — these are simply absent/empty on their requests.
     images_b64:  Optional[List[str]] = None
     mime_types:  Optional[List[str]] = None
+    model:          Optional[str] = None   # Gemini vision model (image-input tier)
+    fallback_model: Optional[str] = None   # OpenAI vision model for the fallback leg
 
 
 class PptImageRequest(BaseModel):
     """Text → image generation for PPT slides. Routed through Gemini Imagen or DALL-E 3.
 
     ── `model` (§N.1 step 8) ────────────────────────────────────────────────
-    The SKU the caller's `image-output` tier resolved to. Same reasoning as
-    ImagenRequest.model below and added for the same reason: without it this
-    contract carries a provider but no model, so an administrator assigning a
-    particular Gemini image model gets the right family and whatever
-    GEMINI_IMAGE_MODEL names — silently, because the request still succeeds.
-
-    Optional, and must STAY optional: `auto` is the default provider and a
-    caller that has no tier assignment (or has PPT_IMAGE_PROVIDER pinned) sends
-    none, which has to keep meaning "the deployment's configured default".
+    The SKU the caller's `image-output` tier resolved to, for the first leg
+    (Gemini, or DALL-E when provider="dalle"); `fallback_model` names the DALL-E
+    leg of an `auto` request. The proxy has no default (Phase 8): a leg with no
+    model fails.
     """
     provider:   str = "auto"           # auto | gemini | dalle
     prompt:     str                    # image description from LLM
     model:      Optional[str] = None   # concrete SKU from the image-output tier
+    fallback_model: Optional[str] = None   # OpenAI SKU for the DALL-E leg of `auto`
     request_id: Optional[str] = None
     chat_id:    Optional[str] = None
 
@@ -496,18 +495,15 @@ class ImagenRequest(BaseModel):
     The concrete SKU the caller's `image-output` tier resolved to. Until this
     field existed the contract carried a provider but no model id, so an
     administrator assigning e.g. `gemini-3-pro-image` to the image-output tier
-    got the right FAMILY and the wrong MODEL — silently, because the request
-    still succeeded and returned an image from whatever GEMINI_IMAGE_MODEL
-    named.
+    got the right FAMILY and the wrong MODEL.
 
-    Optional, and it must stay optional: `sandbox/doc_executor.py` posts here
-    for document illustrations and has not been migrated to a tier (that is
-    §N.1 step 8), so an absent `model` has to keep meaning "use the
-    deployment's configured default".
+    `fallback_model` names the other provider's leg. The proxy has no default
+    (Phase 8): a leg with no model fails, and the other leg is tried.
     """
     provider:        str   = "gemini"
     prompt:          str
     model:           Optional[str] = None  # SKU from the caller's image-output tier
+    fallback_model:  Optional[str] = None  # SKU for the other provider's leg
     aspect_ratio:    str   = "16:9"        # 1:1 | 16:9 | 9:16 | 4:3 | 3:4
     number_of_images: int  = 1             # 1..4
     style_suffix:    str   = ""            # extra style instructions (e.g. "vector flat")
@@ -522,11 +518,19 @@ class VeoRequest(BaseModel):
     endpoint is purely the cloud-egress shim that wraps the Google SDK.
     """
     prompt:        str
-    model:         str = ""                # caller may override; defaults to registry VEO_MODEL
+    model:         str = ""                # required: the video-generation tier's model
     aspect_ratio:  str = "16:9"            # 16:9 | 9:16 (Veo supports a limited set)
     duration_secs: int = 8                 # 2..16 (clamped server-side)
 
 # ── Helpers ────────────────────────────────────────────────────
+
+def _model_or_400(model, what: str) -> str:
+    """The model the request named; 400 when it named none (the proxy picks no default)."""
+    try:
+        return require_model(model, what)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
 
 def _resolve_gateway(provider: str):
     """Return (gateway_instance, supports_model_kwarg)."""
@@ -766,17 +770,7 @@ async def generate(req: GenerateRequest, request: Request):
             f"[{req_id}] content_blocks: {len(req.content_blocks)} blocks | {_block_summary}"
         )
 
-    # Resolve the actual model ID that will be sent to the provider
-    from core.model_registry import (
-        CLAUDE_PRIMARY_MODEL as _DEFAULT_CLAUDE,
-        OPENAI_CODING_MODEL  as _DEFAULT_OPENAI,
-        # Gemini chat default = text/coding model. GEMINI_VISION_MODEL now aliases
-        # to the image model and would 400 on /chat dispatch — use GEMINI_TEXT_MODEL
-        # so unspecified-model callers land on gemini-3.5-flash.
-        GEMINI_TEXT_MODEL    as _DEFAULT_GEMINI,
-    )
-    _default_map = {"claude": _DEFAULT_CLAUDE, "openai": _DEFAULT_OPENAI, "gemini": _DEFAULT_GEMINI}
-    resolved_model = req.model or _default_map.get(req.provider, req.provider)
+    resolved_model = _model_or_400(req.model, f"/llm/generate {req.provider}")
 
     if req.content_blocks is not None:
         _mode = "content_blocks"
@@ -918,8 +912,7 @@ async def claude_tools_stream(req: ClaudeToolsRequest, request: Request):
     if upstream_conv_id:
         set_conv_id(upstream_conv_id)
     # ──────────────────────────────────────────────────────────────────────────
-    from core.model_registry import CLAUDE_PRIMARY_MODEL
-    model = req.model or CLAUDE_PRIMARY_MODEL
+    model = _model_or_400(req.model, "/llm/claude-tools-stream")
     logger.info(
         f"[{req_id}] TOOLS-STREAM | model={model} | "
         f"msgs={len(req.messages)} tools={len(req.tools)} "
@@ -1108,8 +1101,7 @@ async def openai_tools_stream(req: OpenAIToolsRequest, request: Request):
     if upstream_conv_id:
         set_conv_id(upstream_conv_id)
     # ──────────────────────────────────────────────────────────────────────────
-    from core.model_registry import OPENAI_CODING_MODEL
-    model = req.model or OPENAI_CODING_MODEL
+    model = _model_or_400(req.model, "/llm/openai-tools-stream")
     logger.info(
         f"[{req_id}] OAI-TOOLS-STREAM | model={model} | "
         f"msgs={len(req.messages)} tools={len(req.tools or [])} "
@@ -1465,8 +1457,7 @@ async def gemini_tools_stream(req: GeminiToolsRequest, request: Request):
     if upstream_conv_id:
         set_conv_id(upstream_conv_id)
     # ──────────────────────────────────────────────────────────────────────────
-    from core.model_registry import GEMINI_VISION_MODEL
-    model_name = req.model or GEMINI_VISION_MODEL
+    model_name = _model_or_400(req.model, "/llm/gemini-tools-stream")
     logger.info(
         f"[{req_id}] GEMINI-TOOLS-STREAM | model={model_name} | "
         f"msgs={len(req.messages)} tools={len(req.tools or [])} "
@@ -1760,11 +1751,10 @@ def _strip_tool_result_name(messages: list) -> list:
 
 
 async def _chat_claude(req: ChatRequest) -> dict:
-    from core.model_registry import CLAUDE_PRIMARY_MODEL
     # No cache breakpoints here. The gateway's httpx transport adds one top-level
     # cache_control as the request leaves for api.anthropic.com (see
     # core/claude_cache_egress.py).
-    model = req.model or CLAUDE_PRIMARY_MODEL
+    model = require_model(req.model, "/llm/chat claude")
     logger.info(f"[LLM DISPATCH] provider=claude model={model} (chat/tool-use)")
     _sys_text = req.system or "You are a helpful AI coding assistant."
     _create_kwargs: dict = {
@@ -1872,8 +1862,7 @@ def _anthropic_tools_to_openai(tools: list) -> list:
 
 
 def _chat_openai(req: ChatRequest) -> dict:
-    from core.model_registry import OPENAI_CODING_MODEL
-    model    = req.model or OPENAI_CODING_MODEL
+    model    = require_model(req.model, "/llm/chat openai")
     messages = _anthropic_msgs_to_openai(req.system, req.messages)
     tools    = _anthropic_tools_to_openai(req.tools) if req.tools else None
     kwargs: dict = {"model": model, "messages": messages, "max_completion_tokens": req.max_tokens}
@@ -1992,10 +1981,7 @@ def _anthropic_tools_to_gemini(tools: list):
 
 def _chat_gemini(req: ChatRequest) -> dict:
     from google.genai import types as _gt
-    # Default to the Gemini text/coding model for chat — GEMINI_VISION_MODEL now
-    # aliases to gemini-3.1-flash-image, which would 400 on text-only contents.
-    from core.model_registry import GEMINI_TEXT_MODEL
-    model    = req.model or GEMINI_TEXT_MODEL
+    model    = require_model(req.model, "/llm/chat gemini")
     logger.info(f"[LLM DISPATCH] provider=gemini model={model} (chat/tool-use)")
     contents = _anthropic_msgs_to_gemini(req.messages)
     cfg_kwargs: dict = {}
@@ -2087,6 +2073,7 @@ async def chat(req: ChatRequest, request: Request):
         f"[{req_id}] CHAT from {caller} | provider={req.provider} "
         f"model={req.model or 'default'} tools={len(req.tools or [])} msgs={len(req.messages)}"
     )
+    _model_or_400(req.model, f"/llm/chat {req.provider}")
     loop  = asyncio.get_running_loop()
     try:
         if req.provider == "claude":
@@ -2153,7 +2140,7 @@ async def generate_image(req: GenerateImageRequest, request: Request):
         from google.genai import types as _gtypes
         from core.retry import retry_llm
         from core.circuit_breaker import get_breaker
-        from core.model_registry import GEMINI_VISION_MODEL as _MODEL
+        _MODEL = require_model(req.model, "gemini vision")
 
         # Compliance is enforced upstream (Tier 1); prompt is already validated/redacted.
         safe_prompt = req.prompt
@@ -2211,6 +2198,7 @@ async def generate_image(req: GenerateImageRequest, request: Request):
             _gateway=_openai_gw,
             images_b64=req.images_b64,
             mime_types=req.mime_types,
+            model=req.fallback_model or "",
         )
 
     if _gemini_gw is None:
@@ -2265,43 +2253,6 @@ async def generate_image(req: GenerateImageRequest, request: Request):
 from fastapi.responses import Response as _Response
 
 
-# Models already reported as priced at a carry-over rate — warned once each,
-# because this is a per-image code path and the message is about configuration,
-# not about the request.
-_IMAGE_RATE_WARNED: set = set()
-
-
-def _image_cost(model: str, in_tok: int, out_tok: int) -> float:
-    """Per-token image-generation cost, using the SAME formula and rate table
-    that chat/doc responses use (core.model_registry.MODEL_COST_PER_1M).
-
-    rates = (input_per_1M, output_per_1M) → cost = (in*rate_in + out*rate_out)/1e6.
-    Falls back to the gemini image rate when the model isn't in the table.
-
-    That fallback used to be silent, which was tolerable while GEMINI_IMAGE_MODEL
-    was the only model that could ever run. Since Phase 6.5 item 2 the
-    image-output tier can name any SKU in the family, so a model with no rate
-    in the table is now genuinely reachable — and it would bill at the old
-    model's price with nothing in the log to say so.
-    """
-    try:
-        from core.model_registry import MODEL_COST_PER_1M, GEMINI_IMAGE_MODEL
-        rates = MODEL_COST_PER_1M.get(model)
-        if rates is None:
-            rates = MODEL_COST_PER_1M.get(GEMINI_IMAGE_MODEL) or (0.075, 0.30)
-            if model and model not in _IMAGE_RATE_WARNED:
-                _IMAGE_RATE_WARNED.add(model)
-                logger.warning(
-                    "image cost: %r has no entry in MODEL_COST_PER_1M — billing "
-                    "at the carry-over rate %r. Set cost_per_1m_input/_output on "
-                    "the model in Admin > LLM Providers so its images are priced "
-                    "correctly.", model, rates,
-                )
-    except Exception:
-        rates = (0.075, 0.30)  # gemini-3.1-flash-image carry-over rate
-    return (int(in_tok or 0) * rates[0] + int(out_tok or 0) * rates[1]) / 1_000_000
-
-
 @app.post("/llm/imagen")
 async def imagen(req: ImagenRequest):
     req_id = str(uuid.uuid4())[:8]
@@ -2312,14 +2263,9 @@ async def imagen(req: ImagenRequest):
     aspect = (req.aspect_ratio or "16:9").strip() or "16:9"
     n_imgs = max(1, min(4, int(req.number_of_images or 1)))
     style  = (req.style_suffix or "").strip()
-    # The SKU the caller's image-output tier picked, if it sent one.
-    #
-    # It applies ONLY to req.provider's branch. The cross-provider fallback
-    # below keeps its own default: handing a Gemini model id to the OpenAI
-    # Images API would turn a working fallback into a hard 400, and "which
-    # family" and "which SKU within that family" are separate facts. This is
-    # the one place in the handler where the two could be conflated.
+    # `model` is req.provider's leg; `fallback_model` the other provider's.
     want_model = (req.model or "").strip()
+    fallback_model = (req.fallback_model or "").strip()
 
     full_prompt = req.prompt.strip()
     if style:
@@ -2330,7 +2276,7 @@ async def imagen(req: ImagenRequest):
     )
     logger.info(
         f"[{req_id}] IMAGEN REQUEST | provider={req.provider} | "
-        f"model={want_model or '(provider default)'} | aspect={aspect} | "
+        f"model={want_model or '-'} fallback_model={fallback_model or '-'} | aspect={aspect} | "
         f"n={n_imgs} | prompt={req.prompt[:60].replace(chr(10),' ')!r}..."
     )
 
@@ -2346,15 +2292,8 @@ async def imagen(req: ImagenRequest):
         if _gemini_gw is None:
             raise RuntimeError("Gemini gateway not available")
         from google.genai import types as _gtypes
-        # Image-generation model. The caller's image-output tier decides when
-        # it sends one (Phase 6.5 item 2); GEMINI_IMAGE_MODEL is the fallback
-        # for callers that do not — today the document pipeline, which is not
-        # tier-migrated yet. Only honoured when gemini is the PRIMARY provider:
-        # on the fallback leg `want_model` names an OpenAI SKU.
-        from core.model_registry import GEMINI_IMAGE_MODEL as _GEMINI_DEFAULT
-        _GEMINI_MULTIMODAL = (
-            want_model if (want_model and req.provider == "gemini") else _GEMINI_DEFAULT
-        )
+        _GEMINI_MULTIMODAL = require_model(
+            want_model if req.provider == "gemini" else fallback_model, "gemini image")
 
         # Image generation prompt fed to generate_content with IMAGE modality.
         # The model returns inline image data in candidates[0].content.parts.
@@ -2404,7 +2343,7 @@ async def imagen(req: ImagenRequest):
         if _openai_gw is None:
             raise RuntimeError("OpenAI gateway not available")
 
-        # OpenAI Images size — both gpt-image-1 and dall-e-3 accept these.
+        # OpenAI Images sizes.
         size_map = {
             "1:1":  "1024x1024",
             "16:9": "1536x1024",
@@ -2437,77 +2376,12 @@ async def imagen(req: ImagenRequest):
                     return fh.read()
             raise RuntimeError("OpenAI Images returned neither b64_json nor url")
 
-        # When the caller's image-output tier named an OpenAI SKU, that SKU is
-        # the answer — one attempt, no probe (Phase 6.5 item 2). Falling
-        # through to a different model here would reproduce exactly the bug
-        # this item fixes: the administrator's choice appearing to apply while
-        # something else runs.
-        if want_model and req.provider == "openai":
-            r = client.images.generate(
-                model=want_model,
-                prompt=full_prompt,
-                size=size,
-                n=1,
-            )
-            _meta["model"] = want_model      # OpenAI images have no token usage
-            return _to_bytes(r)
-
-        # No model requested (document pipeline, or this is the fallback leg of
-        # a gemini-primary request). Try gpt-image-1 first (current OpenAI
-        # image model). Only fall through to dall-e-3 if gpt-image-1 failed
-        # with "model not found" — any other error means gpt-image-1 IS
-        # available and we shouldn't mask a real failure by switching models.
-        try:
-            r = client.images.generate(
-                model="gpt-image-1",
-                prompt=full_prompt,
-                size=size,
-                n=1,
-            )
-            _meta["model"] = "gpt-image-1"   # OpenAI images have no token usage
-            return _to_bytes(r)
-        except Exception as e_new:
-            msg = str(e_new).lower()
-            is_model_missing = (
-                    "does not exist" in msg
-                    or "model_not_found" in msg
-                    or "not found" in msg
-                    or "no access" in msg
-            )
-            if not is_model_missing:
-                # gpt-image-1 exists but the request itself failed (auth,
-                # rate limit, prompt block, …). Re-raise so the caller sees
-                # the real error.
-                logger.warning(f"[{req_id}] gpt-image-1 hard-failed: {e_new}")
-                raise
-            logger.info(
-                f"[{req_id}] gpt-image-1 unavailable on this key, trying dall-e-3"
-            )
-
-        # Fall back to OPENAI_IMAGE_MODEL (configurable, defaults to dall-e-3).
-        try:
-            from core.model_registry import OPENAI_IMAGE_MODEL as _OPENAI_IMG_MODEL
-            r = client.images.generate(
-                model=_OPENAI_IMG_MODEL,
-                prompt=full_prompt,
-                size=size,
-                quality="hd",
-                n=1,
-            )
-            # This leg used to return without recording the model, so an
-            # OPENAI_IMAGE_MODEL image was reported as "" in the X-Imagen-Model
-            # header and priced by _image_cost's carry-over rate.
-            _meta["model"] = _OPENAI_IMG_MODEL
-            return _to_bytes(r)
-        except Exception as e_old:
-            msg = str(e_old).lower()
-            if "does not exist" in msg or "not found" in msg:
-                # Neither model available on this account.
-                raise RuntimeError(
-                    "OpenAI account has neither gpt-image-1 nor dall-e-3 enabled. "
-                    "Enable an image model at platform.openai.com → Limits → Models."
-                ) from e_old
-            raise
+        # The SKU the caller named for this leg; one attempt, no probe ladder.
+        _oai_model = require_model(want_model if req.provider == "openai" else fallback_model,
+                                   "openai image")
+        r = client.images.generate(model=_oai_model, prompt=full_prompt, size=size, n=1)
+        _meta["model"] = _oai_model      # OpenAI images have no token usage
+        return _to_bytes(r)
 
     primary, fallback = ((_call_gemini, _call_openai)
                          if req.provider == "gemini"
@@ -2554,17 +2428,15 @@ async def imagen(req: ImagenRequest):
     # ── Metadata (model, in_tok, out_tok, cost, latency) ──────────
     # Same mechanism chat/doc responses use: token counts come from the
     # provider's usage_metadata (captured into _meta by whichever _call_*
-    # succeeded); cost = _image_cost(model, in, out) via
-    # core.model_registry.MODEL_COST_PER_1M. OpenAI image models expose no
-    # token usage, so their in/out tokens stay 0.
+    # succeeded). The backend prices the call (D105). OpenAI image models
+    # expose no token usage, so their in/out tokens stay 0.
     _latency  = time.time() - _img_t0
     _img_model = _meta["model"]
     _in_tok    = int(_meta["in_tok"]  or 0)
     _out_tok   = int(_meta["out_tok"] or 0)
-    _img_cost  = _image_cost(_img_model, _in_tok, _out_tok)
     logger.info(
         f"[{req_id}] imagen meta | provider={_actual_provider} model={_img_model} "
-        f"in={_in_tok} out={_out_tok} cost={_img_cost:.6f} latency={_latency:.2f}s"
+        f"in={_in_tok} out={_out_tok} latency={_latency:.2f}s"
     )
 
     return _Response(
@@ -2589,7 +2461,6 @@ async def imagen(req: ImagenRequest):
             "X-Input-Tokens":    str(_in_tok),
             "X-Output-Tokens":   str(_out_tok),
             "X-Token-Usage":     str(_in_tok + _out_tok),
-            "X-Cost-USD":        f"{_img_cost:.6f}",
             "X-Latency-Ms":      str(int(_latency * 1000)),
         },
     )
@@ -2640,6 +2511,7 @@ async def veo(req: VeoRequest):
             prompt=req.prompt.strip(),
             aspect_ratio=aspect,
             duration_secs=duration_secs,
+            model=req.model,
         )
 
     try:
@@ -3039,8 +2911,7 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
     """
     Text-prompt → image bytes for PPTX slide backgrounds.
     Returns JSON: {"image_b64": "<base64-encoded PNG/JPEG>", "mime_type": "image/png"}
-    Primary: Gemini Imagen 3 Fast
-    Fallback: DALL-E 3 (if OPENAI_API_KEY available)
+    Primary: Gemini (req.model); fallback: OpenAI (req.fallback_model).
     Fails with 503 if both are unavailable.
     """
     # ── Correlation ID binding ─────────────────────────────────
@@ -3081,11 +2952,9 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
     _in_tok          = 0
     _out_tok         = 0
 
-    # The SKU the caller's image-output tier resolved to, honoured ONLY on the
-    # Gemini leg. "which family" and "which SKU within it" are separate facts:
-    # handing a Gemini id to the DALL-E fallback would turn a working fallback
-    # into a hard 400. Same gate ImagenRequest.model uses.
+    # `model` is the first leg's SKU; `fallback_model` the DALL-E leg of `auto`.
     _want_ppt_model = (req.model or "").strip()
+    _dalle_model = _want_ppt_model if provider == "dalle" else (req.fallback_model or "").strip()
 
     # ── Try Gemini Imagen first (unless explicitly 'dalle') ────
     if provider in ("auto", "gemini") and _gemini_gw is not None:
@@ -3098,10 +2967,7 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
             _sri(req_id)
             if (upstream_chat_id or "-") != "-":
                 _scc("-", upstream_chat_id)
-            _bytes = _gemini_gw.generate_imagen(
-                req.prompt,
-                **({"model": _want_ppt_model} if _want_ppt_model else {}),
-            )
+            _bytes = _gemini_gw.generate_imagen(req.prompt, model=_want_ppt_model)
             return (
                 _bytes,
                 getattr(_gemini_gw, "_last_imagen_model", None) or "",
@@ -3125,7 +2991,7 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
             _sri(req_id)
             if (upstream_chat_id or "-") != "-":
                 _scc("-", upstream_chat_id)
-            return _openai_gw.generate_image_dalle(req.prompt)
+            return _openai_gw.generate_image_dalle(req.prompt, model=_dalle_model)
 
         try:
             img_bytes = await _run_in_pool(loop, _run_dalle)
@@ -3133,8 +2999,7 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
                 mime_type = "image/png"
                 # DALL-E exposes no token usage, so tokens stay 0.
                 _actual_provider = "openai"
-                from core.model_registry import OPENAI_IMAGE_MODEL as _PPT_IMG_MODEL
-                _img_model = _PPT_IMG_MODEL
+                _img_model = _dalle_model
                 logger.info(f"[{req_id}] PPT-IMAGE DONE via DALL-E ({len(img_bytes)} bytes)")
         except Exception as exc:
             logger.warning(f"[{req_id}] PPT-IMAGE DALL-E failed: {exc}")
@@ -3145,10 +3010,9 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
         raise HTTPException(503, "Image generation unavailable — no provider succeeded")
 
     _latency  = time.time() - _img_t0
-    _img_cost = _image_cost(_img_model, _in_tok, _out_tok)
     logger.info(
         f"[{req_id}] PPT-IMAGE meta | provider={_actual_provider} model={_img_model} "
-        f"in={_in_tok} out={_out_tok} cost={_img_cost:.6f} latency={_latency:.2f}s"
+        f"in={_in_tok} out={_out_tok} latency={_latency:.2f}s"
     )
 
     return {
@@ -3160,7 +3024,6 @@ async def generate_ppt_image(req: PptImageRequest, request: Request):
         "provider":  _actual_provider,
         "in_tok":    _in_tok,
         "out_tok":   _out_tok,
-        "cost":      _img_cost,
         "latency":   _latency,
     }
 
@@ -3793,8 +3656,7 @@ def _web_search_via_openai(query: str, model: str) -> tuple[str, int, int]:
     if _openai_gw is None:
         raise RuntimeError("OpenAI gateway not available")
 
-    from core.model_registry import OPENAI_CODING_MODEL
-    _model = model or OPENAI_CODING_MODEL
+    _model = require_model(model, "openai web search")
 
     result = _openai_gw.responses_create(
         model=_model,
@@ -3814,8 +3676,7 @@ async def _web_search_via_claude(query: str, model: str) -> tuple[str, int, int]
     if _claude_gw is None:
         raise RuntimeError("Claude gateway not available")
 
-    from core.model_registry import CLAUDE_PRIMARY_MODEL
-    _model = model or CLAUDE_PRIMARY_MODEL
+    _model = require_model(model, "claude web search")
 
     # Claude's built-in web search tool — no custom implementation needed
     web_search_tool = {
@@ -3850,8 +3711,7 @@ def _web_search_via_gemini(query: str, model: str) -> tuple[str, int, int]:
         raise RuntimeError("Gemini gateway not available")
 
     from google.genai import types as _gtypes
-    from core.model_registry import GEMINI_TEXT_MODEL
-    _model = model or GEMINI_TEXT_MODEL
+    _model = require_model(model, "gemini web search")
 
     response = _gemini_gw.client.models.generate_content(
         model=_model,

@@ -162,6 +162,16 @@ def _make_async_client() -> "_httpx_mod.AsyncClient":
     )
 
 
+def proxy_default_model(provider: str) -> str:
+    from core.tier_resolver import proxy_default_model as _pdm
+    return _pdm(provider)
+
+
+def _family_model(tier, family: str) -> str:
+    from core.tier_resolver import family_model
+    return family_model(tier, family)
+
+
 class _ProxyGateway:
     """
     Drop-in replacement for ClaudeGateway / OpenAIGateway / GeminiGateway.
@@ -214,6 +224,7 @@ class _ProxyGateway:
             payload = {"provider": self.provider, "messages": prompt}
         else:
             payload = {"provider": self.provider, "prompt": prompt}
+        model = model or proxy_default_model(self.provider)
         if model:
             payload["model"] = model
 
@@ -402,6 +413,8 @@ class _ProxyGateway:
             "image_b64":     image_b64,
             "mime_type":     mime_type,
             "system_prompt": system_prompt,
+            "model":          _family_model(Tier.IMAGE_INPUT, "gemini"),
+            "fallback_model": _family_model(Tier.IMAGE_INPUT, "openai"),
         }
         if images_b64:
             payload["images_b64"] = images_b64
@@ -444,6 +457,7 @@ class _ProxyGateway:
                 f"{m['role'].title()}: {m.get('content', '')}" for m in prompt
             )
         payload: dict = {"provider": self.provider, "prompt": prompt}
+        model = model or proxy_default_model(self.provider)
         if model:
             payload["model"] = model
 
@@ -524,6 +538,7 @@ class _ProxyGateway:
             payload: dict = {"provider": self.provider, "messages": prompt}
         else:
             payload = {"provider": self.provider, "prompt": prompt}
+        model = model or proxy_default_model(self.provider)
         if model:
             payload["model"] = model
 

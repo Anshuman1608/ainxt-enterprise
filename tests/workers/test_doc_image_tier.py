@@ -198,12 +198,13 @@ def test_the_ppt_image_request_accepts_a_model():
 
 
 def test_the_model_is_not_sent_to_the_dalle_fallback_leg():
-    """Same distinction /llm/imagen makes: "which family" and "which SKU
-    within it" are separate facts, and handing a Gemini id to DALL-E would
-    turn a working fallback into a hard 400."""
+    """Same distinction /llm/imagen makes: the DALL-E leg of `auto` runs
+    `fallback_model`, never the Gemini id."""
     src = (ROOT / "services" / "llm_proxy" / "main.py").read_text(encoding="utf-8")
     assert '_want_ppt_model = (req.model or "").strip()' in src
-    assert '**({"model": _want_ppt_model} if _want_ppt_model else {})' in src
+    assert '_dalle_model = _want_ppt_model if provider == "dalle" else (req.fallback_model or "").strip()' in src
+    assert "generate_imagen(req.prompt, model=_want_ppt_model)" in src
+    assert "generate_image_dalle(req.prompt, model=_dalle_model)" in src
 
 
 def test_the_doc_sandbox_omits_an_absent_model():

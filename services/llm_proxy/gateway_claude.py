@@ -16,12 +16,10 @@ from core.logger import logger, get_request_id as _get_request_id
 # backend gateway layer (Tier 1). This proxy forwards already-validated,
 # already-redacted text verbatim. Do NOT reintroduce a compliance engine here.
 
-from core.model_registry import CLAUDE_PRIMARY_MODEL
+from core.model_registry import require_model
 
 from dotenv import load_dotenv
 load_dotenv()
-
-CLAUDE_MODEL = CLAUDE_PRIMARY_MODEL
 
 
 # Env flag: set DISABLE_ANTHROPIC_API=true in .env to block all outbound Anthropic calls.
@@ -160,12 +158,6 @@ def _log_claude_cache(request_id: str, label: str, cache_read: int, cache_creati
         pass
 
 
-# Anthropic prompt-cache billing ratios (stable policy; dollar amount derived
-# from MODEL_COST_PER_1M so it stays accurate when pricing changes in the registry).
-_CACHE_READ_RATIO  = 0.10   # 10%  of full input price
-_CACHE_WRITE_RATIO = 1.25   # 125% of full input price
-
-
 def _log_cache_effectiveness(
     *,
     request_id: str,
@@ -177,14 +169,10 @@ def _log_cache_effectiveness(
 ) -> None:
     """Emit a structured [CACHE EFFECTIVENESS] log line for Anthropic/Claude calls.
 
-    Derives the per-token cost from MODEL_COST_PER_1M (the single source of truth)
-    so savings estimates stay accurate when model pricing changes in the registry.
-    Local/in-house models have (0.0, 0.0) rates → savings_est_usd is always 0.
+    Token counts only: the proxy holds no prices (the backend prices calls).
     Always emitted (even when all values are 0) so the absence of caching is explicit.
     """
     try:
-        from core.model_registry import MODEL_COST_PER_1M
-        input_rate_per_1m, _ = MODEL_COST_PER_1M.get(model, (0.0, 0.0))
         # `prompt_total` (Anthropic's `input_tokens`) excludes cache_read/cache_created —
         # they are disjoint token buckets, not overlapping subsets. The true total
         # prompt size processed by the model is the sum of all three, so the hit
@@ -192,16 +180,11 @@ def _log_cache_effectiveness(
         # (which is often near-zero on a cache hit, blowing the ratio past 100%).
         _full_prompt = prompt_total + cache_read + cache_created
         hit_rate = (cache_read / _full_prompt * 100) if _full_prompt > 0 else 0.0
-        # Savings: cache_read tokens billed at 10% instead of 100% of input rate
-        savings_usd = cache_read * input_rate_per_1m * (1.0 - _CACHE_READ_RATIO) / 1_000_000
-        # Write surcharge: cache_created tokens billed at 125% instead of 100%
-        write_surcharge_usd = cache_created * input_rate_per_1m * (_CACHE_WRITE_RATIO - 1.0) / 1_000_000
         ctx_tag = f" context={context}" if context else ""
         logger.info(
             f"[CACHE EFFECTIVENESS] provider=claude request_id={request_id} model={model}{ctx_tag} "
             f"cache_read={cache_read} cache_created={cache_created} prompt_total={prompt_total} "
-            f"full_prompt={_full_prompt} hit_rate={hit_rate:.1f}% savings_tokens={cache_read} "
-            f"savings_est_usd={savings_usd:.6f} write_surcharge_est_usd={write_surcharge_usd:.6f}"
+            f"full_prompt={_full_prompt} hit_rate={hit_rate:.1f}% savings_tokens={cache_read}"
         )
     except Exception:
         pass
@@ -430,10 +413,6 @@ def _convert_oai_messages_to_anthropic(messages, request_id):
 # ============================================================
 
 class ClaudeGateway:
-    from core.model_registry import BLOCKED_MODELS
-
-    if CLAUDE_MODEL in BLOCKED_MODELS:
-        raise Exception("Blocked Claude model attempted")
 
     def __init__(self, api_key: str = None):
         """Initialise the Claude gateway.
@@ -534,7 +513,7 @@ class ClaudeGateway:
             context: str,
             tools: list,
             tool_executor,
-            model: str = CLAUDE_MODEL,
+            model: str = "",
             max_tokens: int = 32000,
             max_tool_rounds: int = 5,
     ) -> str:
@@ -553,6 +532,7 @@ class ClaudeGateway:
         if _ANTHROPIC_DISABLED:
             logger.info("generate_with_tools: Anthropic API disabled (DISABLE_ANTHROPIC_API=true)")
             return "[Anthropic API disabled by configuration]"
+        model = require_model(model, "claude generate_with_tools")
 
         _upstream = _get_request_id()
         request_id = _upstream if _upstream and _upstream != "-" else str(uuid.uuid4())
@@ -663,7 +643,7 @@ class ClaudeGateway:
     async def generate(
             self,
             prompt=None,                              # str | list[dict] (OpenAI multi-turn format) | None
-            model: str = CLAUDE_MODEL,
+            model: str = "",
             temperature: float = 0,
             max_tokens: int = 32000,
             stream: bool = True,
@@ -681,6 +661,7 @@ class ClaudeGateway:
             logger.info("generate: Anthropic API disabled (DISABLE_ANTHROPIC_API=true)")
             yield "[Anthropic API disabled by configuration]"
             return
+        model = require_model(model, "claude generate")
 
         from core.logger import get_request_id as _get_req_id
         request_id = _get_req_id() or str(uuid.uuid4())

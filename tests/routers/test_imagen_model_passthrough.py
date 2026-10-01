@@ -20,9 +20,8 @@ pytest (chat_router pulls in the gateway's module-level filesystem setup).
 
 The subtle one is test_a_model_id_is_never_sent_to_the_fallback_provider: the
 proxy falls back gemini→openai, and "which family" and "which SKU within that
-family" are separate facts. Handing a Gemini id to the OpenAI Images API would
-turn a working fallback into a hard 400 — a fix that broke the thing it was
-meant to leave alone.
+family" are separate facts. Since Phase 8 (D111) the proxy has no defaults, so
+the fallback leg runs `fallback_model`, which the backend also names.
 """
 
 from __future__ import annotations
@@ -53,6 +52,20 @@ def _func(path: pathlib.Path, name: str):
 # ── The wire contract ─────────────────────────────────────────────────────
 
 
+def _imagen_fields() -> set:
+    return {
+        t.target.id
+        for node in ast.walk(ast.parse(_src(PROXY)))
+        if isinstance(node, ast.ClassDef) and node.name == "ImagenRequest"
+        for t in node.body
+        if isinstance(t, ast.AnnAssign) and isinstance(t.target, ast.Name)
+    }
+
+
+def test_imagen_request_accepts_both_legs():
+    assert {"model", "fallback_model"} <= _imagen_fields()
+
+
 def test_imagen_request_accepts_a_model():
     fields = {
         t.target.id
@@ -67,10 +80,8 @@ def test_imagen_request_accepts_a_model():
 
 
 def test_the_model_field_is_optional():
-    """It must STAY optional. sandbox/doc_executor.py posts to /llm/imagen for
-    document illustrations and is not tier-migrated (that is §N.1 step 8), so
-    an absent model has to keep meaning "the deployment's configured default".
-    Making it required would break the document pipeline outright."""
+    """Optional on the wire so a missing model fails its leg with a message
+    (and the other leg is tried) instead of a 422 for the whole request."""
     cls = next(
         node for node in ast.walk(ast.parse(_src(PROXY)))
         if isinstance(node, ast.ClassDef) and node.name == "ImagenRequest"
@@ -83,13 +94,11 @@ def test_the_model_field_is_optional():
     assert isinstance(field.value, ast.Constant) and field.value.value is None
 
 
-def test_the_document_pipeline_still_sends_no_model():
-    """Stated as a test because it is the reason the field is optional: if this
-    starts failing, someone migrated doc_executor and the optionality above can
-    be revisited deliberately rather than by accident."""
-    doc = _src(ROOT / "sandbox" / "doc_executor.py")
-    assert "/llm/imagen" in doc
-    assert '"model"' not in doc.split("/llm/imagen")[1][:600]
+def test_the_proxy_has_no_image_default():
+    """Phase 8 (D111): each leg runs the model the request names, or fails."""
+    src = _src(PROXY)
+    for gone in ("GEMINI_IMAGE_MODEL", "OPENAI_IMAGE_MODEL", '"gpt-image-1"', "_GEMINI_DEFAULT"):
+        assert gone not in src, gone
 
 
 # ── Each of the three hops forwards it ────────────────────────────────────
@@ -98,12 +107,12 @@ def test_the_document_pipeline_still_sends_no_model():
 def test_the_proxy_honours_the_requested_gemini_model():
     src = _src(PROXY)
     assert 'want_model = (req.model or "").strip()' in src
-    assert 'want_model if (want_model and req.provider == "gemini") else _GEMINI_DEFAULT' in src
+    assert 'want_model if req.provider == "gemini" else fallback_model, "gemini image")' in src
 
 
 def test_the_proxy_honours_the_requested_openai_model():
     src = _src(PROXY)
-    assert 'if want_model and req.provider == "openai":' in src
+    assert 'want_model if req.provider == "openai" else fallback_model,' in src
 
 
 def test_the_gateway_forwards_the_model_to_the_proxy():
@@ -112,7 +121,10 @@ def test_the_gateway_forwards_the_model_to_the_proxy():
     assert "model" in params, (
         "gateway_gemini.generate_imagen() takes no model= — chat_router has "
         "nowhere to put the SKU the tier resolved")
-    assert '**({"model": model.strip()} if (model or "").strip() else {})' in _src(GATEWAY)
+    src = _src(GATEWAY)
+    assert '_img_primary = (model or "").strip() or family_model(Tier.IMAGE_OUTPUT, provider)' in src
+    assert '**({"model": _img_primary} if _img_primary else {})' in src
+    assert '**({"fallback_model": _img_fallback} if _img_fallback else {})' in src
 
 
 def test_the_direct_dev_path_honours_it_too():
@@ -138,23 +150,22 @@ def test_chat_router_sends_the_tier_resolved_model():
 
 def test_a_model_id_is_never_sent_to_the_fallback_provider():
     """Both provider branches gate on `req.provider` matching their own family,
-    so on the fallback leg the requested SKU is ignored and the family default
-    runs. Without the gate, a gemini-primary request that fell back to OpenAI
-    would call the OpenAI Images API with a Gemini model id and hard-fail —
-    breaking a fallback that works today."""
+    so the fallback leg runs `fallback_model`. Without the gate a gemini-primary
+    request that fell back to OpenAI would send a Gemini id to OpenAI Images."""
     src = _src(PROXY)
     assert src.count('req.provider == "gemini"') >= 1
     assert src.count('req.provider == "openai"') >= 1
-    # Neither branch may use want_model unconditionally.
-    assert "model=want_model,\n" in src        # the guarded openai call
-    assert 'model=want_model or' not in src    # an unguarded shortcut
+    assert "model=want_model" not in src       # never unguarded
+    gw = _src(GATEWAY)
+    assert '_other = "openai" if provider == "gemini" else "gemini"' in gw
+    assert "_img_fallback = family_model(Tier.IMAGE_OUTPUT, _other)" in gw
 
 
 def test_the_proxy_logs_which_model_it_will_run():
     """The diagnosis path. The original bug was invisible precisely because no
     log line named the model before the call — the only model in the logs was
     whatever came back, which was always the env default."""
-    assert "model={want_model or '(provider default)'}" in _src(PROXY)
+    assert "model={want_model or '-'} fallback_model={fallback_model or '-'}" in _src(PROXY)
 
 
 def test_the_stale_honest_limit_note_is_gone():
@@ -169,21 +180,15 @@ def test_the_stale_honest_limit_note_is_gone():
 # ── The pricing consequence ───────────────────────────────────────────────
 
 
-def test_an_unpriced_model_is_reported_rather_than_billed_silently():
-    """_image_cost falls back to the gemini image rate for a model it has no
-    entry for. That was harmless while only one model could ever run; now that
-    the tier can name any SKU in the family, a real model can bill at another
-    model's price — so it has to say so."""
+def test_the_proxy_does_not_price_images():
+    """D105: the backend prices every call; the proxy's own table is gone."""
     src = _src(PROXY)
-    assert "_IMAGE_RATE_WARNED" in src
-    assert "has no entry in MODEL_COST_PER_1M" in src
+    assert "_image_cost" not in src and "MODEL_COST_PER_1M" not in src
 
 
-def test_the_openai_fallback_leg_records_its_model():
-    """It used to `return _to_bytes(r)` without touching _meta, so an
-    OPENAI_IMAGE_MODEL image was reported as "" in X-Imagen-Model and priced by
-    the carry-over rate. Found while adding the model field."""
-    assert '_meta["model"] = _OPENAI_IMG_MODEL' in _src(PROXY)
+def test_the_openai_leg_records_its_model():
+    """The model reported in X-Imagen-Model is the one that ran."""
+    assert '_meta["model"] = _oai_model' in _src(PROXY)
 
 
 @pytest.mark.parametrize("path", [PROXY, GATEWAY, CHAT])

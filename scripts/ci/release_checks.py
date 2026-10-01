@@ -821,7 +821,7 @@ def check_tier_migration(cfg) -> list[str]:
 # script keeps running without the app's dependencies. Counts code only — a
 # comment or docstring may name a variable to explain history. Lower it as
 # modules stop reading a variable; 0 once Phase 8 lands.
-_LEGACY_ENV_REF_BASELINE = 312
+_LEGACY_ENV_REF_BASELINE = 187   # compose, .env.example, sdlc-setup.sh (stage 8.7)
 _LEGACY_ENV_GLOBS = ("*.py", "*.sh", "*.yml", "*.yaml", ".env.example")
 _LEGACY_ENV_EXCLUDED = ("core/legacy_env.py", "scripts/ci/release_checks.py", "db/phase8_env_prices.py")
 

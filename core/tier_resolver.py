@@ -514,3 +514,18 @@ def family_model(tier: Tier, family: str) -> str:
         return next((m["model_id"] for m in get_enabled_models() if m["family"] == family), "")
     except Exception:  # noqa: BLE001
         return ""
+
+
+# Proxy provider → (registry family, tier) for a proxied call that names no model;
+# the same defaults the direct gateways use.
+_PROXY_PROVIDER_DEFAULT = {
+    "claude": ("anthropic", Tier.COMPLEX),
+    "openai": ("openai", Tier.MEDIUM),
+    "gemini": ("gemini", Tier.MEDIUM),
+}
+
+
+def proxy_default_model(provider: str) -> str:
+    """The model to send the LLM proxy when the caller named none (it picks no default)."""
+    family, tier = _PROXY_PROVIDER_DEFAULT.get(provider, ("", None))
+    return family_model(tier, family) if family else ""

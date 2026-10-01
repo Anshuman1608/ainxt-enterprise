@@ -16,17 +16,10 @@ from core.logger import logger, get_request_id as _get_request_id
 # backend gateway layer (Tier 1). This proxy forwards already-validated,
 # already-redacted text verbatim. Do NOT reintroduce a compliance engine here.
 
-from core.model_registry import OPENAI_PRIMARY_MODEL, OPENAI_IMAGE_MODEL
-
-MODEL = OPENAI_PRIMARY_MODEL
+from core.model_registry import require_model
 
 # Thread-local storage so concurrent requests don't overwrite each other's token counts
 _tl = threading.local()
-
-# OpenAI automatic prompt caching: cached tokens are billed at 50% of the model's input rate.
-# Caching is transparent — no explicit flag; OpenAI decides what to cache automatically.
-_OAI_CACHE_READ_RATIO = 0.50   # 50% of full input price
-
 
 def _log_cache_effectiveness(
     *,
@@ -38,23 +31,17 @@ def _log_cache_effectiveness(
 ) -> None:
     """Emit a structured [CACHE EFFECTIVENESS] log line for OpenAI calls.
 
-    Derives the per-token cost from MODEL_COST_PER_1M (the single source of truth)
-    so savings estimates stay accurate when model pricing changes in the registry.
-    Local/in-house models (e.g. OPENAI_OSS_MODEL) have (0.0, 0.0) rates → savings = 0.
+    Token counts only: the proxy holds no prices (the backend prices calls).
     OpenAI has no explicit cache_creation concept — caching is automatic and transparent.
     Always emitted so zero-cache calls are also visible in logs.
     """
     try:
-        from core.model_registry import MODEL_COST_PER_1M
-        input_rate_per_1m, _ = MODEL_COST_PER_1M.get(model, (0.0, 0.0))
         hit_rate = (cache_read / prompt_total * 100) if prompt_total > 0 else 0.0
-        # Savings: cache_read tokens billed at 50% instead of 100% of input rate
-        savings_usd = cache_read * input_rate_per_1m * (1.0 - _OAI_CACHE_READ_RATIO) / 1_000_000
         ctx_tag = f" context={context}" if context else ""
         logger.info(
             f"[CACHE EFFECTIVENESS] provider=openai request_id={request_id} model={model}{ctx_tag} "
             f"cache_read={cache_read} prompt_total={prompt_total} "
-            f"hit_rate={hit_rate:.1f}% savings_tokens={cache_read} savings_est_usd={savings_usd:.6f} "
+            f"hit_rate={hit_rate:.1f}% savings_tokens={cache_read} "
             f"cache_enabled=auto"   # OpenAI caches automatically; no explicit flag
         )
     except Exception:
@@ -64,13 +51,7 @@ def _log_cache_effectiveness(
 class OpenAIGateway:
 
     def generate_with_model(self, prompt, model):
-
-        from core.model_registry import BLOCKED_MODELS
-
-        if model in BLOCKED_MODELS:
-            raise Exception(f"Blocked model attempted: {model}")
-
-        return self.generate(prompt)
+        return self.generate(prompt, model=model)
 
     def __init__(self, api_key: str = None):
         """Initialise the OpenAI gateway.
@@ -139,7 +120,7 @@ class OpenAIGateway:
         Parts-list content (vision / tool calls) is passed through unchanged —
         the caller owns that shape."""
 
-        _model     = model or MODEL
+        _model     = require_model(model, "openai generate")
         _upstream = _get_request_id()
         request_id = _upstream if _upstream and _upstream != "-" else str(uuid.uuid4())
 
@@ -270,7 +251,7 @@ class OpenAIGateway:
         three providers (Claude, OpenAI, Gemini) share the same native-async
         token delivery path.
         """
-        _model = model or MODEL
+        _model = require_model(model, "openai async_generate")
         _upstream = _get_request_id()
         request_id = _upstream if _upstream and _upstream != "-" else str(uuid.uuid4())
 
@@ -462,7 +443,7 @@ class OpenAIGateway:
         yield {"output_text": output_text, "in_tok": in_tok, "out_tok": out_tok}
 
 
-    def generate_image_dalle(self, prompt: str, size: str = "1792x1024") -> bytes | None:
+    def generate_image_dalle(self, prompt: str, size: str = "1792x1024", *, model: str = "") -> bytes | None:
         """
         Generate an image via DALL-E 3 (text → image bytes).
         Returns raw PNG bytes or None on failure.
@@ -473,11 +454,12 @@ class OpenAIGateway:
         from core.retry import retry_llm
         from core.circuit_breaker import get_breaker
         import base64 as _b64
+        model = require_model(model, "openai image")
 
         try:
             def _call():
                 return self.client.images.generate(
-                    model=OPENAI_IMAGE_MODEL,
+                    model=model,
                     prompt=prompt,
                     size=size,
                     quality="standard",
@@ -529,6 +511,8 @@ def generate_with_image_openai(
         _gateway: "OpenAIGateway | None" = None,
         images_b64: "list[str] | None" = None,
         mime_types: "list[str] | None" = None,
+        *,
+        model: str = "",
 ) -> tuple[str, int, int]:
     """
     Send a prompt + inline base64 image(s) to OpenAI vision.
@@ -541,7 +525,7 @@ def generate_with_image_openai(
     `mime_type` pair (original behaviour, unchanged for every existing
     caller).
     """
-    from core.model_registry import OPENAI_CODING_MODEL
+    model = require_model(model, "openai vision")
     from core.retry import retry_llm
     from core.circuit_breaker import get_breaker
 
@@ -571,7 +555,7 @@ def generate_with_image_openai(
 
     def _call():
         return gw.client.chat.completions.create(
-            model=OPENAI_CODING_MODEL,
+            model=model,
             messages=messages,
         )
 
@@ -589,7 +573,7 @@ def generate_with_image_openai(
         output = response.choices[0].message.content or ""
 
     logger.info(
-        f"[OPENAI VISION] model={OPENAI_CODING_MODEL} "
+        f"[OPENAI VISION] model={model} "
         f"in={in_tok} out={out_tok}"
     )
     return output, in_tok, out_tok

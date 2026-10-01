@@ -38,6 +38,13 @@ def _default_model() -> str:
     """Model for a call that names none: must return text, so the image-input tier (§I.2)."""
     return _tier_gemini_model("image-input")
 
+
+def _tier_openai_image_input() -> str:
+    """The image-input tier's OpenAI model: the proxy's vision fallback leg."""
+    from core.tiers import Tier
+    from core.tier_resolver import family_model
+    return family_model(Tier.IMAGE_INPUT, "openai")
+
 # Gap #2 (7/7): surface Gemini "thought" parts (2.5 thinking models) as
 # first-class reasoning deltas instead of silently discarding them. Emitted
 # before the answer output. Default-on; env opt-out; fail-safe.
@@ -531,10 +538,9 @@ class GeminiGateway:
             model: str = "",
     ) -> "bytes | None | tuple[bytes | None, dict]":
         """
-        Generate an image. Primary attempt uses the gemini image model
-        (gemini-3.1-flash-image by default), with automatic fallback to
-        OpenAI's gpt-image-1 (then dall-e-3) implemented inside the LLM
-        proxy's /llm/imagen handler. If BOTH providers are unavailable
+        Generate an image with the image-output tier's model for `provider`;
+        the LLM proxy's /llm/imagen handler falls back to the tier's model
+        from the other provider. If BOTH providers are unavailable
         the proxy returns HTTP 503 with an "image_model_unavailable"
         payload, which we surface to the caller as None + a recognisable
         _last_imagen_error so the chat router can render a friendly
@@ -549,9 +555,8 @@ class GeminiGateway:
               (Phase 6.5 item 2). `provider` selects the FAMILY and this
               selects the model within it — previously only the family was
               controllable, so an administrator's choice of a specific
-              image model appeared to apply while GEMINI_IMAGE_MODEL ran.
-              Defaults to "" meaning "the deployment's configured default",
-              which is what the un-migrated document pipeline still wants.
+              image model appeared to apply while another one ran.
+              "" means the image-output tier's model for `provider`.
 
         Routing policy (matches gateway_claude / gateway_openai / text path
         in this same module — see line ~177):
@@ -611,6 +616,12 @@ class GeminiGateway:
         # All outbound cloud calls go through the proxy. This is non-
         # negotiable per the architecture rule in CLAUDE.md.
         if _proxy:
+            # The proxy picks no model: name both legs from the image-output tier.
+            from core.tiers import Tier
+            from core.tier_resolver import family_model
+            _other = "openai" if provider == "gemini" else "gemini"
+            _img_primary = (model or "").strip() or family_model(Tier.IMAGE_OUTPUT, provider)
+            _img_fallback = family_model(Tier.IMAGE_OUTPUT, _other)
             try:
                 import requests as _rq
                 resp = _rq.post(
@@ -618,10 +629,8 @@ class GeminiGateway:
                     json={
                         "provider":         provider,
                         "prompt":           safe_prompt[:4000],
-                        # Omitted rather than sent empty when the caller has no
-                        # tier-resolved model, so an older proxy that does not
-                        # know the field is unaffected either way.
-                        **({"model": model.strip()} if (model or "").strip() else {}),
+                        **({"model": _img_primary} if _img_primary else {}),
+                        **({"fallback_model": _img_fallback} if _img_fallback else {}),
                         "aspect_ratio":     aspect_ratio,
                         "number_of_images": number_of_images,
                         "style_suffix":     style_suffix or "",
@@ -1023,6 +1032,8 @@ def generate_with_image(
                         "image_b64":     image_b64,
                         "mime_type":     mime_type,
                         "system_prompt": system_prompt,
+                        "model":          _default_model(),
+                        "fallback_model": _tier_openai_image_input(),
                     },
                     headers=_lph(),
                     timeout=float(os.getenv("LLM_TIMEOUT_SEC", "300")) or None,

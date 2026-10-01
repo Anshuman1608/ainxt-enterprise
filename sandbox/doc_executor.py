@@ -73,8 +73,8 @@ def _generate_doc_image(prompt: str, aspect_ratio: str, provider: str,
     (workers/doc_worker.py::_FAMILY_TO_IMAGE_PROVIDER); sending a family here
     would be rejected by the endpoint.
 
-    `model` is the SKU the `image-output` tier resolved to, and is omitted when
-    blank so an absent model keeps meaning "the deployment's default".
+    `model` is the SKU the `image-output` tier resolved to. The proxy picks no
+    default (Phase 8), so a blank model fails that image (non-fatal).
     """
     import httpx
     payload = {

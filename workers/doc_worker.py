@@ -1580,7 +1580,12 @@ def _image_target() -> tuple[str, str]:
     """
     forced = _PPT_IMG_PROVIDER.lower().strip()
     if forced and forced != "auto":
-        return (forced, "")
+        # A pinned provider still takes its model from the tier (the proxy picks none).
+        fam = {"gemini": "gemini", "dalle": "openai", "openai": "openai"}.get(forced, "")
+        if not fam:
+            return (forced, "")
+        from core.tier_resolver import family_model
+        return (forced, family_model(Tier.IMAGE_OUTPUT, fam))
 
     try:
         from core.tier_resolver import NoEligibleModel
@@ -5523,7 +5528,10 @@ def _fetch_dalle_image(prompt: str) -> bytes | None:
     """
     proxy_url = os.getenv("LLM_PROXY_URL", "").rstrip("/")
     if proxy_url:
-        return _fetch_ppt_image_via_proxy(prompt, provider="dalle")
+        # The proxy picks no model: the image-output tier's OpenAI model.
+        from core.tier_resolver import family_model
+        return _fetch_ppt_image_via_proxy(
+            prompt, provider="dalle", model=family_model(Tier.IMAGE_OUTPUT, "openai"))
     # Local dev fallback: call gateway directly
     try:
         from gateway_openai import generate_image_dalle

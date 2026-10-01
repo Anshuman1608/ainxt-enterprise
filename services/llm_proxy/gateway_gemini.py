@@ -14,18 +14,10 @@ from core.logger import logger, get_request_id as _get_request_id
 # NOTE: Compliance (PCI/PII detection + redaction) lives EXCLUSIVELY in the
 # backend gateway layer (Tier 1). This proxy forwards already-validated,
 # already-redacted text verbatim. Do NOT reintroduce a compliance engine here.
-from core.model_registry import GEMINI_VISION_MODEL, GEMINI_IMAGE_MODEL, VEO_MODEL
+from core.model_registry import require_model
 
 # Thread-local storage so concurrent requests don't overwrite each other's token counts
 _tl = threading.local()
-
-
-# Default model for generate() — aliases to GEMINI_IMAGE_MODEL via the registry.
-MODEL = GEMINI_VISION_MODEL
-
-# Gemini context caching: cached tokens are billed at 25% of the model's normal input rate.
-# Context cache storage is billed separately per hour; not modelled here.
-_GEMINI_CACHE_READ_RATIO = 0.25   # 25% of full input price
 
 
 def _log_cache_effectiveness(
@@ -38,23 +30,18 @@ def _log_cache_effectiveness(
 ) -> None:
     """Emit a structured [CACHE EFFECTIVENESS] log line for Gemini calls.
 
-    Derives the per-token cost from MODEL_COST_PER_1M (the single source of truth)
-    so savings estimates stay accurate when model pricing changes in the registry.
+    Token counts only: the proxy holds no prices (the backend prices calls).
     Gemini context caching (cached_content_token_count in usage_metadata) is
     explicit -- callers must create a CachedContent object. Always emitted so
     zero-cache calls are visible and cache effectiveness can be tracked over time.
     """
     try:
-        from core.model_registry import MODEL_COST_PER_1M
-        input_rate_per_1m, _ = MODEL_COST_PER_1M.get(model, (0.0, 0.0))
         hit_rate = (cache_read / prompt_total * 100) if prompt_total > 0 else 0.0
-        # Savings: cache_read tokens billed at 25% instead of 100% of input rate
-        savings_usd = cache_read * input_rate_per_1m * (1.0 - _GEMINI_CACHE_READ_RATIO) / 1_000_000
         ctx_tag = f" context={context}" if context else ""
         logger.info(
             f"[CACHE EFFECTIVENESS] provider=gemini request_id={request_id} model={model}{ctx_tag} "
             f"cache_read={cache_read} prompt_total={prompt_total} "
-            f"hit_rate={hit_rate:.1f}% savings_tokens={cache_read} savings_est_usd={savings_usd:.6f}"
+            f"hit_rate={hit_rate:.1f}% savings_tokens={cache_read}"
         )
     except Exception:
         pass
@@ -117,7 +104,7 @@ class GeminiGateway:
     def _last_imagen_model(self):
         # Thread-local so concurrent image requests don't clobber each other's
         # reported model id (matches the token-count properties above).
-        return getattr(_tl, "gemini_imagen_model", GEMINI_IMAGE_MODEL)
+        return getattr(_tl, "gemini_imagen_model", "")
 
     @_last_imagen_model.setter
     def _last_imagen_model(self, v):
@@ -140,8 +127,7 @@ class GeminiGateway:
         array (list of {"role": "user"|"assistant", "content": str}). Lists
         become google-genai Content list with "assistant" → "model".
 
-        model: optional explicit Gemini model ID. When None, falls back to
-        the module-level MODEL constant (GEMINI_VISION_MODEL)."""
+        model: the Gemini model id; required (the proxy picks none)."""
 
         _upstream = _get_request_id()
         request_id = _upstream if _upstream and _upstream != "-" else str(uuid.uuid4())
@@ -170,7 +156,7 @@ class GeminiGateway:
             else:
                 contents_arg = prompt
 
-            _effective_model = model or MODEL
+            _effective_model = require_model(model, "gemini generate")
 
             def _call():
                 # Streaming generation: returns an iterator of partial chunks
@@ -251,8 +237,7 @@ class GeminiGateway:
         an AsyncIterator[GenerateContentResponse] — use `async for chunk in
         await c.aio.models.generate_content_stream(...)`.
 
-        model: optional explicit Gemini model ID. When None, falls back to
-        the module-level MODEL constant (GEMINI_VISION_MODEL).
+        model: the Gemini model id; required (the proxy picks none).
         """
         _upstream = _get_request_id()
         request_id = _upstream if _upstream and _upstream != "-" else str(uuid.uuid4())
@@ -260,7 +245,7 @@ class GeminiGateway:
         self._last_input_tokens  = 0
         self._last_output_tokens = 0
 
-        _effective_model = model or MODEL
+        _effective_model = require_model(model, "gemini async_generate")
 
         try:
             from core.circuit_breaker import get_breaker
@@ -318,7 +303,7 @@ class GeminiGateway:
             )
             yield "\nError generating response"
 
-    def generate_imagen(self, prompt: str) -> bytes | None:
+    def generate_imagen(self, prompt: str, *, model: str = "") -> bytes | None:
         """
         Generate an image via Gemini (text → image bytes).
         Uses gemini-3.1-flash-image with generate_content + response_modalities=["IMAGE"].
@@ -343,14 +328,11 @@ class GeminiGateway:
         # previous call don't leak through (mirrors generate()).
         self._last_input_tokens  = 0
         self._last_output_tokens = 0
-        self._last_imagen_model  = GEMINI_IMAGE_MODEL
+        _GEMINI_MULTIMODAL = require_model(model, "gemini image")
+        self._last_imagen_model  = _GEMINI_MULTIMODAL
 
         try:
             from google.genai import types as _gtypes
-
-            # Image-generation model — sourced from the registry so the env
-            # override (GEMINI_IMAGE_MODEL) is respected without code changes.
-            _GEMINI_MULTIMODAL = GEMINI_IMAGE_MODEL
 
             def _call():
                 return self.client.models.generate_content(
@@ -755,6 +737,8 @@ class GeminiGateway:
             duration_secs: int = 8,
             poll_interval_secs: int = 5,
             max_wait_secs: int = 300,
+            *,
+            model: str = "",
     ) -> tuple[bytes | None, str | None]:
         """
         Generate a short video via Google Veo 3.1 (preview).
@@ -775,13 +759,17 @@ class GeminiGateway:
         from core.circuit_breaker import get_breaker
 
         safe_prompt = prompt
+        try:
+            model = require_model(model, "veo")
+        except ValueError as exc:
+            return None, str(exc)
 
         try:
             from google.genai import types as gtypes
 
             def _start():
                 return self.client.models.generate_videos(
-                    model=VEO_MODEL,
+                    model=model,
                     prompt=safe_prompt,
                     config=gtypes.GenerateVideosConfig(
                         aspect_ratio=aspect_ratio,
@@ -867,7 +855,7 @@ class GeminiGateway:
                 return None, err
 
             logger.info(
-                f"generate_veo_video: OK model={VEO_MODEL} "
+                f"generate_veo_video: OK model={model} "
                 f"duration={duration_secs}s bytes={len(video_bytes)}"
             )
             return video_bytes, None
@@ -910,6 +898,8 @@ def generate_with_image(
     _gateway: "GeminiGateway | None" = None,
     images_b64: "list[str] | None" = None,
     mime_types: "list[str] | None" = None,
+    *,
+    model: str = "",
 ) -> str:
     """
     Send a prompt + inline image(s) to Gemini vision.
@@ -926,6 +916,7 @@ def generate_with_image(
     sends the single-image fields).
     """
     import base64 as _b64
+    model = require_model(model, "gemini vision")
 
     # _gateway is the proxy's already-initialised instance (has the
     # ProxyKeyCache key). Only fall back to the lazy module singleton
@@ -968,7 +959,7 @@ def generate_with_image(
 
         def _call():
             return gw.client.models.generate_content(
-                model=MODEL,
+                model=model,
                 contents=_gtypes.Content(parts=parts, role="user"),
             )
 
@@ -985,13 +976,13 @@ def generate_with_image(
                 gw._last_input_tokens  = _p
                 gw._last_output_tokens = _c
                 logger.info(
-                    f"[GEMINI USAGE] vision model={MODEL} "
+                    f"[GEMINI USAGE] vision model={model} "
                     f"prompt={_p} candidates={_c} cached_in={_ci} "
                     f"billed_in={_p - _ci} total={getattr(_um, 'total_token_count', 0) or 0}"
                 )
                 _log_cache_effectiveness(
                     request_id="gemini-vision",
-                    model=MODEL,
+                    model=model,
                     cache_read=_ci,
                     prompt_total=_p,
                     context="vision",
