@@ -110,12 +110,8 @@ say "  Enables the SDLC pipeline's coding-agent engine (the sdlc-worker containe
 # ── 0. Ensure required .env values exist ────────────────────────────────────
 # Fixed values (service key, gateway URL) are the same for every install and
 # have no compose-side default (docker-compose.yml falls back to blank), so
-# they're generated/written here automatically. Claude model IDs DO have a
-# blank compose fallback too, and core/model_registry.py's guard fails closed
-# on blank (see patches/0011), so a fresh install needs *something* there to
-# work out of the box — pre-filled with sane defaults, but they're only a
-# placeholder, not a correctness guarantee. Flagged again once setup finishes.
-MODELS_DEFAULTED=""
+# they're generated/written here automatically. Models are not set here: the
+# tiers pick them (Phase 8).
 
 env_get() {
   # Several keys this script checks (AINXT_PLATFORM_SERVICE_API_KEYS,
@@ -154,26 +150,6 @@ ensure_sdlc_env() {
   elif [[ ",${platform_keys}," != *",${svc_key},"* ]]; then
     set_env AINXT_PLATFORM_SERVICE_API_KEYS "${platform_keys},${svc_key}"
     ok "SDLC_SERVICE_API_KEY appended to AINXT_PLATFORM_SERVICE_API_KEYS"
-  fi
-
-  # Only pre-fill Claude model IDs when Anthropic is actually the configured
-  # provider — matches render_config_toml()'s provider priority below.
-  if [[ -n "$(env_get ANTHROPIC_API_KEY)" ]]; then
-    if [[ -z "$(env_get CLAUDE_PRIMARY_MODEL)" ]]; then
-      set_env CLAUDE_PRIMARY_MODEL "claude-sonnet-4-6"
-      MODELS_DEFAULTED=1
-    fi
-    if [[ -z "$(env_get CLAUDE_HAIKU)" ]]; then
-      set_env CLAUDE_HAIKU "claude-sonnet-4-6"
-      MODELS_DEFAULTED=1
-    fi
-    if [[ -z "$(env_get CLAUDE_OPUS_MODEL)" ]]; then
-      set_env CLAUDE_OPUS_MODEL "claude-opus-4-7"
-      MODELS_DEFAULTED=1
-    fi
-    if [[ -n "$MODELS_DEFAULTED" ]]; then
-      ok "Claude model IDs defaulted in .env — verify these once setup finishes"
-    fi
   fi
 }
 
@@ -357,19 +333,13 @@ with open(".env", encoding="utf-8") as f:
             k, _, v = line.partition("=")
             env[k.strip()] = v.strip()
 
-def first_nonempty(*keys):
-    for k in keys:
-        v = env.get(k, "")
-        if v:
-            return v
-    return ""
-
 anthropic_key = env.get("ANTHROPIC_API_KEY", "")
 openai_key    = env.get("OPENAI_API_KEY", "")
 gemini_key    = env.get("GEMINI_API_KEY", "")
 
 if anthropic_key:
-    model = first_nonempty("CLAUDE_PRIMARY_MODEL") or "claude-sonnet-4-6"
+    # Placeholder: the SDLC engine passes --model from the tiers on every run.
+    model = "claude-sonnet-4-6"
     body = f'''[model.sdlc-model]
 model = "{model}"
 base_url = "https://api.anthropic.com/v1"
@@ -383,7 +353,7 @@ anthropic-version = "2023-06-01"
 '''
     provider = "anthropic"
 elif openai_key:
-    model = first_nonempty("OPENAI_CODING_MODEL") or "gpt-5.4"
+    model = "gpt-5.4"   # placeholder, as above
     body = f'''[model.sdlc-model]
 model = "{model}"
 base_url = "https://api.openai.com/v1"
@@ -393,7 +363,7 @@ context_window = 128000
 '''
     provider = "openai"
 elif gemini_key:
-    model = first_nonempty("GEMINI_TEXT_MODEL") or "gemini-3.5-flash"
+    model = "gemini-3.5-flash"   # placeholder, as above
     body = f'''# UNVERIFIED: see bin/config.toml.example's Gemini note.
 [model.sdlc-model]
 model = "{model}"
@@ -452,12 +422,6 @@ else
   warn "SDLC stays disabled until both bin/ainxt and bin/config.toml exist."
 fi
 
-if [[ -n "$MODELS_DEFAULTED" ]]; then
-  say ""
-  warn "Claude model IDs were pre-filled with defaults, not detected from your account:"
-  warn "  CLAUDE_PRIMARY_MODEL / CLAUDE_HAIKU = claude-sonnet-4-6, CLAUDE_OPUS_MODEL = claude-opus-4-7"
-  warn "These are placeholders — they may not match what your Anthropic account/key can actually"
-  warn "call. Check .env, correct them if needed, then apply the change with:"
-  warn "  ${COMPOSE[*]} restart gateway sdlc-worker"
-fi
+say ""
+ok "SDLC models come from Admin > Model Governance > Tiers (simple and complex must be assigned)."
 say ""

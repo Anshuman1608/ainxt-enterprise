@@ -5,9 +5,10 @@
 > knowing which of them were inert. It is now an admin screen: assign the
 > models you want to the `simple` and `complex` tiers on
 > **Admin → Model Governance → Tiers**, and every SDLC stage — CLI and
-> in-process — follows. `SDLC_MODEL_*`, `SDLC_TIER_*` and `SDLC_CLI_*` still
-> work as per-stage pins and still win over the tiers, but they are deprecated
-> and warn once per process.
+> in-process — follows. **Phase 8 removed** `SDLC_TIER_*`, `SDLC_CLI_*_MODEL`
+> and every provider model variable (`OPENAI_*_MODEL`, `CLAUDE_*`, …) used
+> below; `SDLC_MODEL_<STAGE>` remains but takes a tier name only. The rest of
+> this document is kept as history and its `.env` steps no longer apply.
 >
 > Two things below are now wrong rather than merely unnecessary:
 > `SDLC_MODEL_PLAN` was never read by anything (the PLAN spawn takes

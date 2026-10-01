@@ -117,12 +117,12 @@ def test_no_cloud_egress_defaults_to_todays_behaviour():
     assert m.group(1) == "", f"default is {m.group(1)!r}, expected unset"
 
 
-def test_both_vars_are_documented():
+def test_the_residency_switch_is_documented_and_the_override_is_not():
     env = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "ENRICH_NO_CLOUD_EGRESS" in env, (
         "a data-residency switch that is not in .env.example is one nobody "
         "will find when they need it")
-    assert "ENRICH_MODEL" in env
+    assert "ENRICH_MODEL" not in env   # removed in Phase 8; the `simple` tier decides
 
 
 @pytest.mark.parametrize("path", [WORKER, ROUTER])

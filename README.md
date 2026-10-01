@@ -1374,16 +1374,15 @@ The LLM Providers screen reads from the database and takes precedence once seede
 ### Option A — Local model via Ollama (dev / offline)
 
 No API key. No data leaves your machine. The installer pulls `llama3.2` for you;
-swap `FACTORY_MODEL` for any model you have pulled with `ollama pull`.
+any model you `ollama pull` appears in Admin → LLM Providers after **Sync models**.
 
 ```env
 # OPENAI_COMPATIBLE_BASE_URL — the default model endpoint (used by most features)
 OPENAI_COMPATIBLE_BASE_URL=http://localhost:11434/v1
 OPENAI_COMPATIBLE_API_KEY=not-needed
-# FACTORY_BASE_URL / FACTORY_MODEL — the "factory" fallback model used by internal workers
+# FACTORY_BASE_URL — the endpoint internal workers use
 FACTORY_BASE_URL=http://localhost:11434/v1
 FACTORY_API_KEY=not-needed
-FACTORY_MODEL=llama3.2
 LLM_PROXY_TOKEN=
 ```
 
@@ -1411,54 +1410,22 @@ when you want a single controlled egress point for all model traffic.
 ```env
 OPENAI_COMPATIBLE_BASE_URL=http://YOUR_PROXY_HOST:8003   # replace with your proxy hostname
 FACTORY_BASE_URL=http://YOUR_PROXY_HOST:8003             # replace with your proxy hostname
-FACTORY_MODEL=claude-sonnet-4-6
 LLM_PROXY_TOKEN=your-llm-proxy-token-here                # replace with your shared secret
 ```
 
-**Models available in proxy mode:**
+The proxy picks no model: each request names the one the tiers resolved, from
+the providers registered in Admin → LLM Providers.
 
-| Model | Provider |
-|-------|----------|
-| `claude-sonnet-4-6` | Anthropic |
-| `claude-haiku-4-5-20251001` | Anthropic |
-| `claude-opus-4-7` | Anthropic |
-| `gpt-5-mini` | OpenAI |
-| `gpt-5.4` | OpenAI |
-| `gemini-2.5-flash` | Google |
-| Any Ollama model | Local |
+### Choose the models (Admin → Model Governance → Tiers)
 
-### Which model classifies each message's intent? (`CIL_INTENT_MODEL`)
+`.env` holds no model names. Once your providers are registered, assign a model
+to each tier: `mini`, `simple`, `medium`, `complex` and `intent-classification`
+are required (`./doctor.sh` fails until they are), and `image-input`,
+`image-output` and `video-generation` turn on image and video features.
 
-Every message you send is looked at twice: once by an internal **intent
-classifier**, which quietly decides *what kind of request this is* (a normal
-question? a request for a Word/PowerPoint document? an image? a video?), and
-then by the actual model that writes your answer. This happens on **every
-single turn**, even a one-word "thanks" — so, by default, it uses a small,
-fast, cheap model (`local_mini`, an in-house model that never leaves your
-infrastructure) instead of the same model that writes the answer. That keeps
-ordinary chat fast and inexpensive.
-
-You do not need to touch this to use the platform — it works out of the box.
-Change it only if you want to test whether a different model classifies
-requests more accurately (for example, if you notice the platform
-misunderstanding what you're asking for).
-
-```env
-CIL_INTENT_MODEL=haiku
-CLAUDE_HAIKU=claude-haiku-4-5-20251001
-```
-
-| `CIL_INTENT_MODEL` value | Uses | Also set |
-|---|---|---|
-| *(blank/unset — default)* | in-house `local_mini` model, no cloud egress | `OPENAI_OSS_MODEL` |
-| `haiku` | Claude Haiku | `CLAUDE_HAIKU` |
-| `mini` | GPT-5-mini | `OPENAI_SIMPLE_MODEL` |
-| `gemini` | Gemini text tier | `GEMINI_TEXT_MODEL` |
-
-After changing either variable, restart the gateway so it picks up the new
-value — see [restarting a single container](#restarting-a-single-container-after-an-env-change)
-below (`docker compose restart` alone will **not** pick up `.env` changes;
-you need `docker compose up -d gateway`).
+`intent-classification` is the model that decides, on every turn, what kind of
+request a message is (a question, a document, an image, a video). Pick a small,
+fast model for it; a deployment-local one keeps that traffic in your network.
 
 ---
 

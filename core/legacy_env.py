@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Environment variables Phase 8 removes (plan.html §I.2, §I.3, §I.6).
+"""Environment variables Phase 8 removed (plan.html §I.2, §I.3, §I.6).
 
-Each one names a model, a display label, or a per-SKU switch that the admin
-registry now owns. They still work; this module only lets the platform say
-which of them a deployment still sets. Deliberately excluded: the §I.5 Keep
+Each one named a model, a display label, or a per-SKU switch that the admin
+registry now owns. Nothing reads them; this list lets the gateway warn and
+doctor.sh fail when a deployment still sets one. Deliberately excluded: the §I.5 Keep
 rows, LOCAL_HIDDEN_MODELS, LOCAL_MODEL_IDS* (Phase 7), DOWNGRADE_MODEL (under
 investigation) and SDLC_MODEL_<STAGE> (narrowed to tier names, not removed).
 """
@@ -51,6 +51,8 @@ PHASE8_REMOVED_VARS: tuple[str, ...] = (
     "ENABLE_OPUS", "ENABLE_CHAT_OPUS", "ENABLE_CLI_OPUS_48", "ENABLE_CLI_OPUS_5",
     "ENABLE_SONNET_5", "ENABLE_GPT56_TERA", "ENABLE_GPT56_LUNA", "VEO_ENABLED",
     "BLOCKED_MODELS_EXTRA",
+    # Phase 10 (flag half, D106): governance is always on
+    "TIER_GOVERNANCE_ENABLED",
 )
 
 
@@ -73,8 +75,8 @@ def warn_legacy_env_once(environ=None) -> list[str]:
             return found
         _warned = True
     logger.warning(
-        "Deprecated model env vars are set and will be removed in Phase 8 "
-        "(configure models in Admin → LLM Providers / Model Governance instead): %s",
+        "Model env vars removed in Phase 8 are still set and are IGNORED; delete them "
+        "(models live in Admin → LLM Providers / Model Governance): %s",
         ", ".join(found),
     )
     return found

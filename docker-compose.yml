@@ -62,35 +62,11 @@ x-worker-env: &worker-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
   GEMINI_API_KEY:    ${GEMINI_API_KEY:-}
-  # Tier governance (Phase 5) — see the gateway service for what this does.
-  # The worker pools run agents and SDLC stages through the same ModelRouter,
-  # so a flag set only on the gateway would give one answer in Chat and a
-  # different one in a background job.
-  TIER_GOVERNANCE_ENABLED: ${TIER_GOVERNANCE_ENABLED:-false}
   # Residency policy for long-lived memory (Phase 6 §D.2 / §M.1). Off by
   # default: a deployment that never had the constraint does not acquire
-  # one. Lives alongside the governance flag because the same ModelRouter
-  # in the worker pools writes memory too.
+  # one. Workers need it too: their ModelRouter writes memory.
   MEMORY_NO_CLOUD_EGRESS: ${MEMORY_NO_CLOUD_EGRESS:-false}
   OPENAI_BASE_URL:       ${OPENAI_BASE_URL:-https://api.openai.com/v1}
-  OPENAI_SIMPLE_MODEL:   ${OPENAI_SIMPLE_MODEL:-gpt-5-mini}
-  OPENAI_CODING_MODEL:   ${OPENAI_CODING_MODEL:-gpt-5.4}
-  OPENAI_LATEST_MODEL:   ${OPENAI_LATEST_MODEL:-gpt-5.5}
-  OPENAI_TERA_MODEL:     ${OPENAI_TERA_MODEL:-gpt-5.6-terra}
-  OPENAI_LUNA_MODEL:     ${OPENAI_LUNA_MODEL:-gpt-5.6-luna}
-  OPENAI_SIMPLE_DISPLAY: ${OPENAI_SIMPLE_DISPLAY:-}
-  OPENAI_CODING_DISPLAY: ${OPENAI_CODING_DISPLAY:-}
-  OPENAI_LATEST_DISPLAY: ${OPENAI_LATEST_DISPLAY:-}
-  OPENAI_TERA_DISPLAY:   ${OPENAI_TERA_DISPLAY:-}
-  OPENAI_LUNA_DISPLAY:   ${OPENAI_LUNA_DISPLAY:-}
-  GEMINI_TEXT_MODEL:        ${GEMINI_TEXT_MODEL:-gemini-3.5-flash}
-  GEMINI_CODING_LITE_MODEL: ${GEMINI_CODING_LITE_MODEL:-gemini-3.1-flash-lite}
-  GEMINI_IMAGE_MODEL:       ${GEMINI_IMAGE_MODEL:-gemini-3.1-flash-image}
-  GEMINI_VISION_MODEL:      ${GEMINI_VISION_MODEL:-gemini-3.5-flash}
-  VEO_ENABLED:           ${VEO_ENABLED:-false}
-  # DEPRECATED override for the `video-generation` tier (Phase 6
-  # §N.1 step 5). No default, for the same reason as CIL_INTENT_MODEL.
-  VEO_MODEL:             ${VEO_MODEL:-}
   ENABLE_INJECTION_SCAN: ${ENABLE_INJECTION_SCAN:-false}
   INJECTION_SCAN_URL:    ${INJECTION_SCAN_URL:-}
   AINXT_DOC_STORAGE_DIR: /var/lib/ainxt/docs
@@ -106,16 +82,6 @@ x-worker-env: &worker-env
   EMBED_PROVIDER:        ${EMBED_PROVIDER:-ollama}
   KAFKA_ENABLED:         ${KAFKA_ENABLED:-true}
   KAFKA_BOOTSTRAP:       ${KAFKA_BOOTSTRAP:-kafka:19092}
-  # ── Claude (Anthropic) model ids — despite the SDLC worker block's comment
-  # claiming this anchor already supplied these, they were never actually
-  # declared here, so CLAUDE_PRIMARY_MODEL/HAIKU/OPUS_MODEL from .env never
-  # reached any worker container — core/model_registry.py's CLAUDE_* constants
-  # resolved blank, and agents/sdlc_cli_engine.py's model guard fails closed
-  # ("model guard: <blank> not allowed") before ever spawning the CLI.
-  CLAUDE_PRIMARY_MODEL: ${CLAUDE_PRIMARY_MODEL:-}
-  CLAUDE_HAIKU:         ${CLAUDE_HAIKU:-}
-  CLAUDE_OPUS_MODEL:    ${CLAUDE_OPUS_MODEL:-}
-  ENABLE_OPUS:          ${ENABLE_OPUS:-true}
   # ── SCM / GitLab / GitHub (SDLC pipeline) ───────────────────────────────────
   # Clone / index / MR operations run across the connector, index, security and
   # sdlc worker pools, so they all need the SCM creds. All optional (:-) — an
@@ -153,9 +119,6 @@ x-worker-env: &worker-env
   CODEWIKI_BASE_URL:      ${CODEWIKI_BASE_URL:-}
   CODEWIKI_API_KEY:       ${CODEWIKI_API_KEY:-}
   CODEWIKI_PROVIDER:      ${CODEWIKI_PROVIDER:-}
-  CODEWIKI_MAIN_MODEL:    ${CODEWIKI_MAIN_MODEL:-}
-  CODEWIKI_CLUSTER_MODEL: ${CODEWIKI_CLUSTER_MODEL:-}
-  CODEWIKI_FALLBACK_MODEL: ${CODEWIKI_FALLBACK_MODEL:-}
   CODEWIKI_MAX_TOKENS_FOR_GENERATION: ${CODEWIKI_MAX_TOKENS_FOR_GENERATION:-}
   CODEWIKI_MAX_TOKENS_FOR_CLUSTERING: ${CODEWIKI_MAX_TOKENS_FOR_CLUSTERING:-}
   CODEWIKI_MAX_TOKEN_PER_MODULE:      ${CODEWIKI_MAX_TOKEN_PER_MODULE:-}
@@ -286,24 +249,16 @@ services:
       # as EMBED_SVC_URL above: without this line, setting it in .env has no
       # effect at all inside the container (confirmed via testing).
       HOD_APPROVAL_ENABLED: ${HOD_APPROVAL_ENABLED:-false}
+      HOD_STATEMENT_LLM_ENABLED: ${HOD_STATEMENT_LLM_ENABLED:-false}
       SEED_ADMIN_PASSWORD:  ${SEED_ADMIN_PASSWORD:-}
       # Log to the console so `docker compose logs` shows real errors.
       GUNICORN_LOG_DIR:  ${GUNICORN_LOG_DIR:-/dev/null-not-writable}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
       GEMINI_API_KEY:    ${GEMINI_API_KEY:-}
-      # Tier governance (Phase 5). OFF: models are chosen by the
-      # OPENAI_*/CLAUDE_*/GEMINI_* constants below, as they always have been.
-      # ON: by the assignments in Admin -> Model Governance -> Tiers, with
-      # those constants as a logged fallback. Must be listed here explicitly —
-      # `environment:` is an allow-list, so setting it in .env alone has no
-      # effect on a Docker deployment and the admin screen would keep
-      # reporting "not yet routing" with no way to change that.
-      TIER_GOVERNANCE_ENABLED: ${TIER_GOVERNANCE_ENABLED:-false}
       # Residency policy for long-lived memory (Phase 6 §D.2 / §M.1). Off by
       # default: a deployment that never had the constraint does not acquire
-      # one. Lives alongside the governance flag because the same ModelRouter
-      # in the worker pools writes memory too.
+      # one. Workers need it too: their ModelRouter writes memory.
       MEMORY_NO_CLOUD_EGRESS: ${MEMORY_NO_CLOUD_EGRESS:-false}
       # Model routing is configured in .env, but compose's `environment:` is an
       # explicit allow-list — without these the container silently falls back to
@@ -312,40 +267,7 @@ services:
       # endpoint, so auto-routing (tier=medium -> _get_openai()) serves Claude
       # instead of erroring on the missing OpenAI key.
       OPENAI_BASE_URL:       ${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      OPENAI_SIMPLE_MODEL:   ${OPENAI_SIMPLE_MODEL:-gpt-5-mini}
-      OPENAI_CODING_MODEL:   ${OPENAI_CODING_MODEL:-gpt-5.4}
-      OPENAI_LATEST_MODEL:   ${OPENAI_LATEST_MODEL:-gpt-5.5}
-      OPENAI_TERA_MODEL:     ${OPENAI_TERA_MODEL:-gpt-5.6-terra}
-      OPENAI_LUNA_MODEL:     ${OPENAI_LUNA_MODEL:-gpt-5.6-luna}
-      OPENAI_SIMPLE_DISPLAY: ${OPENAI_SIMPLE_DISPLAY:-}
-      OPENAI_CODING_DISPLAY: ${OPENAI_CODING_DISPLAY:-}
-      OPENAI_LATEST_DISPLAY: ${OPENAI_LATEST_DISPLAY:-}
-      OPENAI_TERA_DISPLAY:   ${OPENAI_TERA_DISPLAY:-}
-      OPENAI_LUNA_DISPLAY:   ${OPENAI_LUNA_DISPLAY:-}
-      GEMINI_TEXT_MODEL:        ${GEMINI_TEXT_MODEL:-gemini-3.5-flash}
-      GEMINI_CODING_LITE_MODEL: ${GEMINI_CODING_LITE_MODEL:-gemini-3.1-flash-lite}
-      GEMINI_IMAGE_MODEL:       ${GEMINI_IMAGE_MODEL:-gemini-3.1-flash-image}
-      GEMINI_VISION_MODEL:      ${GEMINI_VISION_MODEL:-gemini-3.5-flash}
-      VEO_ENABLED:           ${VEO_ENABLED:-false}
-      # DEPRECATED override for the `video-generation` tier (Phase 6
-      # §N.1 step 5). No default, for the same reason as CIL_INTENT_MODEL.
-      VEO_MODEL:             ${VEO_MODEL:-}
       EVAL_ENABLED:          ${EVAL_ENABLED:-true}
-      # Claude model ids — same gap as the worker anchor: undeclared here means
-      # the gateway's /ainxt/v1/api/models list and core/model_registry.py
-      # never see whatever CLAUDE_PRIMARY_MODEL/HAIKU/OPUS_MODEL is set in .env.
-      CLAUDE_PRIMARY_MODEL: ${CLAUDE_PRIMARY_MODEL:-}
-      CLAUDE_HAIKU:         ${CLAUDE_HAIKU:-}
-      CLAUDE_OPUS_MODEL:    ${CLAUDE_OPUS_MODEL:-}
-      ENABLE_OPUS:          ${ENABLE_OPUS:-true}
-      # cil/intent.py's model hint for the CIL intent classifier — same
-      # explicit-allow-list gap as the vars above. Defaults to "local_mini".
-      # Phase 6 §N.1 step 2 — DEPRECATED override for the
-      # `intent-classification` tier. Deliberately has NO default: `:-`
-      # substitutes on empty as well as unset, so a pinned default here would
-      # beat the administrator's tier assignment on every request and the
-      # Tiers screen would silently control nothing.
-      CIL_INTENT_MODEL:     ${CIL_INTENT_MODEL:-}
       AINXT_DOC_STORAGE_DIR: /var/lib/ainxt/docs
       # Encrypts store/credential_vault.py (LLM provider API keys added via the
       # "LLM Providers" admin screen, OAuth connector tokens, etc.). This block
@@ -404,9 +326,6 @@ services:
       CODEWIKI_BASE_URL:      ${CODEWIKI_BASE_URL:-}
       CODEWIKI_API_KEY:       ${CODEWIKI_API_KEY:-}
       CODEWIKI_PROVIDER:      ${CODEWIKI_PROVIDER:-}
-      CODEWIKI_MAIN_MODEL:    ${CODEWIKI_MAIN_MODEL:-}
-      CODEWIKI_CLUSTER_MODEL: ${CODEWIKI_CLUSTER_MODEL:-}
-      CODEWIKI_FALLBACK_MODEL: ${CODEWIKI_FALLBACK_MODEL:-}
       CODEWIKI_MAX_TOKENS_FOR_GENERATION: ${CODEWIKI_MAX_TOKENS_FOR_GENERATION:-}
       CODEWIKI_MAX_TOKENS_FOR_CLUSTERING: ${CODEWIKI_MAX_TOKENS_FOR_CLUSTERING:-}
       CODEWIKI_MAX_TOKEN_PER_MODULE:      ${CODEWIKI_MAX_TOKEN_PER_MODULE:-}
@@ -546,18 +465,9 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
       GEMINI_API_KEY:    ${GEMINI_API_KEY:-}
-      # Tier governance (Phase 5). OFF: models are chosen by the
-      # OPENAI_*/CLAUDE_*/GEMINI_* constants below, as they always have been.
-      # ON: by the assignments in Admin -> Model Governance -> Tiers, with
-      # those constants as a logged fallback. Must be listed here explicitly —
-      # `environment:` is an allow-list, so setting it in .env alone has no
-      # effect on a Docker deployment and the admin screen would keep
-      # reporting "not yet routing" with no way to change that.
-      TIER_GOVERNANCE_ENABLED: ${TIER_GOVERNANCE_ENABLED:-false}
       # Residency policy for long-lived memory (Phase 6 §D.2 / §M.1). Off by
       # default: a deployment that never had the constraint does not acquire
-      # one. Lives alongside the governance flag because the same ModelRouter
-      # in the worker pools writes memory too.
+      # one. Workers need it too: their ModelRouter writes memory.
       MEMORY_NO_CLOUD_EGRESS: ${MEMORY_NO_CLOUD_EGRESS:-false}
       # Model routing is configured in .env, but compose's `environment:` is an
       # explicit allow-list — without these the container silently falls back to
@@ -566,24 +476,6 @@ services:
       # endpoint, so auto-routing (tier=medium -> _get_openai()) serves Claude
       # instead of erroring on the missing OpenAI key.
       OPENAI_BASE_URL:       ${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      OPENAI_SIMPLE_MODEL:   ${OPENAI_SIMPLE_MODEL:-gpt-5-mini}
-      OPENAI_CODING_MODEL:   ${OPENAI_CODING_MODEL:-gpt-5.4}
-      OPENAI_LATEST_MODEL:   ${OPENAI_LATEST_MODEL:-gpt-5.5}
-      OPENAI_TERA_MODEL:     ${OPENAI_TERA_MODEL:-gpt-5.6-terra}
-      OPENAI_LUNA_MODEL:     ${OPENAI_LUNA_MODEL:-gpt-5.6-luna}
-      OPENAI_SIMPLE_DISPLAY: ${OPENAI_SIMPLE_DISPLAY:-}
-      OPENAI_CODING_DISPLAY: ${OPENAI_CODING_DISPLAY:-}
-      OPENAI_LATEST_DISPLAY: ${OPENAI_LATEST_DISPLAY:-}
-      OPENAI_TERA_DISPLAY:   ${OPENAI_TERA_DISPLAY:-}
-      OPENAI_LUNA_DISPLAY:   ${OPENAI_LUNA_DISPLAY:-}
-      GEMINI_TEXT_MODEL:        ${GEMINI_TEXT_MODEL:-gemini-3.5-flash}
-      GEMINI_CODING_LITE_MODEL: ${GEMINI_CODING_LITE_MODEL:-gemini-3.1-flash-lite}
-      GEMINI_IMAGE_MODEL:       ${GEMINI_IMAGE_MODEL:-gemini-3.1-flash-image}
-      GEMINI_VISION_MODEL:      ${GEMINI_VISION_MODEL:-gemini-3.5-flash}
-      VEO_ENABLED:           ${VEO_ENABLED:-false}
-      # DEPRECATED override for the `video-generation` tier (Phase 6
-      # §N.1 step 5). No default, for the same reason as CIL_INTENT_MODEL.
-      VEO_MODEL:             ${VEO_MODEL:-}
       ENABLE_INJECTION_SCAN: ${ENABLE_INJECTION_SCAN:-false}
       INJECTION_SCAN_URL: ${INJECTION_SCAN_URL:-}
       AINXT_DOC_STORAGE_DIR: /var/lib/ainxt/docs
@@ -771,26 +663,7 @@ services:
       # agents/sdlc_cli_engine.py _cli_env) instead of the gateway's
       # Anthropic-compat endpoint.
       SDLC_CLI_GATEWAY_URL: ${SDLC_CLI_GATEWAY_URL:-}
-      # ── SDLC phase model selection — PROVIDER-AGNOSTIC ──────────────────────
-      # This worker no longer hardcodes Anthropic model ids. The shared
-      # *worker-env anchor already supplies CLAUDE_*/OPENAI_* defaults as
-      # fallbacks; the knobs below let an operator point every phase/tier at ANY
-      # provider's model (incl. a harness with no Anthropic). Compose only injects
-      # DECLARED vars, so each must be listed here to reach the container — all
-      # default to blank (:-) → fall back to the anchor's tier defaults, i.e. a
-      # no-op unless set in .env.
-      #
-      # Per-tier remap (one place; family-agnostic; see core/model_registry.py
-      # _tier_env_override). Set these to your models to run without Anthropic.
-      SDLC_TIER_SIMPLE_MODEL:   ${SDLC_TIER_SIMPLE_MODEL:-}
-      SDLC_TIER_COMPLEX_MODEL:  ${SDLC_TIER_COMPLEX_MODEL:-}
-      SDLC_TIER_SOLUTION_MODEL: ${SDLC_TIER_SOLUTION_MODEL:-}
-      SDLC_TIER_MEDIUM_MODEL:   ${SDLC_TIER_MEDIUM_MODEL:-}
-      SDLC_TIER_DEEP_MODEL:     ${SDLC_TIER_DEEP_MODEL:-}
-      # Per-phase override — each accepts a router tier name OR a concrete model id.
-      SDLC_CLI_CLASSIFY_MODEL:      ${SDLC_CLI_CLASSIFY_MODEL:-}
-      SDLC_CLI_PLAN_MODEL:          ${SDLC_CLI_PLAN_MODEL:-}
-      SDLC_CLI_IMPLEMENT_MODEL:     ${SDLC_CLI_IMPLEMENT_MODEL:-}
+      # Per-stage pins: a tier name only (Admin > Model Governance > Tiers picks the model).
       SDLC_MODEL_NORMALIZE:         ${SDLC_MODEL_NORMALIZE:-}
       SDLC_MODEL_CODE_REVIEW:       ${SDLC_MODEL_CODE_REVIEW:-}
       SDLC_MODEL_MANIFEST_VALIDATE: ${SDLC_MODEL_MANIFEST_VALIDATE:-}

@@ -815,13 +815,12 @@ def check_tier_migration(cfg) -> list[str]:
     return bad
 
 
-# ── Phase 8 prep: references to the env vars Phase 8 removes may only fall ──
+# ── Phase 8: nothing may reference the env vars it removed ──────────────────
 #
 # The list lives in core/legacy_env.py and is read by AST, not imported, so this
 # script keeps running without the app's dependencies. Counts code only — a
-# comment or docstring may name a variable to explain history. Lower it as
-# modules stop reading a variable; 0 once Phase 8 lands.
-_LEGACY_ENV_REF_BASELINE = 187   # compose, .env.example, sdlc-setup.sh (stage 8.7)
+# comment or docstring may name a variable to explain history.
+_LEGACY_ENV_REF_BASELINE = 0
 _LEGACY_ENV_GLOBS = ("*.py", "*.sh", "*.yml", "*.yaml", ".env.example")
 _LEGACY_ENV_EXCLUDED = ("core/legacy_env.py", "scripts/ci/release_checks.py", "db/phase8_env_prices.py")
 
@@ -880,7 +879,7 @@ def legacy_env_refs() -> dict[str, int]:
 
 
 def check_legacy_env_refs(cfg) -> list[str]:
-    """References to the env vars Phase 8 removes may fall, never rise."""
+    """No code or config may reference an env var Phase 8 removed."""
     per_file = legacy_env_refs()
     total = sum(per_file.values())
     if total <= _LEGACY_ENV_REF_BASELINE:
@@ -888,8 +887,7 @@ def check_legacy_env_refs(cfg) -> list[str]:
     worst = sorted(per_file.items(), key=lambda kv: -kv[1])[:5]
     detail = ", ".join(f"{f} ({n})" for f, n in worst)
     return [
-        f"references to Phase 8's removed env vars rose to {total}, above the "
-        f"baseline of {_LEGACY_ENV_REF_BASELINE}. Resolve the model through a tier "
+        f"{total} reference(s) to env vars Phase 8 removed. Resolve the model through a tier "
         f"or the registry instead (core/legacy_env.py lists them). Highest: {detail}"
     ]
 

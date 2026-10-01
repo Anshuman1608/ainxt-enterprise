@@ -74,28 +74,41 @@ than the release named in its entry.
   translation happens at the boundary only, is never exposed by the governance
   API, and does not affect routing.
 
-- **Model environment variables** — the 93 listed in `core/legacy_env.py::PHASE8_REMOVED_VARS`.
+### Removed
 
-  **What is deprecated.** Variables that name a model (`OPENAI_CODING_MODEL`,
-  `CLAUDE_PRIMARY_MODEL`, `GEMINI_TEXT_MODEL`, …), its display label
-  (`*_DISPLAY`), a per-feature model override (`CIL_INTENT_MODEL`,
-  `FACTORY_MODEL`, `SDLC_TIER_<TIER>_MODEL`, …) or a per-SKU switch
-  (`ENABLE_OPUS`, `ENABLE_SONNET_5`, `VEO_ENABLED`, …), and the matching
-  `docker-compose.yml` defaults.
+- **Model environment variables** — the 94 listed in `core/legacy_env.py::PHASE8_REMOVED_VARS`
+  (Phase 8, plus `TIER_GOVERNANCE_ENABLED`). The two-release gate announced for
+  them was waived for this release (plan.html D104).
 
-  **What to use instead.** Register providers and models in Admin → LLM
-  Providers, and assign them to tiers in Admin → Model Governance. Infrastructure,
-  credentials and policy variables (`LLM_PROXY_URL`, `*_API_KEY`,
-  `PRIVACY_FLOOR_ENFORCE`, `LOCAL_HIDDEN_MODELS`, …) are not affected.
+  **What is gone.** Variables that named a model (`OPENAI_CODING_MODEL`,
+  `CLAUDE_PRIMARY_MODEL`, …), its display label (`*_DISPLAY`), a per-feature
+  override (`CIL_INTENT_MODEL`, `FACTORY_MODEL`, `SDLC_TIER_<TIER>_MODEL`,
+  `SDLC_CLI_*_MODEL`, `AINXT_MODEL_*`, …), a per-SKU switch (`ENABLE_OPUS`,
+  `VEO_ENABLED`, `BLOCKED_MODELS_EXTRA`, …) and the governance flag, with their
+  `docker-compose.yml` defaults. Nothing reads them; a value left set is ignored.
 
-  **How to tell whether you use them.** The gateway logs one warning at startup
-  naming every listed variable it was started with, and `doctor.sh` reports the
-  same list under "legacy model env vars".
+  **What decides instead.** The models registered in Admin → LLM Providers and
+  the tier assignments in Admin → Model Governance → Tiers. Governance is always
+  on. `SDLC_MODEL_<STAGE>` now takes a tier name only.
 
-  **When it is removed.** Two minor releases after the release that dates this
-  section, on the same terms as the aliases above.
+  **Behaviour that changes.**
+  - An unassigned tier fails the request with a message naming the Tiers screen;
+    nothing falls back to `.env`. `mini`, `simple`, `medium`, `complex` and
+    `intent-classification` must be assigned; `doctor.sh` fails until they are.
+  - Prices come from the model row (`cost_per_1m_input`/`_output`). Migration
+    Part AE1 copies the `.env`-era prices onto the rows, so **start the new
+    release once with your old `.env` before deleting the lines**. An unpriced
+    paid model bills at the conservative fallback rate; `doctor.sh` lists them.
+  - The LLM proxy (`services/llm_proxy`) picks no model and prices nothing: every
+    request must name its model (400 otherwise). Upgrade it with the gateway.
 
-  **Nothing changes yet.** Every variable is still read exactly as before.
+  **What to do.** Delete the listed lines from `.env`. The gateway logs any still
+  set at startup, and `doctor.sh` fails under "legacy model env vars".
+
+### Added
+
+- `HOD_STATEMENT_LLM_ENABLED` (default `false`): narrate manager/HOD statements
+  with the `medium` tier. Replaces the removed `HOD_STATEMENT_LLM_MODEL`.
 
 ### Changed
 

@@ -514,13 +514,15 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
       pass "llm models priced" "every paid model has a price"
     fi
 
-    # Phase 8 removes these env vars; the gateway knows which ones it was started with.
-    legacy_raw="$(docker exec ainxt-gateway python -c 'from core.legacy_env import legacy_vars_set as l; print("OK " + ", ".join(l()))' 2>/dev/null | grep '^OK' | tail -1)"
-    if [[ -z "$legacy_raw" ]]; then
-      skip "legacy model env vars" "gateway not reachable or predates the check"
-    elif [[ "$legacy_raw" != "OK" ]]; then
-      warno "legacy model env vars" "still set: ${legacy_raw#OK }" \
-            "Phase 8 removes these; move each to Admin > LLM Providers / Model Governance and unset it (docker-compose defaults included)"
+    # Phase 8 removed these env vars (core/legacy_env.py lists them); a set one is ignored.
+    legacy_set=()
+    for _v in $(grep -o '"[A-Z][A-Z0-9_]*"' core/legacy_env.py 2>/dev/null | tr -d '"'); do
+      _val="$(envval "$_v" || true)"
+      [[ -n "$_val" && "${_val:0:1}" != "#" ]] && legacy_set+=("$_v")
+    done
+    if [[ ${#legacy_set[@]} -gt 0 ]]; then
+      fail "legacy model env vars" "still set in .env: ${legacy_set[*]}" \
+           "Phase 8 removed these and nothing reads them; delete the lines (models live in Admin > LLM Providers / Model Governance)"
     else
       pass "legacy model env vars" "none set"
     fi
@@ -566,47 +568,30 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
       pass "llm channel restrictions" "none — no model is channel-restricted"
     fi
 
-    # ── Is tier governance actually deciding anything? (Phase 5) ────────────
-    # The single most useful line in this section, because every check below
-    # it means something different depending on the answer. With the flag off
-    # an unassigned tier is future work; with it on, that tier falls back to
-    # the deprecated .env model constants on every request.
-    # .env first, then the environment: the gateway reads the value through
-    # python-dotenv, so a value present only in .env is still the live one.
-    tg_raw="$(envval TIER_GOVERNANCE_ENABLED || true)"
-    [[ -z "$tg_raw" ]] && tg_raw="${TIER_GOVERNANCE_ENABLED:-}"
-    tg_raw="$(printf '%s' "$tg_raw" | tr '[:upper:]' '[:lower:]')"
-    case "$tg_raw" in
-      1|true|yes|on) tg_on=1 ;;
-      *)             tg_on=0 ;;
-    esac
-    if [[ "$tg_on" -eq 1 ]]; then
-      pass "llm tier governance" "ON — models resolve from the tier assignments"
-    else
-      # Not a pass and not a warning: off is the correct default, and a green
-      # tick would suggest the assignments below are in effect when they are not.
-      skip "llm tier governance" "OFF — .env model constants still decide; set TIER_GOVERNANCE_ENABLED=true to switch over"
-    fi
-
-    # ── Tier assignment coverage (Phase 3) ──────────────────────────────────
-    # An unassigned tier is not an error: a deployment with no image model
-    # genuinely cannot generate images, and saying so is the point. But it
-    # silently disables whichever features request that tier, so it must be
-    # visible here rather than discovered when a user hits the feature.
+    # ── Tier assignment coverage ────────────────────────────────────────────
+    # Phase 8: an unassigned text tier fails its requests (nothing falls back),
+    # so those five are required; image and video only disable their feature.
     tiers_n="$(run_sql "SELECT count(DISTINCT tier) FROM ainxt.llm_tier_models WHERE enabled = TRUE AND org_id = 'default'" | tr -d ' \r')"
     if [[ -z "$tiers_n" ]]; then
-      warno "llm tier assignments" "llm_tier_models not queryable" \
-            "run: python db/migrate.py   (Part AD1 creates and seeds it)"
-    elif [[ "$tiers_n" -eq 8 ]]; then
-      pass "llm tier assignments" "all 8 tiers have at least one eligible model"
+      fail "llm tier assignments" "llm_tier_models not queryable" \
+           "run: python db/migrate.py   (Part AD1 creates and seeds it)"
     else
-      unassigned="$(run_sql "SELECT string_agg(t, ', ' ORDER BY t) FROM unnest(ARRAY['mini','simple','medium','complex','image-input','image-output','video-generation','intent-classification']) AS t WHERE t NOT IN (SELECT tier FROM ainxt.llm_tier_models WHERE enabled = TRUE AND org_id = 'default')" | tr -d '\r' | sed 's/^ *//;s/ *$//')"
-      if [[ "$tg_on" -eq 1 ]]; then
-        warno "llm tier assignments" "$tiers_n/8 assigned — unassigned: ${unassigned:-unknown}" \
-              "governance is ON, so every request for these tiers falls back to the deprecated .env model constants; assign models in Admin → Model Governance → Tiers"
+      _unassigned() {
+        run_sql "SELECT string_agg(t, ', ' ORDER BY t) FROM unnest(ARRAY[$1]) AS t WHERE t NOT IN (SELECT tier FROM ainxt.llm_tier_models WHERE enabled = TRUE AND org_id = 'default')" | tr -d '\r' | sed 's/^ *//;s/ *$//'
+      }
+      text_missing="$(_unassigned "'mini','simple','medium','complex','intent-classification'")"
+      media_missing="$(_unassigned "'image-input','image-output','video-generation'")"
+      if [[ -n "$text_missing" ]]; then
+        fail "llm text tiers assigned" "unassigned: $text_missing" \
+             "requests for these tiers fail; assign models in Admin → Model Governance → Tiers"
       else
-        warno "llm tier assignments" "$tiers_n/8 assigned — unassigned: ${unassigned:-unknown}" \
-              "features using these tiers report unavailable; assign models in Admin → Model Governance → Tiers"
+        pass "llm text tiers assigned" "mini, simple, medium, complex, intent-classification"
+      fi
+      if [[ -n "$media_missing" ]]; then
+        warno "llm media tiers assigned" "unassigned: $media_missing" \
+              "the matching image/video features report unavailable; assign models in Admin → Model Governance → Tiers"
+      else
+        pass "llm media tiers assigned" "image-input, image-output, video-generation"
       fi
     fi
 

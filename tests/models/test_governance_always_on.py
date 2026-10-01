@@ -41,7 +41,8 @@ def test_no_module_reads_the_removed_switch():
     offenders = []
     for path in sorted(ROOT.rglob("*.py")):
         rel = path.relative_to(ROOT)
-        if _SKIP_DIRS & set(rel.parts):
+        # legacy_env.py lists removed names so doctor.sh can flag a stale line.
+        if _SKIP_DIRS & set(rel.parts) or rel.as_posix() == "core/legacy_env.py":
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "TIER_GOVERNANCE_ENABLED" not in text and "governance_enabled" not in text:

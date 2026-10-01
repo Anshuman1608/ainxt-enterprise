@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
-"""D103 — Phase 8 prep: one list of the env vars Phase 8 removes.
+"""D103/D112 — one list of the env vars Phase 8 removed.
 
-Nothing is removed here. The list drives the startup warning, doctor.sh and a
-release-check ratchet, so the deprecation an operator is told about and the
-one CI enforces are the same set.
+It drives the startup warning, the doctor.sh failure and the zero-rule release
+check, so what an operator is told to delete and what CI forbids are one set.
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ KEEP = {
     "CONTEXT_FIT_FRACTION", "PIPELINE_V2", "PIPELINE_V2_ROUTING", "CIL_MODEL_ROUTING",
     "ENABLE_RAW_OPENAI_API", "LOCAL_HIDDEN_MODELS", "LOCAL_MODEL_REFRESH_SECS",
     "LOCAL_MODEL_IDS", "LOCAL_MODEL_IDS_DEFAULT", "LOCAL_MODEL_IDS_REPLACE",
-    "MODEL_CONTEXT_CONFIG", "OPENAI_EMBED_MODEL", "TIER_GOVERNANCE_ENABLED",
+    "MODEL_CONTEXT_CONFIG", "OPENAI_EMBED_MODEL", "HOD_STATEMENT_LLM_ENABLED",
 }
 
 
@@ -90,5 +89,30 @@ def test_the_ratchet_catches_a_new_reference(rc, monkeypatch):
 
 
 def test_the_baseline_is_the_measured_count(rc):
-    """Raising the baseline would hide a new reference; lower it when one goes."""
-    assert sum(rc.legacy_env_refs().values()) == rc._LEGACY_ENV_REF_BASELINE
+    """Phase 8 landed: zero references, in code or config."""
+    assert rc._LEGACY_ENV_REF_BASELINE == 0
+    assert rc.legacy_env_refs() == {}
+
+
+# ── doctor.sh pre-flight (D112) ─────────────────────────────────────────────
+
+
+def _doctor() -> str:
+    return (ROOT / "doctor.sh").read_text(encoding="utf-8")
+
+
+def test_doctor_fails_on_a_set_legacy_variable():
+    src = _doctor()
+    assert "core/legacy_env.py" in src
+    assert 'fail "legacy model env vars"' in src
+
+
+def test_doctor_fails_on_an_unassigned_text_tier_and_warns_for_media():
+    src = _doctor()
+    assert "'mini','simple','medium','complex','intent-classification'" in src
+    assert 'fail "llm text tiers assigned"' in src
+    assert 'warno "llm media tiers assigned"' in src
+
+
+def test_doctor_no_longer_checks_the_governance_flag():
+    assert "TIER_GOVERNANCE_ENABLED" not in _doctor()
