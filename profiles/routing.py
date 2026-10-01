@@ -44,7 +44,7 @@ class ModelCandidate:
     """Routing-relevant model metadata (docs/architecture/10 §10.8 RT1).
 
     At wiring time, `cost_per_1k` should be derived from the single source of
-    truth in core/model_registry.MODEL_COST_PER_1M (reconcile its input/output
+    truth, core.model_registry.rates_for (reconcile its input/output
     tuple into a blended scalar) rather than hand-fed.
     """
 

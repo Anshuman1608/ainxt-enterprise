@@ -212,18 +212,15 @@ def _is_local_model(model_name: str) -> bool:
 
 
 def estimate_model_cost(model_name: str, tokens_in: int, tokens_out: int) -> float:
-    """Estimate USD cost using the platform model registry pricing table."""
+    """Estimate USD cost from the platform's registry price (unpriced paid models over-bill)."""
     if _is_local_model(model_name):
         return 0.0
     try:
-        from core.model_registry import MODEL_COST_PER_1M
-        pricing = MODEL_COST_PER_1M.get(model_name)
-        if pricing:
-            in_cost, out_cost = pricing
-            return (tokens_in * in_cost + tokens_out * out_cost) / 1_000_000
+        from core.model_registry import rates_for
+        in_cost, out_cost = rates_for(model_name)
+        return (tokens_in * in_cost + tokens_out * out_cost) / 1_000_000
     except Exception:
-        pass
-    return 0.0
+        return 0.0
 
 
 def _estimate_cost(model_name: str, tokens_in: int, tokens_out: int) -> float:

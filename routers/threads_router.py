@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from core.config import REDIS_HOST as _REDIS_HOST, REDIS_PORT as _REDIS_PORT
 from core.logger import logger
 from auth.dependencies import get_current_user
-from core.model_registry import MODEL_COST_PER_1M as _MODEL_COST_PER_1M
+from core.model_registry import rates_for as _rates_for
 from core.security_validation import (
     validate_create_thread_request,
     validate_thread_message_request,
@@ -385,7 +385,7 @@ def _ainxt_flow(thread_id: str, message_content: str, repo: str, product_id: str
             _in_tok  = int(len(react_task.split()) * 1.3)
             _out_tok = int(len(fix_analysis.split()) * 1.3)
             _model = _actual_model_label
-            _rates = _MODEL_COST_PER_1M.get(_model, (3.00, 15.00))
+            _rates = _rates_for(_model)
             _cost  = round((_in_tok * _rates[0] + _out_tok * _rates[1]) / 1_000_000, 6)
         except Exception:
             _in_tok, _out_tok, _cost = 0, 0, 0.0

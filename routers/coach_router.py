@@ -83,8 +83,8 @@ def _out_cost(model: Optional[str]) -> Optional[float]:
     if _is_local_model(model):
         return 0.0
     try:
-        from core.model_registry import MODEL_COST_PER_1M
-        c = MODEL_COST_PER_1M.get(_model_key(model))
+        from core.model_registry import price_of
+        c = price_of(_model_key(model))
         return float(c[1]) if c else None
     except Exception:
         return None

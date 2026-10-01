@@ -55,14 +55,14 @@ def _log_cache_effectiveness(
 ) -> None:
     """Emit a structured [CACHE EFFECTIVENESS] log line for Gemini calls.
 
-    Derives the per-token cost from MODEL_COST_PER_1M (the single source of truth)
+    Derives the per-token cost from core.model_registry.rates_for (the single source of truth)
     so savings estimates stay accurate when model pricing changes in the registry.
     Gemini context caching (cached_content_token_count in usage_metadata) is
     explicit — callers must create a CachedContent object. Always emitted so
     zero-cache calls are visible and cache effectiveness can be tracked over time.
     """
-    from core.model_registry import MODEL_COST_PER_1M
-    input_rate_per_1m, _ = MODEL_COST_PER_1M.get(model, (0.0, 0.0))
+    from core.model_registry import rates_for
+    input_rate_per_1m, _ = rates_for(model)
     hit_rate = (cache_read / prompt_total * 100) if prompt_total > 0 else 0.0
     # Savings: cache_read tokens billed at 25% instead of 100% of input rate
     savings_usd = cache_read * input_rate_per_1m * (1.0 - _GEMINI_CACHE_READ_RATIO) / 1_000_000

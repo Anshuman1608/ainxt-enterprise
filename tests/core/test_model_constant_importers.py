@@ -86,7 +86,7 @@ SKU_DISPLAY = frozenset({
 #: model the caller then routes to.
 PERMITTED = frozenset({
     # cost / normalisation
-    "MODEL_COST_PER_1M", "MODEL_COST_PER_SECOND", "VEO_COST_PER_SECOND",
+    "VEO_COST_PER_SECOND", "UNPRICED_RATES",
     # capability metadata (§I.4) — a property of a model, not a choice of one
     "CLI_ADDRESSABLE_MODEL_PREFIXES",
     "LOCAL_VISION_MODELS",

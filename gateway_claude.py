@@ -65,8 +65,8 @@ _STREAM_REASONING_DELTAS = os.getenv("STREAM_REASONING_DELTAS", "true").lower() 
 #   cache_read    → billed at 10% of the model's normal input rate
 #   cache_created → billed at 125% of the model's normal input rate (write surcharge)
 # These ratios are stable Anthropic policy; the actual per-token dollar amount
-# is derived at call time from MODEL_COST_PER_1M so it stays in sync with the
-# registry without any code change when model pricing is updated.
+# is derived at call time from core.model_registry.rates_for, i.e. the model's
+# registry price, so no code change is needed when pricing is updated.
 _CACHE_READ_RATIO    = 0.10   # 10% of full input price
 _CACHE_WRITE_RATIO   = 1.25   # 125% of full input price
 
@@ -82,13 +82,13 @@ def _log_cache_effectiveness(
 ) -> None:
     """Emit a structured [CACHE EFFECTIVENESS] log line for Anthropic/Claude calls.
 
-    Derives the per-token cost from MODEL_COST_PER_1M (the single source of truth)
+    Derives the per-token cost from core.model_registry.rates_for (the single source of truth)
     so savings estimates stay accurate when model pricing changes in the registry.
     Local/in-house models have (0.0, 0.0) rates → savings_est_usd is always 0.
     Always emitted (even when all values are 0) so the absence of caching is explicit.
     """
-    from core.model_registry import MODEL_COST_PER_1M
-    input_rate_per_1m, _ = MODEL_COST_PER_1M.get(model, (0.0, 0.0))
+    from core.model_registry import rates_for
+    input_rate_per_1m, _ = rates_for(model)
     # `prompt_total` (Anthropic's `input_tokens`) excludes cache_read/cache_created —
     # they are disjoint token buckets, not overlapping subsets. The true total
     # prompt size processed by the model is the sum of all three, so the hit

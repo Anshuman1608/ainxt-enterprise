@@ -94,13 +94,8 @@ def _log_cache_effectiveness(
     When the proxy does not populate this field, cache_read will be 0 — the
     log is still emitted so the absence of KV-cache reuse is explicit.
 
-    Cost is derived from MODEL_COST_PER_1M (the single source of truth).
-    In-house models are registered with (0.0, 0.0) → savings_est_usd is always 0,
-    which correctly reflects that local inference has no cloud billing cost.
+    Local inference has no cloud billing cost, so savings_est_usd is always 0.
     """
-    from core.model_registry import MODEL_COST_PER_1M, LOCAL_LLM_MODEL_NAME
-    # Local models may be registered under their specific ID or the generic sentinel.
-    input_rate_per_1m, _ = MODEL_COST_PER_1M.get(model) or MODEL_COST_PER_1M.get(LOCAL_LLM_MODEL_NAME, (0.0, 0.0))
     hit_rate = (cache_read / prompt_total * 100) if prompt_total > 0 else 0.0
     # KV-cache read ratio for vLLM/LiteLLM is not standardised; savings are $0 for local.
     savings_usd = 0.0  # always 0 — local inference has no cloud billing cost

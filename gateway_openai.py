@@ -101,14 +101,14 @@ def _log_cache_effectiveness(
 ) -> None:
     """Emit a structured [CACHE EFFECTIVENESS] log line for OpenAI calls.
 
-    Derives the per-token cost from MODEL_COST_PER_1M (the single source of truth)
+    Derives the per-token cost from core.model_registry.rates_for (the single source of truth)
     so savings estimates stay accurate when model pricing changes in the registry.
     Local/in-house models (e.g. OPENAI_OSS_MODEL) have (0.0, 0.0) rates → savings = 0.
     OpenAI has no explicit cache_creation concept — caching is automatic and transparent.
     Always emitted so zero-cache calls are also visible in logs.
     """
-    from core.model_registry import MODEL_COST_PER_1M
-    input_rate_per_1m, _ = MODEL_COST_PER_1M.get(model, (0.0, 0.0))
+    from core.model_registry import rates_for
+    input_rate_per_1m, _ = rates_for(model)
     hit_rate = (cache_read / prompt_total * 100) if prompt_total > 0 else 0.0
     # Savings: cache_read tokens billed at 50% instead of 100% of input rate
     savings_usd = cache_read * input_rate_per_1m * (1.0 - _OAI_CACHE_READ_RATIO) / 1_000_000

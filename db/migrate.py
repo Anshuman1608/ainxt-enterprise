@@ -1349,6 +1349,9 @@ CREATE INDEX IF NOT EXISTS idx_sec_scan_scanned_at ON security_scan_results(scan
     # ── Part AC4: 2026-09-25 — backfill privacy_class/modality capabilities ────
     _part_ac4_capability_backfill_2026_09_25()
 
+    # ── Part AE1: 2026-10-01 — carry .env-era prices onto registry rows (Phase 8)
+    _part_ae1_price_backfill_2026_10_01()
+
     # ── Part AD1: 2026-09-25 — tier-assignment table constraint + seed ────────
     # Must follow AC4: the seed filters candidates on capabilities.modality,
     # which AC4 is what puts on pre-existing rows.
@@ -8030,12 +8033,9 @@ def _part_ac1_llm_provider_seed_2026_09_01():
             if family_key in low:
                 ctx = window
                 break
-        cost = _mr.MODEL_COST_PER_1M.get(model_id)
         cap = {}
         if ctx is not None:
             cap["context_window"] = ctx
-        if cost is not None:
-            cap["cost_per_1m_input"], cap["cost_per_1m_output"] = cost
 
         # ── Phase 2 of the LLM tier governance migration ─────────────────────
         # The Phase 3 resolver filters a tier's eligible models by capability
@@ -8043,15 +8043,7 @@ def _part_ac1_llm_provider_seed_2026_09_01():
         # accepts a `temperature` param). Those facts live today in constant
         # tables and prefix heuristics scattered across the codebase. Lift them
         # onto the model row here so the registry — not a code constant — is
-        # what the resolver reads.
-        #
-        # Flat keys (cost_per_1m_input/_output) rather than a nested object:
-        # that is the shape this function already wrote and that readers
-        # already expect. A nested cost object would need a data migration for
-        # no benefit.
-        per_second = _safe_getattr_dict(_mr, "MODEL_COST_PER_SECOND").get(model_id)
-        if per_second is not None:
-            cap["cost_per_second"] = per_second
+        # what the resolver reads. Prices are written by Part AE1 (Phase 8).
 
         # Anthropic's newer generations 400 outright on `temperature` rather
         # than clamping it. Only record the negative case: absent means "no
@@ -8272,6 +8264,51 @@ def _part_ac3_remove_bogus_local_llm_seed_2026_09_01():
         print(f"  (skipped) Part AC3: could not clean up bogus local-llm rows — {exc}")
     finally:
         db.close()
+
+
+def _part_ae1_price_backfill_2026_10_01(environ=None):
+    """
+    2026-10-01 — write each registry row's .env-era price onto the row.
+
+    Phase 8 deletes the code price table; every reader now prices through
+    core.model_registry.rates_for, which reads capabilities.cost_per_1m_*.
+    IDEMPOTENT and NEVER OVERWRITES: only rows with no price are touched.
+    """
+    from db.phase8_env_prices import env_prices
+    env = os.environ if environ is None else environ
+    prices = env_prices(env)
+    veo = (env.get("VEO_MODEL") or "").strip()
+    try:
+        veo_rate = float(env.get("VEO_COST_PER_SECOND") or "0.40")
+    except ValueError:
+        veo_rate = 0.40
+    if not prices and not veo:
+        print("  (skipped) Part AE1: no .env-era model ids set")
+        return
+
+    from db.database import SessionLocal
+    from db.models import LLMModel
+
+    session = SessionLocal()
+    try:
+        touched = 0
+        for model in session.query(LLMModel).all():
+            caps = dict(model.capabilities or {})
+            before = dict(caps)
+            if model.model_id in prices and "cost_per_1m_input" not in caps and "cost_per_1m_output" not in caps:
+                caps["cost_per_1m_input"], caps["cost_per_1m_output"] = prices[model.model_id]
+            if veo and model.model_id == veo and "cost_per_second" not in caps:
+                caps["cost_per_second"] = veo_rate
+            if caps != before:
+                model.capabilities = caps
+                touched += 1
+        session.commit()
+        print(f"  ✅ Part AE1: recorded .env-era prices on {touched} registry row(s)")
+    except Exception as exc:
+        session.rollback()
+        print(f"  ⚠️  Part AE1 failed (non-fatal): {exc}")
+    finally:
+        session.close()
 
 
 def _part_ac4_capability_backfill_2026_09_25():

@@ -170,7 +170,6 @@ from core.model_registry import (
     GEMINI_TEXT_MODEL as _GEMINI_TEXT,
     GEMINI_CODING_LITE_MODEL as _GEMINI_CODING_LITE,
     GEMINI_IMAGE_MODEL as _GEMINI_IMAGE,
-    MODEL_COST_PER_1M as _MODEL_COST_PER_1M,
     CLAUDE_PRIMARY_DISPLAY as _CLAUDE_PRIMARY_DISPLAY,
     CLAUDE_HAIKU_DISPLAY as _CLAUDE_HAIKU_DISPLAY,
     CLAUDE_OPUS_DISPLAY as _CLAUDE_OPUS_DISPLAY,
@@ -364,56 +363,9 @@ def _resolve_model_id(model: str) -> str:
 
 
 def _estimate_cost(model: str, input_tok: int, output_tok: int) -> float:
-    """Return the estimated USD cost for a single LLM call.
-
-    Local/in-house models are always free ($0.00).  Three checks are applied
-    so that bare model names (e.g. "Kimi-k2.5", "kimi-k2.7-code", "glm-5.2",
-    or an admin-registered Ollama model like "llama3.2") that don't carry a
-    "local:" prefix are still recognised as in-house:
-
-      1. Fast string heuristic — "local" anywhere in the model string.
-      2. Dynamic catalog lookup via gateway_local_llm.is_local_model(), which
-         consults the live /v1/models catalog cached by the local-LLM gateway.
-         This is the authoritative check for bare model IDs served in-house.
-      3. core.llm_provider_registry lookup — catches admin-registered Ollama
-         models dispatched directly against their own base_url (not through
-         the in-house LLM proxy check #2 above), or any registry model
-         explicitly tagged capabilities.billing_tier="free".
-    """
-    _m = (model or "").lower()
-    # 1. Fast heuristic: "local" in the model string covers "local:Kimi-k2.5",
-    #    "local-llm", display labels like "Local (Kimi-k2.5)", etc.
-    if "local" in _m:
-        return 0.0
-    # 2. Dynamic catalog check: catches bare model IDs (e.g. "Kimi-k2.5",
-    #    "kimi-k2.7-code", "glm-5.2") that are served by the in-house LLM
-    #    proxy but whose names don't contain the word "local".
-    try:
-        from gateway_local_llm import is_local_model as _is_local_model
-        if _is_local_model(model):
-            return 0.0
-    except Exception:
-        pass  # fail-open: fall through to cost table lookup
-    # 3. Registry check: an admin-registered Ollama model, or any model
-    #    explicitly marked free, called by its bare model_id.
-    try:
-        from core.llm_provider_registry import get_model as _get_registry_model
-        _reg = _get_registry_model(model)
-        if _reg and (_reg["family"] == "ollama" or _reg["capabilities"].get("billing_tier") == "free"):
-            return 0.0
-    except Exception:
-        pass  # fail-open: fall through to cost table lookup
-    # MODEL_COST_PER_1M is keyed by raw model IDs (e.g. "gpt-5.4", "claude-sonnet-4-6").
-    # `model` may be a display label like "GPT-5.4 (Coding) (gpt-5.4)" when it comes
-    # from last_model_label — try direct lookup first, then scan for a matching ID substring.
-    rates = _MODEL_COST_PER_1M.get(model)
-    if rates is None:
-        for _mid, _r in _MODEL_COST_PER_1M.items():
-            if _mid.lower() in _m:
-                rates = _r
-                break
-    if rates is None:
-        rates = (2.00, 8.00)  # conservative default (gpt-5.4 rate)
+    """Estimated USD for one call, priced by core.model_registry.rates_for (local is free)."""
+    from core.model_registry import rates_for as _rates_for
+    rates = _rates_for(model)
     return (input_tok * rates[0] + output_tok * rates[1]) / 1_000_000
 
 
@@ -13607,8 +13559,8 @@ def openai_responses(
         # Budget increment
         try:
             from store.budget_store import increment_usage as _inc_r
-            from core.model_registry import MODEL_COST_PER_1M as _costs
-            _rate = _costs.get(req.model, (2.0, 8.0))
+            from core.model_registry import rates_for as _rates_for
+            _rate = _rates_for(req.model)
             _cost = (_meta_r["in_tok"] * _rate[0] + _meta_r["out_tok"] * _rate[1]) / 1_000_000
             _inc_r(_user_id, tokens=_meta_r["in_tok"] + _meta_r["out_tok"], cost_usd=_cost)
         except Exception:
@@ -15562,7 +15514,7 @@ async def ask_with_image(
         FALLBACK_VISION_PROVIDER,
         LOCAL_VISION_MODELS,
         GEMINI_VISION_MODEL as _GEMINI_MODEL,
-        MODEL_COST_PER_1M,
+        rates_for as _rates_for,
     )
 
     # Resolve the actual model name — mirrors the text /ask path convention:
@@ -15684,7 +15636,7 @@ async def ask_with_image(
     _latency = round(time.time() - _start, 3)
 
     # Cost estimation
-    _cost_in, _cost_out = MODEL_COST_PER_1M.get(_GEMINI_MODEL, (0.075, 0.30))
+    _cost_in, _cost_out = _rates_for(_GEMINI_MODEL)
     _img_cost = round((_in_tok * _cost_in + _out_tok * _cost_out) / 1_000_000, 6)
 
     # ── Persist ALL uploaded images SERVER-SIDE so previews survive

@@ -348,8 +348,8 @@ def _r_premium_for_trivial(event, ctx):
     if not model:
         return None
     try:
-        from core.model_registry import MODEL_COST_PER_1M
-        cost = MODEL_COST_PER_1M.get(model)
+        from core.model_registry import price_of
+        cost = price_of(model)
     except Exception:
         cost = None
     # "premium" = output price >= $10 / 1M tokens.

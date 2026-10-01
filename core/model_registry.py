@@ -198,55 +198,77 @@ CHAT_FALLBACK_CHAIN: list[str] = [
 # Internal: set to your preferred chain, e.g. local:kimi-k2.7-code,local:glm-5.2,haiku
 
 
-# ---------------- SHARED COST TABLE (one source of truth) ----------------
+# ---------------- COST (one authority, read from the registry) ----------------
 #
-# Cost per 1 million tokens (input_usd, output_usd).
-# Keys use the constant values so env-var overrides propagate automatically.
-# In-house local models are always free — callers check for "local" in model name.
+# Per-model prices are admin data on the registry row (capabilities
+# cost_per_1m_input / cost_per_1m_output), set on Admin > LLM Providers. No
+# vendor publishes prices through an API, so nothing here can know them.
 
-MODEL_COST_PER_1M: dict[str, tuple[float, float]] = {
-    OPENAI_SIMPLE_MODEL:        (0.15,    0.60),
-    OPENAI_CODING_MODEL:        (2.50,    15.00),
-    OPENAI_LATEST_MODEL:        (5.00,   30.00),
-    OPENAI_TERA_MODEL:          (2.00,   12.00),  # placeholder — update when official pricing confirmed
-    OPENAI_LUNA_MODEL:          (0.20,   1.20),  # placeholder — update when official pricing confirmed
-    OPENAI_OSS_MODEL:           (0.0,     0.0),   # in-house hosted — no cloud cost
-    OPENAI_DEEP_RESEARCH_MINI:  (2.00,   10.00),
-    OPENAI_DEEP_RESEARCH:       (15.00,  60.00),
-    CLAUDE_PRIMARY_MODEL:       (3.00,   15.00),
-    CLAUDE_HAIKU:               (0.80,    4.00),
-    CLAUDE_OPUS_MODEL:          (15.00,  75.00),
-    CLAUDE_OPUS_48_MODEL:       (15.00,  75.00),  # placeholder — update when official pricing announced
-    CLAUDE_OPUS_5_MODEL:        (15.00,  75.00),  # placeholder — update when official pricing announced
-    CLAUDE_SONNET_5_MODEL:      (3.00,   15.00),  # placeholder — mirrors Sonnet 4.6 until official pricing
-    GEMINI_TEXT_MODEL:          (0.30,    1.20),  # placeholder — confirm official pricing
-    GEMINI_CODING_LITE_MODEL:   (0.10,    0.40),  # placeholder — confirm official pricing
-    GEMINI_IMAGE_MODEL:         (0.30,   30.00),  # image OUTPUT tokens billed ~$30/1M (~$0.039/image); input keeps text rate
-    LOCAL_LLM_MODEL_NAME:       (0.0,     0.0),
-}
+# Charged for a paid model with no recorded price: over-bill, never bill nothing.
+UNPRICED_RATES: tuple[float, float] = (2.00, 8.00)
+_FREE_RATES: tuple[float, float] = (0.0, 0.0)
 
 
-# ---------------- PER-SECOND COST TABLE (video models) ----------------
-#
-# Video-generation models (Veo) are billed per output second, not per token.
-# Kept as a separate map so per-token math elsewhere is unaffected.
-#
-# Guarded on VEO_MODEL being set, because Phase 6 made its docker-compose
-# default bare so the `video-generation` tier could win — and an unguarded
-# `{VEO_MODEL: ...}` then produced `{"": 0.40}`, a rate for a model that does
-# not exist. db/migrate.py's capability backfill does `.get(model_id)` against
-# this map, so it matched nothing and `capabilities.cost_per_second` was
-# written for no model at all: both Veo variants billed identically at the flat
-# rate, which is Phase 6.5 item 3.
-#
-# Deliberately NOT extended with per-SKU literals (D19). A vendor's per-second
-# price is not a fact this repo knows, and a guessed number in an authoritative
-# budget gate — routers/chat_router.py does not fail open on video — is worse
-# than an honest flat rate. Declare it per model in Admin > LLM Providers; it
-# lands on capabilities.cost_per_second, which chat_router reads first.
-MODEL_COST_PER_SECOND: dict[str, float] = (
-    {VEO_MODEL: VEO_COST_PER_SECOND} if VEO_MODEL else {}
-)
+def _registry_row_for(model: str):
+    """The enabled registry row for an id, or for the longest id inside a display label."""
+    try:
+        from core.llm_provider_registry import get_enabled_models, get_model
+    except Exception:
+        return None
+    row = get_model(model)
+    if row is not None:
+        return row
+    low = model.lower()
+    hits = [m for m in get_enabled_models() if m["model_id"] and m["model_id"].lower() in low]
+    return max(hits, key=lambda m: len(m["model_id"])) if hits else None
+
+
+def price_of(model: str):
+    """Recorded (input, output) per 1M, (0, 0) if local or free, None if a paid model has no price."""
+    m = (model or "").strip()
+    if not m:
+        return None
+    try:
+        row = _registry_row_for(m)
+    except Exception as exc:
+        logger.warning(f"[model_registry] price lookup failed for {m!r}: {exc}")
+        row = None
+    if row is not None:
+        caps = row.get("capabilities") or {}
+        cin, cout = caps.get("cost_per_1m_input"), caps.get("cost_per_1m_output")
+        if isinstance(cin, (int, float)) and isinstance(cout, (int, float)):
+            return (float(cin), float(cout))
+        if row.get("family") == "ollama" or caps.get("billing_tier") == "free":
+            return _FREE_RATES
+        return None
+    low = m.lower()
+    if low.startswith("local:") or "local" in low:
+        return _FREE_RATES
+    try:
+        from gateway_local_llm import is_local_model
+        if is_local_model(m):
+            return _FREE_RATES
+    except Exception:
+        pass
+    return None
+
+
+def rates_for(model: str) -> tuple[float, float]:
+    """(input_usd, output_usd) per 1M tokens; UNPRICED_RATES when no price is recorded."""
+    return price_of(model) or UNPRICED_RATES
+
+
+def rate_per_second_for(model: str):
+    """Recorded per-second price for a video model, or None."""
+    try:
+        row = _registry_row_for((model or "").strip())
+    except Exception:
+        return None
+    val = ((row or {}).get("capabilities") or {}).get("cost_per_second")
+    return float(val) if isinstance(val, (int, float)) else None
+
+
+
 
 
 # ---------------- VEO ACCESS GATE (ad_level 0 or admin) ----------------
@@ -861,10 +883,7 @@ def tier_cost_per_1m(hint: str) -> tuple[float, float]:
 
     Single source of truth for SDLC cost accounting (RFD R3) — resolves the
     hint to its concrete model id (env override → registry lookup, via
-    ``_role_model()``) and reads the canonical MODEL_COST_PER_1M, falling
-    through to the registry's own billing_tier metadata and finally a
-    conservative non-zero default when the resolved id isn't in either
-    table. Reads ENABLE_OPUS at call time for the solution tier.
+    ``_role_model()``) and prices it with ``rates_for()``. Reads ENABLE_OPUS at call time for the solution tier.
     Local/simple → (0, 0). Unknown hints fall back to the Sonnet (complex)
     rate/model, never $0, so an unrecognised tier over-bills rather than
     silently under-bills.
@@ -895,22 +914,7 @@ def tier_cost_per_1m(hint: str) -> tuple[float, float]:
     else:
         model_id = _role_model(_tier_env_override("complex") or CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
 
-    rates = MODEL_COST_PER_1M.get(model_id)
-    if rates is not None:
-        return rates
-
-    try:
-        from core.llm_provider_registry import get_model as _get_registry_model
-        reg = _get_registry_model(model_id)
-        if reg and (reg["family"] == "ollama" or reg["capabilities"].get("billing_tier") == "free"):
-            return (0.0, 0.0)
-    except Exception as exc:
-        logger.warning(f"[model_registry] tier_cost_per_1m registry lookup failed for {model_id!r}: {exc}")
-
-    # Conservative non-zero default (matches gateway.py::_estimate_cost()'s
-    # fallback for unknown models) — never $0, so an id this table and the
-    # registry both know nothing about over-bills rather than under-bills.
-    return (2.00, 8.00)
+    return rates_for(model_id)
 
 
 # ============================================================

@@ -171,7 +171,7 @@ def test_premium_for_trivial_silent_without_model():
 def test_premium_for_trivial_monkeypatched(monkeypatch):
     """Force a premium model + a 'simple/high-confidence' classification."""
     import core.model_registry as mr
-    monkeypatch.setattr(mr, "MODEL_COST_PER_1M", {"premium-x": (5.0, 25.0)}, raising=False)
+    monkeypatch.setattr(mr, "price_of", lambda m: (5.0, 25.0) if m == "premium-x" else None, raising=True)
     import models.classifier as clf
     monkeypatch.setattr(clf, "classify_with_confidence", lambda *_a, **_k: ("simple", 0.95), raising=False)
 

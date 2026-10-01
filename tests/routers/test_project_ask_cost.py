@@ -23,17 +23,17 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 def cost(monkeypatch):
     """The real helper, with the registry and the local catalogue pinned."""
     import core.llm_provider_registry as reg
-    import core.model_registry as mreg
     import gateway_local_llm as glm
 
     rows = {
         "qwen2.5:7b": {"family": "ollama", "capabilities": {}},
         "meta-llama-4-maverick": {"family": "openai_compatible", "capabilities": {}},
-        "priced-model": {"family": "openai", "capabilities": {}},
+        "priced-model": {"family": "openai", "model_id": "priced-model",
+                         "capabilities": {"cost_per_1m_input": 3.0, "cost_per_1m_output": 15.0}},
     }
     monkeypatch.setattr(reg, "get_model", lambda mid: rows.get(mid), raising=True)
+    monkeypatch.setattr(reg, "get_enabled_models", lambda channel=None: [], raising=True)
     monkeypatch.setattr(glm, "is_local_model", lambda mid: False, raising=True)
-    monkeypatch.setattr(mreg, "MODEL_COST_PER_1M", {"priced-model": (3.0, 15.0)}, raising=True)
 
     from routers.projects_router import _project_ask_cost
     return _project_ask_cost

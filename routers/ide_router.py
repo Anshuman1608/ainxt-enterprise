@@ -542,7 +542,7 @@ async def ide_chat(body: IDEChat, request: Request, _u: dict = Depends(_require_
     # cost_usd_spent stayed 0.0 and the $30 cap never fired.
     try:
         from store.budget_store import increment_usage as _inc_usage
-        from core.model_registry import MODEL_COST_PER_1M
+        from core.model_registry import rates_for
         from models.model_router import model_router as _mr
         _uid     = _u.get("sub") or _u.get("email") or ""
         _in_tok  = getattr(_mr, "last_input_tokens",  0) or max(1, len(question) // 4)
@@ -551,19 +551,9 @@ async def ide_chat(body: IDEChat, request: Request, _u: dict = Depends(_require_
         # The label is a display string like "GPT-5.4 (Coding) (gpt-5.4)"; local
         # models produce "Local (In-house) (...)" and must never be charged.
         _model_lbl = (getattr(_mr, "last_model_label", "") or "").lower()
-        if "local" in _model_lbl:
-            _cost = 0.0
-        else:
-            # Direct lookup by label, then scan for a known model-ID substring.
-            # MODEL_COST_PER_1M keys are raw IDs (e.g. "gpt-5.4", "claude-sonnet-4-6").
-            _rates = MODEL_COST_PER_1M.get(_model_lbl)
-            if _rates is None:
-                for _mid, _r in MODEL_COST_PER_1M.items():
-                    if _mid.lower() in _model_lbl:
-                        _rates = _r
-                        break
-            _rates = _rates or (2.00, 8.00)  # conservative default (gpt-5.4 rate)
-            _cost  = round((_in_tok * _rates[0] + _out_tok * _rates[1]) / 1_000_000, 6)
+        # rates_for resolves a display label to the id inside it; local is free.
+        _rates = rates_for(_model_lbl)
+        _cost  = round((_in_tok * _rates[0] + _out_tok * _rates[1]) / 1_000_000, 6)
         if _uid:
             _inc_usage(_uid, tokens=_in_tok + _out_tok, requests=0, cost_usd=_cost)
         logger.info(

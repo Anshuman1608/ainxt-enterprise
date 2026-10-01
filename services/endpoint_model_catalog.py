@@ -33,10 +33,7 @@ from typing import Dict, List, Optional
 
 from core.logger import logger
 
-# Conservative fallback rate for a model we cannot price: the gpt-5.4 rate, matching
-# gateway._estimate_cost:315. Deliberately NOT (0,0) — an unpriced cloud model must
-# over-bill rather than silently bill nothing (which is what
-# messages_compat_router._compute_cost_usd and ABStudio's estimate_model_cost do).
+# Used only if the cost authority cannot be imported; the same over-bill-not-zero rule.
 _UNKNOWN_RATES = (2.00, 8.00)
 
 # "local" appearing anywhere in the model name is the platform's de-facto $0 marker
@@ -211,32 +208,12 @@ def first_local_model(model_ids: Optional[List[str]]) -> Optional[str]:
 # ── Cost ─────────────────────────────────────────────────────────────────────
 
 def _rates_for(model: str):
-    """
-    (input_usd, output_usd) per 1M tokens.
-
-    Same resolution order as gateway._estimate_cost (the platform-standard
-    implementation, and the only one that never returns $0 for an unknown cloud
-    model): exact key, then substring scan so display labels like
-    "GPT-5.4 (Coding) (gpt-5.4) [fallback]" still price correctly, then a
-    conservative default.
-
-    Replicated here rather than imported so the request path does not pull in the
-    12k-line gateway.py module.
-    """
+    """(input_usd, output_usd) per 1M tokens, from the platform cost authority."""
     try:
-        from core.model_registry import MODEL_COST_PER_1M
+        from core.model_registry import rates_for
     except Exception:
         return _UNKNOWN_RATES
-
-    rates = MODEL_COST_PER_1M.get(model)
-    if rates is not None:
-        return rates
-
-    m = (model or "").lower()
-    for mid, r in MODEL_COST_PER_1M.items():
-        if mid and mid.lower() in m:
-            return r
-    return _UNKNOWN_RATES
+    return rates_for(model)
 
 
 def cheapest_cloud_model(model_ids: Optional[List[str]]) -> Optional[str]:
@@ -269,9 +246,9 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> Deci
     """
     USD cost of a call, as Decimal (callers persist NUMERIC(12,6)).
 
-    In-house models are always free. Everything else is priced from
-    MODEL_COST_PER_1M, defaulting to a conservative rate when unknown so an
-    unpriced cloud model over-bills rather than escaping billing entirely.
+    In-house models are always free. Everything else is priced by
+    core.model_registry.rates_for, which over-bills an unpriced cloud model
+    rather than letting it escape billing.
     """
     if not model:
         return Decimal("0")

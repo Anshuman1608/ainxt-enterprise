@@ -2356,8 +2356,8 @@ def _compute_cost_usd(
         logger.info(f"[CLI] In house model used - model = {model} in_house={inhouse}")
         return 0.0, True
     try:
-        from core.model_registry import MODEL_COST_PER_1M
-        rates = MODEL_COST_PER_1M.get(model, (0.0, 0.0))
+        from core.model_registry import rates_for
+        rates = rates_for(model)
         input_rate = rates[0]
         cost = (in_tok / 1_000_000) * input_rate + (out_tok / 1_000_000) * rates[1]
         if TRACK_CACHE_TOKENS:
@@ -2545,8 +2545,8 @@ def _track_budget(
     if user_id == _PLATFORM_SERVICE_USER_ID:
         return
     # Cost is derived from the *canonical* model id (model_hint) — the same
-    # id used by /ask and /v1/chat/completions — so MODEL_COST_PER_1M lookups
-    # hit the right key regardless of which CLI alias the user typed
+    # id used by /ask and /v1/chat/completions — so the registry price lookup
+    # hits the right row regardless of which CLI alias the user typed
     # (e.g. "sonnet" → "claude-sonnet-4-6").
     canonical_model = model_hint or model
     # `precomputed_cost_usd` lets the caller pass the exact figure it already

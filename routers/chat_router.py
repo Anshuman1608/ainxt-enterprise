@@ -625,21 +625,19 @@ def toggle_pin_chat(chat_id: str, current_user: dict = Depends(get_current_user)
 # so the model can respond with text (typically a refusal). The mapping in
 # ai-ui/src/utils/imageGenerate.js mirrors this.
 #
-# SINGLE SOURCE OF TRUTH: image-token pricing is read from
-# core.model_registry.MODEL_COST_PER_1M[GEMINI_IMAGE_MODEL] — the same table
-# the chat/messages path uses. This avoids the drift bug we hit earlier, where
+# SINGLE SOURCE OF TRUTH: image-token pricing is read through
+# core.model_registry.rates_for — the same authority the chat/messages path uses. This avoids the drift bug we hit earlier, where
 # a duplicated hardcoded rate here stayed stale (text rates) after the registry
 # was corrected, so every image cost rounded to <$0.01.
 #
 # We use the real token counts captured by gateway_gemini.generate_imagen()
 # (via Gemini's usage_metadata) so the cost chip matches actual billing.
 def _gemini_image_rates_per_1k() -> tuple[float, float]:
-    """(input_per_1k, output_per_1k) for the Gemini image model, sourced from
-    the central registry (stored per-1M, so divide by 1000). Falls back to the
-    known image rate if the registry lookup ever fails."""
+    """(input_per_1k, output_per_1k) for the Gemini image model, from its
+    registry price (stored per-1M, so divide by 1000)."""
     try:
-        from core.model_registry import MODEL_COST_PER_1M, GEMINI_IMAGE_MODEL
-        in_1m, out_1m = MODEL_COST_PER_1M.get(GEMINI_IMAGE_MODEL, (0.30, 30.00))
+        from core.model_registry import rates_for, GEMINI_IMAGE_MODEL
+        in_1m, out_1m = rates_for(GEMINI_IMAGE_MODEL)
         return (in_1m / 1000.0, out_1m / 1000.0)
     except Exception:
         # $0.30/1M input, $30/1M output — image OUTPUT tokens are billed far

@@ -29,17 +29,14 @@ from typing import Any, Dict, List, Optional
 from core.logger import logger
 from core.config import REDIS_HOST as _REDIS_HOST, REDIS_PORT as _REDIS_PORT
 from agents.compliance_engine import compliance_engine
-from core.model_registry import MODEL_COST_PER_1M as _MODEL_COST_PER_1M
+from core.model_registry import rates_for as _rates_for
 
 
 # ── Cost estimator (mirrors gateway.py _estimate_cost) ───────────────────────
 
 def _estimate_usage_cost(model: str, in_tok: int, out_tok: int) -> float:
-    """Cost in USD using MODEL_COST_PER_1M (per-1M rates)."""
-    _m = (model or "").lower()
-    if "local" in _m or "ollama" in _m or "llama" in _m:
-        return 0.0
-    in_rate, out_rate = _MODEL_COST_PER_1M.get(model, (2.00, 8.00))
+    """Cost in USD from core.model_registry.rates_for (local is free)."""
+    in_rate, out_rate = _rates_for(model)
     return round((in_tok * in_rate + out_tok * out_rate) / 1_000_000, 8)
 
 

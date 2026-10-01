@@ -505,6 +505,15 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
       pass "llm models have output limit" "all have max_output_tokens"
     fi
 
+    # Prices are admin data on the row (Phase 8); an unpriced paid model bills at the fallback rate.
+    unpriced="$(run_sql "SELECT string_agg(m.model_id, ', ' ORDER BY m.model_id) FROM ainxt.llm_models m JOIN ainxt.llm_providers p ON p.id = m.provider_id WHERE m.enabled = TRUE AND p.family <> 'ollama' AND coalesce(m.capabilities->>'billing_tier', 'paid') <> 'free' AND (m.capabilities->>'cost_per_1m_input' IS NULL OR m.capabilities->>'cost_per_1m_output' IS NULL)" | tr -d '\r' | sed 's/^ *//;s/ *$//')"
+    if [[ -n "$unpriced" ]]; then
+      warno "llm models priced" "no price: $unpriced" \
+            "set cost_per_1m_input/_output on each in Admin > LLM Providers; until then they bill at the conservative fallback rate"
+    else
+      pass "llm models priced" "every paid model has a price"
+    fi
+
     # Phase 8 removes these env vars; the gateway knows which ones it was started with.
     legacy_raw="$(docker exec ainxt-gateway python -c 'from core.legacy_env import legacy_vars_set as l; print("OK " + ", ".join(l()))' 2>/dev/null | grep '^OK' | tail -1)"
     if [[ -z "$legacy_raw" ]]; then
