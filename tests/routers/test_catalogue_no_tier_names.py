@@ -13,14 +13,14 @@ Auto; exposing "complex" in a catalogue invites clients to route on it, which
 re-creates the coupling this whole migration removes — and it leaks the
 operator's tier layout to anyone with a token.
 
-The leak vector is one line away in four places. ``capabilities`` is seeded
+The leak vector is one line away in three places. ``capabilities`` is seeded
 with tier names by ``db/migrate.py``'s ``_AC1_MODEL_ROLE_TAGS``::
 
     "CLAUDE_PRIMARY_MODEL": ("anthropic", ["complex", "claude", "sonnet"], ...)
     "OPENAI_SIMPLE_MODEL":  ("openai",    ["simple", "mini"],              ...)
     "OPENAI_CODING_MODEL":  ("openai",    ["medium", "coding"],            ...)
 
-and all four builders below already hold ``caps`` in hand to read
+and all three builders below already hold ``caps`` in hand to read
 ``billing_tier``, ``modality`` and ``context_window`` off it. A single
 ``entry["capabilities"] = caps`` publishes the tier layout of every model.
 (Measured on the reference deployment: ``tier_tags`` is ``None`` on all 12
@@ -45,8 +45,14 @@ Exact-match is safe for all eight: none of them is ever a whole field value
 in a correct payload. A tier name buried inside an operator-authored display
 label is out of scope — that is text someone typed, not a code defect.
 
-HOW THE FOUR BUILDERS ARE REACHED
----------------------------------
+There were four. ``gateway.py::list_oai_models`` was the fourth, and it was
+deleted (D79): ``messages_compat_router`` claims both of its paths earlier and
+wins, so it served no request. ``GET /v1/models + /models`` below is that
+route's real handler, and it is registry-backed — which is why the §H skip this
+file used to carry for the OpenAI catalogue is gone.
+
+HOW THE THREE BUILDERS ARE REACHED
+----------------------------------
 ``routers.ide_router`` and ``routers.messages_compat_router`` import on a bare
 CI runner, so they are called directly. ``gateway.py`` is loaded from source
 by AST, the technique ``tests/test_browser_agent_prompt.py:22`` uses and for
@@ -206,52 +212,8 @@ def _all_models():
     return fn(_Req())
 
 
-def _oai_models(monkeypatch):
-    """26 free names, all of them .env model constants and two helpers.
 
-    The injection list below doubles as a written record of exactly what
-    GET /v1/models is built from today — every name in it is one Phase 8
-    deletes. That is also why this endpoint is still on plan.html's deferred
-    list (D58): it never consults the registry at all.
-    """
-    import logging
-
-    consts = {
-        "_APP_OWNER": "ainxt",
-        "_OPENAI_LATEST": "vendor-o-latest",
-        "_OPENAI_CODING": "vendor-o-coding",
-        "_OPENAI_SIMPLE": "vendor-o-simple",
-        "_OPENAI_TERA": "vendor-o-tera",
-        "_OPENAI_LUNA": "vendor-o-luna",
-        "_CLAUDE_PRIMARY": "vendor-c-primary",
-        "_CLAUDE_HAIKU": "vendor-c-haiku",
-        "_CLAUDE_OPUS": "vendor-c-opus",
-        "_CLAUDE_OPUS_48": "vendor-c-opus-48",
-        "_CLAUDE_OPUS_5": "vendor-c-opus-5",
-        "_CLAUDE_SONNET_5": "vendor-c-sonnet-5",
-        "_GEMINI_TEXT": "vendor-g-text",
-        "_GEMINI_CODING_LITE": "vendor-g-lite",
-        "_GEMINI_IMAGE": "vendor-g-image",
-    }
-    flags = {k: True for k in (
-        "_ENABLE_OPUS", "_ENABLE_CLI_OPUS_48", "_ENABLE_CLI_OPUS_5",
-        "_ENABLE_SONNET_5", "_ENABLE_GPT56_TERA", "_ENABLE_GPT56_LUNA",
-    )}
-
-    class _LocalGw:
-        def list_models(self):
-            return ["llama-test:1b"]
-
-    fn = _gateway_builder("list_oai_models", {
-        **consts, **flags,
-        "_get_local_gw": lambda: _LocalGw(),
-        "_max_out_for_oai": lambda _m: None,
-        "logger": logging.getLogger("test"),
-    })
-    return fn()
-
-
-# ── the four catalogues ─────────────────────────────────────────────────────
+# ── the three catalogues ─────────────────────────────────────────────────────
 
 
 def _ide_models(monkeypatch):
@@ -288,9 +250,8 @@ def _compat_models(monkeypatch):
 
 CATALOGUES = {
     "GET /all-models":            lambda mp: _all_models(),
-    "GET /v1/models (OpenAI)":    _oai_models,
     "GET /ide/models":            _ide_models,
-    "GET /v1/models (CLI compat)": _compat_models,
+    "GET /v1/models + /models":   _compat_models,
 }
 
 
@@ -315,12 +276,10 @@ def test_the_catalogue_is_not_empty(name, monkeypatch):
 @pytest.mark.parametrize("name", list(CATALOGUES))
 def test_a_model_with_no_tier_assignment_is_still_offered(name, monkeypatch):
     """§H: tier assignment is the administrator's routing concern. A model
-    with none is still a model the user may pick, and three of the four
+    with none is still a model the user may pick, and two of the three
     catalogues would have no way to say otherwise — but the one that filters
     on capabilities could acquire one by accident."""
     payload = CATALOGUES[name](monkeypatch)
-    if name == "GET /v1/models (OpenAI)":
-        pytest.skip("built from .env constants, never consults the registry (D58)")
     blob = json.dumps(payload)
     assert _UNASSIGNED["model_id"] in blob, (
         f"{name} dropped {_UNASSIGNED['model_id']}, whose capabilities are "
@@ -328,7 +287,7 @@ def test_a_model_with_no_tier_assignment_is_still_offered(name, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("name", ["GET /ide/models", "GET /v1/models (CLI compat)"])
+@pytest.mark.parametrize("name", ["GET /ide/models", "GET /v1/models + /models"])
 def test_the_local_id_prefix_survives(name, monkeypatch):
     """§P requires the `local:` prefix be preserved unchanged. It is also the
     reason this file matches tier names EXACTLY rather than by substring —
@@ -336,6 +295,45 @@ def test_the_local_id_prefix_survives(name, monkeypatch):
     convention the plan protects as the defect."""
     blob = json.dumps(CATALOGUES[name](monkeypatch))
     assert "local:" in blob, f"{name} no longer emits the local: id prefix"
+
+
+@pytest.mark.parametrize("client_source,expected", [
+    ("ide-vscode", "ide-vscode"),
+    ("api", "api"),
+    ("cli", "cli"),
+    (None, "cli"),          # middleware did not set it — keep today's answer
+    ("", "cli"),
+])
+def test_the_catalogue_filters_on_the_callers_channel(monkeypatch, client_source,
+                                                      expected):
+    """D82. This handler serves /v1/models for IDE and SDK callers too, so a
+    literal channel="cli" evaluates an admin's capabilities.channels entry
+    against the wrong channel for every non-CLI client. R18 shipped the `api`
+    classification in Phase 2 precisely so it would apply to them."""
+    import routers.messages_compat_router as compat
+
+    seen = {}
+
+    def _fake_cli_style(channel=None):
+        seen["channel"] = channel
+        return []
+
+    monkeypatch.setattr("core.llm_provider_registry.get_cli_style_models",
+                        _fake_cli_style)
+    monkeypatch.setattr(compat, "_resolve_user",
+                        lambda _r: {"user_id": "t", "email": "t@example.com"})
+
+    class _R:
+        headers: dict = {}
+
+        class state:        # noqa: D106
+            pass
+
+    if client_source is not None:
+        _R.state.client_source = client_source
+
+    anyio.run(compat.list_models_compat, _R())
+    assert seen["channel"] == expected
 
 
 def test_the_tier_vocabulary_under_test_is_the_real_one():

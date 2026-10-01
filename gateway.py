@@ -165,11 +165,6 @@ from core.model_registry import (
     CLAUDE_OPUS_48_MODEL as _CLAUDE_OPUS_48,
     CLAUDE_OPUS_5_MODEL as _CLAUDE_OPUS_5,
     CLAUDE_SONNET_5_MODEL as _CLAUDE_SONNET_5,
-    ENABLE_OPUS as _ENABLE_OPUS,
-    ENABLE_SONNET_5 as _ENABLE_SONNET_5,
-    ENABLE_CHAT_OPUS as _ENABLE_CHAT_OPUS,
-    ENABLE_CLI_OPUS_48 as _ENABLE_CLI_OPUS_48,
-    ENABLE_CLI_OPUS_5 as _ENABLE_CLI_OPUS_5,
     ENABLE_RAW_OPENAI_API as _ENABLE_RAW_OPENAI_API,
     GEMINI_VISION_MODEL as _GEMINI_VISION,
     GEMINI_TEXT_MODEL as _GEMINI_TEXT,
@@ -189,8 +184,6 @@ from core.model_registry import (
     OPENAI_LUNA_MODEL as _OPENAI_LUNA,
     OPENAI_TERA_DISPLAY as _OPENAI_TERA_DISPLAY,
     OPENAI_LUNA_DISPLAY as _OPENAI_LUNA_DISPLAY,
-    ENABLE_GPT56_TERA as _ENABLE_GPT56_TERA,
-    ENABLE_GPT56_LUNA as _ENABLE_GPT56_LUNA,
     GEMINI_DISPLAY as _GEMINI_DISPLAY,
     GEMINI_TEXT_DISPLAY as _GEMINI_TEXT_DISPLAY,
     GEMINI_CODING_LITE_DISPLAY as _GEMINI_CODING_LITE_DISPLAY,
@@ -10906,6 +10899,35 @@ def _oai_model_hint(model_name: str) -> Optional[str]:
     return None  # let model_router auto-route
 
 
+def _oai_explicit_model_id(model_name: str) -> str:
+    """The caller's id, when it is an enabled registry model. Else "".
+
+    _oai_model_hint() above prefix-matches, which destroys the id before the
+    router can see it: `claude-opus-5-5` becomes the hint `opus-5`, and the
+    router resolves that to whatever CLAUDE_OPUS_5_MODEL holds — empty on any
+    deployment configured through the admin screen. Measured on this one, 9 of
+    the 11 advertised cloud ids dispatched a different model than requested.
+
+    model_router already resolves this correctly for every other caller: it
+    checks an exact registry model_id BEFORE the alias table, precisely
+    because several registry ids are also alias keys (see the TIER_REGISTRY
+    branch). Passing the id through untranslated is what lets it.
+
+    `local:` ids are excluded on purpose — they already dispatch exactly, and
+    _use_local / _local_model_name read the hint and the raw request value.
+    """
+    name = (model_name or "").strip()
+    if not name or name.lower().startswith("local:"):
+        return ""
+    try:
+        from core.llm_provider_registry import get_model as _reg_get_model
+        return name if _reg_get_model(name) else ""
+    except Exception as exc:
+        logger.warning("Explicit-pick lookup failed for %r (%s) — falling back "
+                       "to the hint table", name, exc)
+        return ""
+
+
 # A tool-call turn can only be served by a family the tools channel can
 # address. services.cloud_tool_stream.stream_cloud_tools takes
 # "openai" | "claude" | "gemini", and _tools_proxy_stream posts to the
@@ -11002,35 +11024,76 @@ def _oai_tool_channel(model_hint: Optional[str]) -> tuple:
     return None, ""
 
 
+def _oai_advertised_model_ids() -> list:
+    """The ids GET /v1/models actually serves.
+
+    Both of this module's `/v1/models` registrations are shadowed by
+    messages_compat_router::list_models_compat, which claims the same two
+    paths ~14.8k lines earlier and therefore wins — so the audit below has to
+    read that catalogue's sources, not a list of this module's own constants.
+    """
+    out: list = []
+    try:
+        from core.llm_provider_registry import get_cli_style_models as _cli_models
+        out = [m["id"] for m in _cli_models(channel="cli")]
+    except Exception as exc:
+        logger.warning("Advertised-model audit: registry read failed: %s", exc)
+    try:
+        from gateway_local_llm import _catalog as _local_catalog
+        for _mid in _local_catalog.all_models():
+            if f"local:{_mid}" not in out:
+                out.append(f"local:{_mid}")
+    except Exception:
+        pass
+    if "local" not in out:
+        out.append("local")
+    return out
+
+
 def _audit_model_hint_coverage() -> list:
-    """Every model id this server advertises must map to a routing hint.
+    """Every advertised id must be addressable — by registry id or by hint.
 
-    An id with no mapping falls through _oai_model_hint() to `return None`, which
-    means "auto-route by prompt complexity" — so a caller asking for that model
-    silently gets a different one. Four advertised ids were in that state
-    (gpt-5-mini, gpt-5.6-terra, gpt-5.6-luna) or mapped to the wrong tier
-    (claude-haiku-4-5 -> "claude", i.e. served by Sonnet). This runs at startup so
-    adding a model to the catalogue without a hint is caught immediately instead
-    of becoming a silent, billable substitution.
+    A caller's id is honoured one of two ways. An exact enabled registry
+    model_id is passed to the router untranslated and dispatched as itself
+    (see _oai_explicit_model_id and model_router's TIER_REGISTRY branch).
+    Anything else goes through _oai_model_hint(), and an id with no mapping
+    returns None there — "auto-route by prompt complexity" — so the caller
+    silently gets a different model.
 
-    Returns the list of unmapped ids (empty when healthy).
+    Runs at startup, so a model added to the catalogue that neither route can
+    address is reported rather than becoming a silent, billable substitution.
+    Ids are quoted in the log line: the previous version interpolated them
+    bare, so an advertised empty id printed as nothing between two commas.
+
+    Returns the list of unaddressable ids (empty when healthy).
     """
     try:
-        advertised = [m["id"] for m in list_oai_models().get("data", [])]
+        from core.llm_provider_registry import get_model as _reg_get_model
     except Exception as exc:            # never block boot on a self-check
         logger.warning("Model hint coverage audit skipped: %s", exc)
         return []
-    unmapped = [mid for mid in advertised if _oai_model_hint(mid) is None]
+    advertised = _oai_advertised_model_ids()
+
+    def _addressable(mid: str) -> bool:
+        try:
+            if _reg_get_model(mid):
+                return True
+        except Exception:
+            pass
+        return _oai_model_hint(mid) is not None
+
+    unmapped = [mid for mid in advertised if not _addressable(mid)]
     if unmapped:
         logger.error(
-            "MODEL ROUTING GAP: %d advertised model id(s) have no routing hint and "
-            "will be auto-routed by prompt complexity instead of honoured: %s. "
-            "Add them to _OAI_MODEL_MAP.",
-            len(unmapped), ", ".join(unmapped),
+            "MODEL ROUTING GAP: %d advertised model id(s) are neither an enabled "
+            "registry model nor mapped to a routing hint, so a request for one is "
+            "auto-routed by prompt complexity instead of honoured: %s. Enable the "
+            "model on Admin > LLM Providers, or add it to _OAI_MODEL_MAP.",
+            len(unmapped), ", ".join(repr(m) for m in unmapped),
         )
     else:
         logger.info(
-            "Model hint coverage: all %d advertised model id(s) map to a routing hint",
+            "Model hint coverage: all %d advertised model id(s) are addressable",
             len(advertised),
         )
     return unmapped
@@ -11043,92 +11106,6 @@ def _messages_have_image(msgs) -> bool:
             if any(isinstance(p, dict) and p.get("type") == "image_url" for p in m.content):
                 return True
     return False
-
-
-@_v1.get("/v1/models", tags=["ai"])
-@_v1.get("/models", tags=["ai"])
-def list_oai_models():
-    """Return available models in OpenAI format so IDE extensions can populate their model picker.
-    Includes both cloud and local models so Kilo Code / Continue.dev show the full list.
-    owned_by is driven by APP_OWNER (default "ainxt"; set it to your own
-    organisation slug to attribute the models to you).
-    """
-    from core.config import APP_OWNER as _APP_OWNER
-    _models = [
-        {"id": _OPENAI_LATEST,  "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        {"id": _OPENAI_CODING,  "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        {"id": _OPENAI_SIMPLE,  "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        {"id": _CLAUDE_PRIMARY, "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        {"id": _CLAUDE_HAIKU,   "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        # Gemini 3.x split — text/coding, lightweight coding, image generation
-        {"id": _GEMINI_TEXT,        "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        {"id": _GEMINI_CODING_LITE, "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        {"id": _GEMINI_IMAGE,       "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        # Note: deep research models (o4-mini-deep-research, o3-deep-research) are intentionally
-        # excluded — they are only accessible via POST /v1/responses, not /chat/completions.
-        *([
-            {"id": _CLAUDE_OPUS,    "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-            # Opus 4.6 is deliberately NOT advertised: core/model_registry.py marks
-            # CLAUDE_OPUS_46_MODEL "RETIRED — always blocked", so listing it offered
-            # callers a model that can never serve a request. The name it referenced
-            # (_CLAUDE_OPUS_46) was also never defined anywhere in this module, so
-            # GET /v1/models raised NameError outright whenever ENABLE_OPUS was set.
-        ] if _ENABLE_OPUS else []),
-        # Claude Opus 4.8 — CLI / IDE-plugin only. Intentionally NOT added to
-        # /v1/all-models (web Chat picker). Gated by ENABLE_CLI_OPUS_48 so ops
-        # can disable without code changes.
-        *([
-            {"id": _CLAUDE_OPUS_48, "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        ] if (_ENABLE_OPUS and _ENABLE_CLI_OPUS_48) else []),
-        # Claude Opus 5 — CLI / IDE-plugin only. Opt-in via ENABLE_CLI_OPUS_5.
-        *([
-            {"id": _CLAUDE_OPUS_5, "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        ] if (_ENABLE_OPUS and _ENABLE_CLI_OPUS_5) else []),
-        # Claude Sonnet 5 — available on ALL channels (Chat picker, IDE / OpenAI-
-        # compat picker, CLI, SDLC). Only gated by the global ENABLE_SONNET_5
-        # kill-switch. Not restricted by ENABLE_OPUS / channel checks by design.
-        *([
-            {"id": _CLAUDE_SONNET_5, "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        ] if _ENABLE_SONNET_5 else []),
-        # GPT-5.6 Tera — high-capacity variant, Chat + CLI. Gated by ENABLE_GPT56_TERA.
-        *([
-            {"id": _OPENAI_TERA, "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        ] if _ENABLE_GPT56_TERA else []),
-        # GPT-5.6 Luna — efficient variant, Chat + CLI. Gated by ENABLE_GPT56_LUNA.
-        *([
-            {"id": _OPENAI_LUNA, "object": "model", "created": 1700000000, "owned_by": _APP_OWNER, "apiBackend": "messages"},
-        ] if _ENABLE_GPT56_LUNA else []),
-    ]
-    # Append in-house hosted models from the local LLM proxy
-    try:
-        from gateway_local_llm import get_local_gateway as _get_local_gw
-        for _m in _get_local_gw().list_models():
-            _models.append({
-                "id":        f"local:{_m}",
-                "object":    "model",
-                "created":   1700000000,
-                "owned_by":  "local",
-                "apiBackend": "messages",
-            })
-    except Exception:
-        pass
-
-    # Attach the hard per-model output-token ceiling when one exists (e.g.
-    # Claude Haiku 4.5 caps at 64K output tokens despite a 256K context
-    # window). Without this, IDE/CLI clients that clamp `max_tokens` only
-    # against context_window will send an oversized value that the provider
-    # hard-rejects with a 400 on every request. See
-    # core.model_registry.MODEL_MAX_OUTPUT_TOKENS for the source of truth.
-    try:
-        from core.model_registry import max_output_tokens_for as _max_out_for_oai
-        for _m in _models:
-            _ceiling = _max_out_for_oai(_m["id"])
-            if _ceiling:
-                _m["max_completion_tokens"] = _ceiling
-    except Exception:
-        pass
-
-    return {"object": "list", "data": _models}
 
 
 @_v1.post("/v1/chat/completions", tags=["ai"])
@@ -11145,7 +11122,9 @@ def openai_chat_completions(
     as standard OpenAI SSE chunks (``data: {...}\\n\\n`` / ``data: [DONE]``).
 
     Compatible with: Kilo Code, Continue, Cursor, any OpenAI-SDK client.
-    Base URL to configure in the extension: ``http://localhost:8000``
+    Base URL to configure in the extension:
+    ``http://localhost:8000/ainxt/v1/api`` — every router here is mounted under
+    that prefix, and there is no path rewriting, so a bare /v1/... is a 404.
     """
     # ── Kill-switch: direct/raw access disabled → force managed endpoints ──
     # Default OFF (ENABLE_RAW_OPENAI_API). Blocks curl / SDK / IDE / CLI direct
@@ -11577,6 +11556,11 @@ def openai_chat_completions(
 
     # Resolve model hint from the requested model name
     _model_hint = _oai_model_hint(req.model)
+    # An exact enabled registry id goes to the router untranslated, so the
+    # model the caller named is the model that runs. _model_hint is still
+    # computed for everything that reads it — the gemini/local/deep/mini
+    # branches, the ACL skip, X-Model-Hint, the context-window sizing.
+    _explicit_id = _oai_explicit_model_id(req.model)
     # Phase 6.6 — the tool-call channel and model, resolved once for the whole
     # turn. ("", None) means "keep every .env expression below exactly as it
     # is", which is both the governance-off path and the user's-own-pick path.
@@ -12625,8 +12609,9 @@ def openai_chat_completions(
         # _route_hint is gone with the ladder. It existed to hold the pin, and
         # holding it in a SECOND variable from the one the dispatch read is
         # precisely how the pin came to be computed, logged and then dropped.
-        # One route object now feeds both route() and stream().
-        _oai_route: dict = {"model_hint": _model_hint}
+        # One route object now feeds both route() and stream() — which is why
+        # honouring an explicit registry id is a change to this line only.
+        _oai_route: dict = {"model_hint": _explicit_id or _model_hint}
         if _shape_match and not _model_hint:
             _oai_route = _tier_request(_Tier.COMPLEX, "claude")
             logger.info("[IDE] browser-agent turn with no explicit model — pinning to "
@@ -13300,7 +13285,7 @@ def get_all_models(request: Request):
 # POST /v1/responses  /responses
 #
 # Mirrors the OpenAI Responses API so callers can use:
-#   client = OpenAI(base_url="http://localhost:8000", api_key=...)
+#   client = OpenAI(base_url="http://localhost:8000/ainxt/v1/api", api_key=...)
 #   client.responses.create(model="gpt-5.4", input="...")
 #   client.responses.create(model="o4-mini-deep-research", input="...",
 #                           tools=[{"type": "web_search_preview"}])

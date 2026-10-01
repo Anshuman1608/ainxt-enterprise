@@ -3483,9 +3483,15 @@ async def list_models_compat(request: Request):
     # data GET /v1/all-models reads exclusively. Falls through to the legacy
     # env-var-derived catalogue below only if the registry itself can't be read
     # (e.g. DB unavailable), not merely because it's empty.
+    # This handler also serves /v1/models and /models for IDE and SDK callers
+    # (it claims both paths ahead of gateway.py's own registration), so the
+    # channel is the caller's, not a literal "cli" — otherwise an admin's
+    # capabilities.channels entry is evaluated against the wrong channel for
+    # every non-CLI client. Same precedence GET /all-models uses.
     try:
         from core.llm_provider_registry import get_cli_style_models as _get_cli_style_models
-        models = _get_cli_style_models(channel="cli")
+        _channel = getattr(request.state, "client_source", "") or "cli"
+        models = _get_cli_style_models(channel=_channel)
     except Exception as exc:
         logger.warning(f"[CLI /v1/models] llm_provider_registry read failed, "
                         f"falling back to env-var catalogue: {exc}")

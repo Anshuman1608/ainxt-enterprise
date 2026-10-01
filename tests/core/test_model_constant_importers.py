@@ -118,9 +118,13 @@ ALLOWLIST = {
         "the legacy resolver itself — _HINT_MAP and the governance-off "
         "fallback ladder ARE the constants. Emptied by Phase 8/10.",
     "gateway.py":
-        "list_oai_models() (GET /v1/models) is 8 unconditional env constants "
-        "plus 6 flag-gated, registry never consulted. Deferred under D58 and "
-        "removed with the variables in Phase 8.",
+        "34 sites: 19 model names and 15 *_DISPLAY labels. D58's "
+        "list_oai_models() is no longer among them — deleted (D79) once "
+        "measuring showed messages_compat_router wins both of its paths. "
+        "What reads them now: the 15 _OAI_MODEL_MAP[_ALIAS] assignments "
+        "that key legacy and foreign names, the picker labels, and the two "
+        "tool-call lanes’ SKU ladders. Removed with the variables in "
+        "Phase 8.",
     "routers/messages_compat_router.py":
         "_list_models_compat_env_fallback — the degraded-mode CLI catalogue, "
         "reached only when the registry is unreadable (D63).",
@@ -129,8 +133,11 @@ ALLOWLIST = {
         "separate on purpose because core/ may be unimportable there (D63).",
 }
 
-#: Measured 2026-09-30. May fall, never rise. Was 17 / 122; lowered when the
-#: four Phase-8-prerequisite modules stopped naming vendors.
+#: Measured 2026-09-30, re-measured 2026-10-01. May fall, never rise. Was
+#: 17 / 122; lowered when the four Phase-8-prerequisite modules stopped
+#: naming vendors. D79 deleted 82 lines from gateway.py and did NOT move
+#: these: it removed seven ENABLE_* reads, and flags are PERMITTED here,
+#: not SKU_NAME. gateway.py still imports every SKU id for _OAI_MODEL_MAP.
 BASELINE_MODULES = 13
 BASELINE_SITES = 116
 

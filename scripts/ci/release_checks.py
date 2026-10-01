@@ -222,41 +222,66 @@ def check_python_syntax(cfg) -> list[str]:
 
 
 def check_model_hint_coverage(cfg) -> list[str]:
-    """Every model id the API advertises must map to a routing hint. Four ids did
-    not, so a caller asking for one model was silently served another — including
-    claude-haiku-4-5 being answered by the far costlier Sonnet."""
+    """Every model id the degraded-mode catalogue can advertise must map to a
+    routing hint. Four ids did not, so a caller asking for one model was
+    silently served another — including claude-haiku-4-5 being answered by the
+    far costlier Sonnet.
+
+    The subject moved. This used to read gateway.py::list_oai_models, which was
+    deleted once measuring showed it unreachable — messages_compat_router claims
+    the same two paths earlier and wins. The catalogue that does serve them is
+    registry-backed, so its ids are runtime values and nothing static can check
+    them; that half is covered by gateway's startup audit
+    (_audit_model_hint_coverage) and tests/routers/test_oai_explicit_pick.py.
+    Do not "restore" a static check for it.
+
+    What remains static is the env-var fallback the CLI catalogue uses when the
+    registry is unreadable (D63) — still literal, still dispatched through the
+    hint table, and the one path where a missing hint is unrecoverable because
+    governance is blind there too.
+    """
     g = ROOT / "gateway.py"
-    if not g.exists():
+    c = ROOT / "routers" / "messages_compat_router.py"
+    if not g.exists() or not c.exists():
         return []
     src = g.read_text(encoding="utf-8", errors="replace")
-    m = re.search(r"_OAI_MODEL_MAP\s*=\s*\{(.*?)\n\}", src, re.S)
-    if not m:
+    compat = c.read_text(encoding="utf-8", errors="replace")
+    if not re.search(r"_OAI_MODEL_MAP\s*=\s*\{(.*?)\n\}", src, re.S):
         return ["gateway.py: _OAI_MODEL_MAP not found"]
-    prefixes = [k for k, _ in re.findall(r'^\s*"([^"]+)"\s*:\s*([^,\n]+),', m.group(1), re.M)]
-    fn = re.search(r"def list_oai_models\(.*?\n(?=\n@|\ndef |\Z)", src, re.S)
+    if re.search(r"^def list_oai_models\(", src, re.M):
+        return ["gateway.py: list_oai_models() is back. It is shadowed by "
+                "messages_compat_router::list_models_compat on both of its "
+                "paths and serves no request — see plan.html D79."]
+
+    fn = re.search(r"def _list_models_compat_env_fallback\(.*?\n(?=\n\ndef |\Z)",
+                   compat, re.S)
     body = fn.group(0) if fn else ""
 
-    # The ids advertised in that body are almost all import aliases (e.g.
-    # `from core.model_registry import CLAUDE_PRIMARY_MODEL as _CLAUDE_PRIMARY`)
-    # whose value is an env var that is blank until an operator configures it —
-    # there is no literal string to test against `prefixes` in a fresh checkout.
-    # Coverage is therefore structural, not value-based: every alias id this
-    # function advertises must have its own `_OAI_MODEL_MAP[_ALIAS] = "..."`
-    # assignment (right after the dict literal in gateway.py), so whatever the
-    # alias resolves to at runtime is a key in the map by construction. That
-    # block is what previously went missing for gpt-5.6-terra/-luna.
-    covered_aliases = set(re.findall(r"_OAI_MODEL_MAP\[(_[A-Z][A-Z_0-9]*)\]\s*=", src))
-    advertised_aliases = set(re.findall(r'\{"id":\s*(_[A-Z][A-Z_0-9]*)', body))
-    literal_ids = set(re.findall(r'\{"id":\s*"([a-z0-9.\-]+)"', body))
-    if not advertised_aliases and not literal_ids:
-        return ["gateway.py: could not resolve any advertised model id — "
+    # Coverage is structural, not value-based: the fallback's ids are env-backed
+    # constants that are blank until an operator sets them, so there is no
+    # literal to compare. Every constant it advertises must reach a
+    # `_OAI_MODEL_MAP[_ALIAS] = ...` assignment in gateway.py, joined through
+    # gateway's own `X as _X` import aliases — which also keeps the two files
+    # from drifting apart about the same constant.
+    aliases = dict(re.findall(r"^\s*([A-Z][A-Z_0-9]*) as (_[A-Z][A-Z_0-9]*),",
+                              src, re.M))
+    covered = set(re.findall(r"_OAI_MODEL_MAP\[(_[A-Z][A-Z_0-9]*)\]\s*=", src))
+    advertised = set(re.findall(r'"id":\s*([A-Z][A-Z_0-9]*)', body))
+    if not advertised:
+        return ["routers/messages_compat_router.py: could not resolve any "
+                "advertised model id in _list_models_compat_env_fallback — "
                 "this check would pass trivially, so failing instead"]
 
-    bad = [f"gateway.py: advertised id {alias} has no _OAI_MODEL_MAP[{alias}] = ... entry"
-           for alias in sorted(advertised_aliases - covered_aliases)]
-    for mid in sorted(literal_ids - {"auto", "default", "local", "inhouse", "in-house"}):
-        if not any(mid.lower().startswith(p) for p in prefixes):
-            bad.append(f"gateway.py: advertised model id {mid!r} has no _OAI_MODEL_MAP entry")
+    bad = []
+    for name in sorted(advertised):
+        alias = aliases.get(name)
+        if alias is None:
+            bad.append(f"routers/messages_compat_router.py: the fallback "
+                       f"advertises {name}, which gateway.py does not import — "
+                       f"it cannot be covered by _OAI_MODEL_MAP")
+        elif alias not in covered:
+            bad.append(f"gateway.py: advertised id {name} ({alias}) has no "
+                       f"_OAI_MODEL_MAP[{alias}] = ... entry")
     return bad
 
 

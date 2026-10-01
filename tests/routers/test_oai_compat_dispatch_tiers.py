@@ -186,10 +186,20 @@ def test_the_routing_decision_is_read_back_off_the_sentinel(src):
     assert '_sm_ide.get("model_id") or _sm_ide.get("model_label")' in src
 
 
-def test_an_explicit_pick_still_rides_as_a_hint(src):
-    """§G. _oai_route defaults to the user's own hint and is only replaced on
-    the no-hint browser-agent path."""
-    assert '_oai_route: dict = {"model_hint": _model_hint}' in src
+def test_an_explicit_pick_rides_as_itself_not_as_a_hint(src):
+    """§G, corrected by D81.
+
+    The old assertion here was `{"model_hint": _model_hint}` — the user's hint
+    is passed through, only replaced on the no-hint browser-agent path. True,
+    and it was certifying the defect: `_model_hint` is the output of a prefix
+    match, so a concrete id never reached the router as an id. An exact enabled
+    registry id now goes through untranslated.
+
+    Behaviour is covered by tests/routers/test_oai_explicit_pick.py; this is
+    the source-level guard that the dispatch point reads it.
+    """
+    assert '_oai_route: dict = {"model_hint": _explicit_id or _model_hint}' in src
+    assert "_explicit_id = _oai_explicit_model_id(req.model)" in src
 
 
 # ── The ACL ────────────────────────────────────────────────────────────────
