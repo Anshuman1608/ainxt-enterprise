@@ -46,6 +46,7 @@ def test_content_title_falls_back_safely(monkeypatch):
         def generate(self, *a, **k):
             raise RuntimeError("local model down")
     monkeypatch.setattr(dw, "model_router", _Boom(), raising=False)
+    monkeypatch.setattr("models.model_router.model_router", _Boom(), raising=True)
 
     title = dw._title_from_content(
         "Summarizr this doic",
@@ -66,6 +67,8 @@ def test_intent_heuristic(case, monkeypatch):
         def generate(self, *a, **k):
             raise RuntimeError("force heuristic")
     monkeypatch.setattr(di, "model_router", _Boom(), raising=False)
+    # classify() imports the router inside the function; patch where it is read.
+    monkeypatch.setattr("models.model_router.model_router", _Boom(), raising=True)
 
     prior = "1. artifact_id=abc123 | \"UPI Report\" (pdf, v1)" if case.get("has_prior_doc") else ""
     res = di.classify(
@@ -95,6 +98,8 @@ def test_summarize_typo_routes_to_summarize(monkeypatch):
         def generate(self, *a, **k):
             raise RuntimeError("force heuristic")
     monkeypatch.setattr(di, "model_router", _Boom(), raising=False)
+    # classify() imports the router inside the function; patch where it is read.
+    monkeypatch.setattr("models.model_router.model_router", _Boom(), raising=True)
     # "Summarizr" is a typo the heuristic can't catch, but a correctly spelled
     # variant must route to summarize.
     res = di.classify("summarize this doc")

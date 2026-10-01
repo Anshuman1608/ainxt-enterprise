@@ -9,19 +9,14 @@
 # enterprise invariant that CONFIDENTIAL+ data never egresses to a cloud
 # provider, even when the caller passed an explicit cloud model_hint.
 #
-# ── Phase 5: the same invariant, now stated twice ───────────────────────────
+# ── Phase 5/8: the invariant as a constraint ────────────────────────────────
 #
-# The MECHANISM changed and the GUARANTEE did not, which is the only reason
-# this file was rewritten rather than replaced:
+# The tier is UNCHANGED and the candidate set narrows to
+# capabilities.privacy_class == deployment_local (§M.1). The pre-Phase-5
+# mechanism (rewrite the tier to TIER_SIMPLE) went with TIER_GOVERNANCE_ENABLED
+# in Phase 8, and its four tests with it.
 #
-#   TIER_GOVERNANCE_ENABLED off — the tier is rewritten to TIER_SIMPLE, so a
-#     hard reasoning task on confidential data runs on the smallest local
-#     model. Historical behaviour, asserted unchanged below.
-#   TIER_GOVERNANCE_ENABLED on  — the tier is UNCHANGED and the candidate set
-#     narrows to capabilities.privacy_class == deployment_local (§M.1).
-#     Capability and policy stop being the same axis.
-#
-# Under governance the resolver additionally refuses to walk the fallback
+# The resolver additionally refuses to walk the fallback
 # ladder, so a deployment with no local model FAILS rather than degrading onto
 # a weaker tier that might be external. That half is asserted here and again,
 # from the routing side, in tests/models/test_tier_switchover.py — a
@@ -36,22 +31,9 @@ from core.tier_resolver import NoEligibleModel
 from core.tiers import Tier
 from models.model_router import (
     ModelRouter,
-    TIER_SIMPLE,
     _privacy_requires_local,
     classification_from_policy,
 )
-
-
-@pytest.fixture(autouse=True)
-def _governance_off(monkeypatch):
-    """Pin the flag for every test in this file that does not set it itself.
-
-    Without this the historical assertions below would depend on the
-    developer's .env: a machine with governance switched on would see the
-    tier NOT rewritten to TIER_SIMPLE and the suite would fail for the right
-    reason at the wrong time.
-    """
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
 
 
 @pytest.mark.parametrize("cls,expected", [
@@ -68,36 +50,6 @@ def _governance_off(monkeypatch):
 ])
 def test_privacy_ladder(cls, expected):
     assert _privacy_requires_local(cls) is expected
-
-
-def test_restricted_forces_local_even_with_cloud_hint():
-    """THE invariant: restricted data pins to local, overriding an explicit hint."""
-    r = ModelRouter()
-    d = r.route("some restricted content", model_hint="opus",
-                data_classification="RESTRICTED")
-    assert d.tier == TIER_SIMPLE, "restricted data must be pinned to the local tier"
-
-
-def test_confidential_forces_local():
-    r = ModelRouter()
-    d = r.route("confidential text", model_hint="claude",
-                data_classification="CONFIDENTIAL")
-    assert d.tier == TIER_SIMPLE
-
-
-def test_public_is_not_forced_local():
-    """Public/internal traffic keeps normal routing — floor must not over-restrict."""
-    r = ModelRouter()
-    d = r.route("just a general question", model_hint="opus",
-                data_classification="PUBLIC")
-    assert d.tier != TIER_SIMPLE
-
-
-def test_no_classification_is_unchanged():
-    r = ModelRouter()
-    d_plain = r.route("hello", model_hint="opus")
-    d_none = r.route("hello", model_hint="opus", data_classification=None)
-    assert d_plain.tier == d_none.tier
 
 
 class _FakeRouting:
@@ -140,8 +92,7 @@ def _model(row_id, *, family, privacy_class):
 
 @pytest.fixture
 def governed(monkeypatch):
-    """Governance ON, over an in-memory registry and tier table."""
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
+    """An in-memory registry and tier table."""
     models: list = []
     assignments: list = []
     monkeypatch.setattr(reg, "get_enabled_models", lambda channel=None: list(models))
@@ -195,7 +146,7 @@ def test_the_ladder_is_never_walked_across_the_privacy_boundary(governed):
         ModelRouter().route("q", model_hint="complex", data_classification="RESTRICTED")
 
 
-def test_public_traffic_is_unconstrained_under_governance_too(governed):
+def test_public_traffic_is_unconstrained(governed):
     """The floor must not over-restrict: the highest-priority model wins."""
     models, assign = governed
     models.append(_model("cloud", family="anthropic", privacy_class="external"))

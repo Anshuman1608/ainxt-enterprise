@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: MIT
 """The async web-chat stream reports the model that ANSWERED, not the route.
 
-Phase 9 changed two things about how this is written, and neither changes what
-is asserted:
+Phase 8 moved this onto the governed path: the medium tier's head candidate's
+provider is down and the next candidate answers (§M.5). What is asserted is
+unchanged:
 
-  * the request is a TIER request — ``tier_request(Tier.MEDIUM, "medium")``,
-    the same splat every migrated call site uses — rather than the bare
-    ``model_hint="medium"`` string. "medium" survives as the ``legacy_hint``,
-    which is what D15 parity requires: with governance off the router must
-    reach exactly the model it reached before.
   * the expected model is taken from the gateway that actually served the
     call, instead of from ``models.model_router.CLAUDE_PRIMARY_MODEL``. That
     constant is one of the .env model constants Phase 8 deletes, and a test
@@ -28,8 +24,16 @@ from collections.abc import AsyncIterator, Iterator
 import anyio
 import pytest
 
+from core.tier_resolver import ResolvedModel
 from core.tiers import Tier
 from models.model_router import ModelRouter, tier_request
+
+
+def _cand(model_id: str, family: str, priority: int) -> ResolvedModel:
+    return ResolvedModel(model_id=model_id, row_id=model_id, provider_id="p",
+                         provider_slug=family, family=family, base_url=None,
+                         capabilities={}, tier=Tier.MEDIUM,
+                         requested_tier=Tier.MEDIUM, priority=priority)
 
 
 class _ClaudeGateway:
@@ -59,8 +63,12 @@ def test_async_stream_reports_actual_claude_fallback_when_openai_unavailable(
     # Given: Auto asked for the medium tier, but only Claude is available.
     router = ModelRouter()
     claude = _ClaudeGateway()
-    monkeypatch.setattr(router, "_get_openai", lambda: None)
-    monkeypatch.setattr(router, "_get_claude", lambda: claude)
+    monkeypatch.setattr(
+        "core.tier_resolver.resolve_tier_candidates",
+        lambda tier, c=None, **kw: [_cand("openai-head", "openai", 1),
+                                    _cand("claude-next", "anthropic", 2)])
+    monkeypatch.setattr(ModelRouter, "_gateway_for_registry_family",
+                        lambda self, family, model_id: claude if family == "anthropic" else None)
 
     # When: the async web-chat stream falls back through its sync worker thread.
     chunks = anyio.run(_collect_stream, router)
@@ -74,4 +82,5 @@ def test_async_stream_reports_actual_claude_fallback_when_openai_unavailable(
     assert "".join(chunk for chunk in chunks if isinstance(chunk, str)) == "ROUTING_OK"
     assert claude.served_model, "the Claude gateway was never asked for a model"
     assert stream_meta["model_id"] == claude.served_model
-    assert "[fallback]" in str(stream_meta["model_label"])
+    # A later candidate in the same tier is not a ladder fallback (§M.5), so no suffix.
+    assert stream_meta["model_label"] == "claude-next"

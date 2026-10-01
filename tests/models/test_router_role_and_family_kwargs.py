@@ -47,8 +47,6 @@ def captured(monkeypatch):
         raise RuntimeError("stop here — the constraints are what this asserts")
 
     monkeypatch.setattr("core.tier_resolver.resolve_tier_candidates", _resolve)
-    monkeypatch.setattr("core.tiers.governance_enabled", lambda: True)
-    monkeypatch.setattr("models.model_router._governance_enabled", lambda: True)
     return seen
 
 
@@ -156,19 +154,13 @@ def test_a_plain_complex_tier_does_NOT_get_the_review_role(captured):
     assert captured[0]["constraints"].require_role is None
 
 
-def test_a_FAILED_tier_resolution_still_falls_back_through_the_legacy_hint(captured):
-    """The other half of the same call, and the reason `captured` is a list.
-
-    When the explicit-tier resolution produces nothing, route() drops to the
-    legacy-hint branch — which resolves AGAIN, this time through
-    _LEGACY_TO_GOVERNED, so `legacy_hint="solution"` does bring the review
-    role back. That is D15 working as designed (flag-off behaviour is what
-    the hint always did), and it is worth pinning because it means the role a
-    stage gets can differ between the governed and the degraded path."""
+def test_a_failed_tier_resolution_does_not_retry_through_the_legacy_hint(captured):
+    """D107. Before Phase 8 a failed explicit-tier resolution dropped to the
+    legacy-hint branch and resolved a second time; now it raises, so a stage
+    that needs the review role must ask for it (SDLC_STAGE_TIERS does)."""
     _route(tier=Tier.COMPLEX, legacy_hint="solution")
-    assert len(captured) == 2, "expected an explicit-tier attempt then a hint attempt"
+    assert len(captured) == 1
     assert captured[0]["constraints"].require_role is None
-    assert captured[1]["constraints"].require_role == ROLE_REVIEW
 
 
 # ── The resolver's own semantics, which the above depends on ────────────────

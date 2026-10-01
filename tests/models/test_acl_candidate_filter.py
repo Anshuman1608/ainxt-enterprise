@@ -122,58 +122,37 @@ def test_a_fully_blocked_tier_raises_models_blocked_by_policy():
 def test_models_blocked_by_policy_is_not_a_no_eligible_model():
     """The type distinction IS the behaviour.
 
-    _resolve_governed returns None on NoEligibleModel, and None means "run the
-    legacy .env chain". If ModelsBlockedByPolicy were a subclass — or were
-    reported as NoEligibleModel — then blocking every model for a department
-    would cause the request to be served by an UNGOVERNED cloud model read
-    from the .env constants. That is the exact escape the pre-migration
-    comment at gateway.py:7591 was written to prevent.
+    NoEligibleModel tells an administrator to assign a model; this tells a
+    user an access rule refused them. Reporting one as the other sends the
+    fix to the wrong person.
     """
     assert not issubclass(ModelsBlockedByPolicy, NoEligibleModel)
 
 
-def test_a_fully_blocked_tier_never_reaches_the_legacy_chain(monkeypatch):
-    """The property the test above only implies, asserted end to end.
-
-    Structured as "the fallback was not entered" rather than "an exception was
-    raised", because a re-raise that lands in some caller's own `except` would
-    satisfy the weaker form while still egressing.
-    """
+def test_a_fully_blocked_tier_raises_the_policy_error(monkeypatch):
+    """Not NoEligibleModel: the deployment can serve the tier, the user may not."""
     router = ModelRouter()
-    entered: list[str] = []
-    monkeypatch.setattr(
-        "models.model_router._warn_env_fallback",
-        lambda tier, reason: entered.append(str(tier)),
-    )
     monkeypatch.setattr(
         "core.tier_resolver.resolve_tier_candidates",
         lambda tier, c=None, **kw: list(CANDIDATES),
     )
-
     with pytest.raises(ModelsBlockedByPolicy):
         router._resolve_governed(
             Tier.MEDIUM, {}, legacy_tier="medium", complexity="medium",
             is_vision=False, hint="medium", constraints_kw={}, channel=None,
             acl_filter=lambda ids: [],
         )
-    assert entered == [], (
-        "a governance block fell through to the .env constants — "
-        "_resolve_governed must re-raise ModelsBlockedByPolicy before its "
-        "NoEligibleModel and bare-Exception handlers"
-    )
 
 
 def test_the_bare_exception_handler_does_not_swallow_it(monkeypatch):
-    """_resolve_governed's last handler is `except Exception`, added so that
-    governance can never break routing. It is also the handler that would
-    quietly turn a policy denial into a legacy-chain dispatch, so the
-    ModelsBlockedByPolicy clause must come first."""
+    """_resolve_governed's last handler is `except Exception`, which converts a
+    resolver failure into NoEligibleModel; the policy error must pass through
+    before it, or a denial would be reported as an unassigned tier."""
     import inspect
     src = inspect.getsource(ModelRouter._resolve_governed)
-    i_policy = src.index("except ModelsBlockedByPolicy")
-    i_noelig = src.index("except NoEligibleModel")
+    i_policy = src.index("except (ModelsBlockedByPolicy, NoEligibleModel)")
     i_bare = src.index("except Exception")
-    assert i_policy < i_noelig < i_bare
+    assert i_policy < i_bare
 
 
 # ── 4. no filter = today's behaviour (§M.4) ───────────────────────────────
@@ -236,7 +215,6 @@ def test_a_broken_filter_fails_open_and_says_so(caplog):
 
 def test_an_empty_candidate_list_is_not_a_policy_block():
     """A tier with nothing assigned is a DEPLOYMENT gap — NoEligibleModel's
-    territory, which degrades to the legacy chain on purpose. Reporting it as
-    a policy block would turn "the admin has not configured this yet" into
-    "you are not allowed", and would stop D15's flag-off path working."""
+    territory. Reporting it as a policy block would turn "the admin has not
+    configured this yet" into "you are not allowed"."""
     assert ModelRouter._apply_acl(Tier.MEDIUM, [], lambda ids: []) == []

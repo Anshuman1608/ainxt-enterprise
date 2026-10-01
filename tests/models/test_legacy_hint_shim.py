@@ -11,8 +11,9 @@ which means the LOCAL model. Without ``legacy_hint`` those sites would move
 local → cloud on every deployment that has not set TIER_GOVERNANCE_ENABLED,
 and the flag would stop being a rollback.
 
-So: ``legacy_hint`` is what the call site used to pass, and it is consumed
-ONLY when the governed path produces nothing. See ``_coerce_tier``.
+So: ``legacy_hint`` is what the call site used to pass. Since Phase 8 it is no
+longer consumed for routing (a tier= call resolves or raises), but
+``_coerce_tier`` still validates it; the flag-off cases here were retired.
 """
 
 from __future__ import annotations
@@ -25,8 +26,6 @@ from core.tiers import Tier
 from models.model_router import (
     ModelRouter,
     TIER_GOVERNED,
-    TIER_HAIKU,
-    TIER_SIMPLE,
 )
 
 
@@ -42,8 +41,7 @@ def _model(row_id: str, model_id: str) -> dict:
 
 @pytest.fixture
 def governed(monkeypatch: pytest.MonkeyPatch):
-    """Governance ON with a registry and assignment table the test controls."""
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
+    """A registry and assignment table the test controls."""
     models: list = []
     assignments: list = []
     monkeypatch.setattr(reg, "get_enabled_models", lambda channel=None: list(models))
@@ -56,15 +54,10 @@ def governed(monkeypatch: pytest.MonkeyPatch):
     return models, assign
 
 
-@pytest.fixture
-def ungoverned(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
-
-
 # ── The three programming errors _coerce_tier refuses to let through ───────
 
 
-def test_legacy_hint_without_tier_is_a_programming_error(ungoverned):
+def test_legacy_hint_without_tier_is_a_programming_error():
     """`legacy_hint` on its own says nothing — it only has meaning as "the hint
     this call site used before it asked for a tier". Supplied alone it is
     almost certainly a half-finished migration, so it fails loudly."""
@@ -72,7 +65,7 @@ def test_legacy_hint_without_tier_is_a_programming_error(ungoverned):
         ModelRouter().route("q", legacy_hint="simple")
 
 
-def test_an_unknown_legacy_hint_is_rejected(ungoverned):
+def test_an_unknown_legacy_hint_is_rejected():
     """A typo must not slide through _HINT_MAP and become the medium default.
 
     The entire value of legacy_hint is that it reproduces a SPECIFIC prior
@@ -83,7 +76,7 @@ def test_an_unknown_legacy_hint_is_rejected(ungoverned):
         ModelRouter().route("q", tier=Tier.SIMPLE, legacy_hint="simpel")
 
 
-def test_tier_and_model_hint_together_still_raise(ungoverned):
+def test_tier_and_model_hint_together_still_raise():
     with pytest.raises(ValueError, match="not both"):
         ModelRouter().route("q", tier=Tier.SIMPLE, model_hint="simple")
 
@@ -91,16 +84,7 @@ def test_tier_and_model_hint_together_still_raise(ungoverned):
 # ── What it actually does ──────────────────────────────────────────────────
 
 
-def test_flag_off_the_legacy_hint_decides(ungoverned):
-    """The point of the whole exercise: migrating the call site changed
-    nothing for a deployment that has not opted in."""
-    r = ModelRouter()
-    assert r.route("q", tier=Tier.SIMPLE, legacy_hint="simple").tier == TIER_SIMPLE
-    # …and without it, the same call would have gone to the cloud tier.
-    assert r.route("q", tier=Tier.SIMPLE).tier == TIER_HAIKU
-
-
-def test_flag_on_the_assignment_beats_the_legacy_hint(governed):
+def test_the_assignment_beats_the_legacy_hint(governed):
     """Opting in is what makes the tier win — not the code change."""
     models, assign = governed
     models.append(_model("row-a", "claude-sonnet-4-5"))
@@ -112,16 +96,10 @@ def test_flag_on_the_assignment_beats_the_legacy_hint(governed):
     assert d.requested_tier is Tier.SIMPLE
 
 
-def test_flag_on_but_tier_unassigned_falls_back_to_the_legacy_hint(governed):
-    """The honest middle case. An operator who turns governance on without
-    assigning every tier gets the OLD behaviour for the tiers they missed,
-    not the _TIER_TO_LEGACY_HINT guess — so a partial rollout is partial
-    rather than a surprise.
-    """
-    governed  # registry and assignments both empty
-    d = ModelRouter().route("q", tier=Tier.SIMPLE, legacy_hint="simple")
-    assert d.tier == TIER_SIMPLE
-    assert d.resolved is None
+def test_an_unassigned_tier_raises_rather_than_using_the_legacy_hint(governed):
+    """D107: no partial rollout through the old chain; the error names the tier."""
+    with pytest.raises(tr.NoEligibleModel):
+        ModelRouter().route("q", tier=Tier.SIMPLE, legacy_hint="simple")
 
 
 def test_intent_classification_reaches_its_own_tier_not_the_haiku_stub(governed):
@@ -142,14 +120,7 @@ def test_intent_classification_reaches_its_own_tier_not_the_haiku_stub(governed)
 # ── no_cloud_egress as a caller-supplied constraint (§M.1, §D.2 memory) ────
 
 
-def test_no_cloud_egress_keyword_pins_local_with_the_flag_off(ungoverned):
-    """Flag off, the historical shape: the privacy floor rewrites the tier."""
-    d = ModelRouter().route("q", tier=Tier.SIMPLE, legacy_hint="simple",
-                            no_cloud_egress=True)
-    assert d.tier == TIER_SIMPLE
-
-
-def test_no_cloud_egress_keyword_narrows_candidates_with_the_flag_on(governed):
+def test_no_cloud_egress_keyword_narrows_candidates(governed):
     """Flag on, §M.1's shape: the tier is UNCHANGED and only deployment-local
     candidates survive. A caller asserting the constraint must get the same
     guarantee as one that labelled the turn CONFIDENTIAL."""

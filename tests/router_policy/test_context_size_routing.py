@@ -6,21 +6,10 @@
 # Frontier pattern #5 (docs/architecture/02 §2.5/§2.8): when a turn's token
 # footprint won't fit, the router must not truncate.
 #
-# ── Phase 5 split this into two mechanisms ──────────────────────────────────
-#
-#   TIER_GOVERNANCE_ENABLED off — the TIER is replaced by a larger-window one,
-#     from the fixed _CONTEXT_PROMOTION_LADDER. Both target tiers are
-#     provider-shaped ("deep" is GPT, "gemini" is Gemini), which is why §M.2
-#     replaces the mechanism. Asserted unchanged in the first half below.
-#   TIER_GOVERNANCE_ENABLED on  — the tier is UNCHANGED and the requested
-#     tier's own candidates are filtered by capabilities.context_window
-#     (§M.2). The window is a property of the MODEL, and a per-tier constant
-#     cannot be right for a tier that has two models of different sizes.
-#
-# The ladder survives Phase 5 rather than being deleted as §M.2 asks, because
-# deleting it would change routing for every deployment running with the flag
-# off — in the release whose safety argument is that turning the flag off
-# changes nothing. It goes in Phase 10 with the rest of the legacy chain.
+# The requested tier is UNCHANGED and its own candidates are filtered by
+# capabilities.context_window (§M.2): the window is a property of the MODEL.
+# The pre-Phase-5 tier-promotion ladder went with TIER_GOVERNANCE_ENABLED in
+# Phase 8, and its eight tests with it.
 # ============================================================
 
 import pytest
@@ -28,62 +17,10 @@ import pytest
 import core.llm_provider_registry as reg
 import core.tier_resolver as tr
 from core.tiers import Tier
-from models.model_router import (
-    _promote_for_context,
-    _tier_window,
-    ModelRouter,
-    TIER_SIMPLE,
-)
+from models.model_router import ModelRouter
 
 
-@pytest.fixture(autouse=True)
-def _governance_off(monkeypatch):
-    """Pin the flag: the promotion assertions describe the flag-OFF path, and
-    a developer whose .env switches it on would otherwise see them fail."""
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
-
-
-def test_small_context_does_not_promote():
-    assert _promote_for_context("medium", 5_000) == "medium"
-
-
-def test_medium_overflow_promotes_to_deep():
-    # 150K tokens / 0.8 headroom = 187.5K needed; medium=128K can't fit → deep=256K
-    assert _promote_for_context("medium", 150_000) == "deep"
-
-
-def test_deep_overflow_promotes_to_gemini():
-    # 250K / 0.8 = 312.5K needed; deep=256K can't fit → gemini=1M
-    assert _promote_for_context("medium", 250_000) == "gemini"
-    assert _promote_for_context("complex", 250_000) == "gemini"
-
-
-def test_already_large_window_unchanged():
-    assert _promote_for_context("gemini", 500_000) == "gemini"
-
-
-def test_beyond_all_windows_picks_largest():
-    assert _promote_for_context("simple", 5_000_000) == "gemini"
-
-
-def test_zero_or_negative_tokens_unchanged():
-    assert _promote_for_context("medium", 0) == "medium"
-    assert _promote_for_context("medium", -1) == "medium"
-
-
-def test_tier_window_defaults_safely():
-    assert _tier_window("unknown_tier") == 128_000
-
-
-def test_privacy_floor_still_wins_over_context_size():
-    # A restricted turn must stay local even if the context is huge — privacy
-    # is enforced before context-size routing.
-    r = ModelRouter()
-    d = r.route("x" * 2_000_000, data_classification="RESTRICTED")
-    assert d.tier == TIER_SIMPLE
-
-
-# ── The same concern, expressed as a capability filter (Phase 5, §M.2) ──────
+# ── Context size as a capability filter (§M.2) ──────────────────────────────
 
 
 def _model(row_id, window):
@@ -99,7 +36,6 @@ def _model(row_id, window):
 
 @pytest.fixture
 def governed(monkeypatch):
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
     models: list = []
     assignments: list = []
     monkeypatch.setattr(reg, "get_enabled_models", lambda channel=None: list(models))
@@ -156,12 +92,11 @@ def test_a_model_with_no_declared_window_is_skipped_not_assumed(governed):
     assert d.provider_model_override == "model-declared"
 
 
-def test_an_unsatisfiable_window_falls_back_rather_than_failing(governed):
-    """Unlike no_cloud_egress, a context constraint that cannot be met is not
-    a compliance failure — it degrades to the .env constants with a warning,
-    which is what every text tier does when it resolves to nothing."""
+def test_an_unsatisfiable_window_is_reported(governed):
+    """Not a compliance failure, but no longer routed around either (D107):
+    the error names the model and the window it lacks."""
     models, assign = governed
     models.append(_model("tiny", 4_000))
     assign(Tier.COMPLEX, "tiny")
-    d = ModelRouter().route("q", model_hint="complex", context_tokens=400_000)
-    assert d.resolved is None
+    with pytest.raises(tr.NoEligibleModel):
+        ModelRouter().route("q", model_hint="complex", context_tokens=400_000)

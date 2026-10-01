@@ -79,8 +79,8 @@ class _Cand:
 
 
 @pytest.fixture
-def governed(monkeypatch):
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
+def governed():
+    """Governance is unconditional since Phase 8; kept so the call sites read clearly."""
 
 
 def _pin_candidates(monkeypatch, candidates):
@@ -194,19 +194,6 @@ def test_an_empty_tier_falls_back_rather_than_failing(helper, governed, monkeypa
     assert helper.fn(None) == (None, "")
 
 
-# ── D57: the flag-off contract ─────────────────────────────────────────────
-
-
-def test_governance_off_changes_nothing(helper, monkeypatch):
-    """The whole rollback story for this path. With the flag off the helper
-    declines to answer and every .env expression in both tool branches is
-    the one that runs — so there is nothing to compare, by construction."""
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
-    _pin_candidates(monkeypatch, [_Cand("assigned-model", "anthropic")])
-    for hint in (None, "claude", "solution", "haiku", "deep", "mini", "gemini"):
-        assert helper.fn(hint) == (None, ""), f"{hint!r} resolved with governance off"
-
-
 # ── D90: an explicit pick is served as itself ──────────────────────────────
 
 
@@ -218,14 +205,8 @@ def _pin_registry(monkeypatch, rows):
 @pytest.mark.parametrize("family,provider", [
     ("anthropic", "claude"), ("openai", "openai"), ("google", "gemini"),
 ])
-@pytest.mark.parametrize("flag", ["true", None])
-def test_an_explicit_pick_is_served_as_itself(helper, monkeypatch, family, provider, flag):
-    """Flag on or off — the router's registry branch is flag-independent, so
-    plain chat already honours the pick and tool calls must agree."""
-    if flag:
-        monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", flag)
-    else:
-        monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
+def test_an_explicit_pick_is_served_as_itself(helper, monkeypatch, family, provider):
+    """The router's registry branch honours the pick, so tool calls must agree."""
     _pin_registry(monkeypatch, {"vendor-m": {"family": family}})
     _pin_candidates(monkeypatch, [_Cand("assigned-model", "anthropic")])
     assert helper.fn("whatever-hint", "vendor-m") == (provider, "vendor-m")
@@ -239,18 +220,9 @@ def test_the_pick_beats_the_hint_it_prefix_matches(helper, governed, monkeypatch
     assert helper.fn("opus-5", "claude-opus-5-5") == ("claude", "claude-opus-5-5")
 
 
-@pytest.mark.parametrize("flag,expected", [
-    ("true", ("claude", "claude-x")),   # the tier's Auto model, as before
-    (None, (None, "")),                 # the .env ladder, as before
-])
-def test_a_pick_with_no_tool_channel_keeps_todays_answer(helper, monkeypatch, caplog,
-                                                         flag, expected):
-    """An Ollama pick cannot carry tools. Today it falls through to Auto, and
-    returning early instead sent it to a ladder that is blank here."""
-    if flag:
-        monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", flag)
-    else:
-        monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
+def test_a_pick_with_no_tool_channel_is_served_by_auto(helper, monkeypatch, caplog):
+    """An Ollama pick cannot carry tools, so it falls through to the tier's Auto model."""
+    expected = ("claude", "claude-x")
     _pin_registry(monkeypatch, {"llama3.2:1b": {"family": "ollama"}})
     _pin_candidates(monkeypatch, [_Cand("claude-x", "anthropic")])
     with caplog.at_level("WARNING"):

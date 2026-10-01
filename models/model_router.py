@@ -48,7 +48,7 @@ from typing import Callable, List, Optional, Union
 from core.logger import logger
 from core.proxy_tool_use import llm_proxy_headers as _llm_proxy_headers
 # core.tiers is a leaf module (stdlib only) — safe to import at module scope.
-from core.tiers import Tier, governance_enabled as _tiers_governance_enabled
+from core.tiers import Tier
 
 # core.tier_resolver reaches the DB and the registry, so it is imported lazily
 # inside route(). This one constant is duplicated rather than imported to keep
@@ -850,63 +850,9 @@ _PRIVACY_FAIL_CLOSED_TEXT = (
 # larger tier is warranted, the complexity-derived tier is unchanged.
 _CONTEXT_SIZE_ROUTING = os.getenv("CONTEXT_SIZE_ROUTING", "true").lower() == "true"
 
-# Approx working context window per tier (tokens). Mirrors gateway._MODEL_
-# CONTEXT_WINDOW but keyed by TIER so route() can reason about fit without a
-# gateway import (keeps the router importable in isolation).
-_TIER_CONTEXT_WINDOW = {
-    # local tier: use the largest window in the in-house fleet (kimi-k2.7-code
-    # at 256 K). The pre-flight guard in messages_compat_router uses the
-    # per-model _MODEL_CONTEXT_WINDOW table for precise per-model limits;
-    # this value is used only for context-promotion decisions in route().
-    "simple":   262_144,   # local fleet ceiling (kimi-k2.7-code 256 K)
-    "mini":     128_000,
-    "local_mini": 131_072,  # in-house gpt-oss-120b / GLM-5.2 (128 K)
-    "medium":   128_000,   # gpt coding
-    "deep":     256_000,   # gpt-5.x
-    "complex":  200_000,   # claude sonnet
-    "haiku":    200_000,
-    "solution": 200_000,   # claude opus/sonnet
-    "opus-4-8": 200_000,
-    "opus-5":   200_000,
-    "sonnet-5": 200_000,
-    "vision":   1_000_000, # gemini
-    "gemini":   1_000_000,
-    "tera":     256_000,   # gpt-5.6-terra
-    "luna":     256_000,   # gpt-5.6-luna
-}
-# Fraction of a window a turn may occupy before we promote (headroom for the
-# answer + safety). 0.8 => promote once the input alone would exceed 80% window.
+# Fraction of a model's window a turn may occupy (headroom for the answer):
+# becomes the min_context_window constraint on the requested tier (§M.2).
 _CONTEXT_FIT_FRACTION = float(os.getenv("CONTEXT_FIT_FRACTION", "0.8"))
-# Promotion ladder by ascending window: try these tiers (that we can reach on
-# the cloud path) when the current tier can't fit the context.
-_CONTEXT_PROMOTION_LADDER = ("deep", "gemini")  # 256K then 1M
-
-
-def _tier_window(tier: str) -> int:
-    return _TIER_CONTEXT_WINDOW.get(tier, 128_000)
-
-
-def _promote_for_context(tier: str, context_tokens: int) -> str:
-    """Return a tier whose window fits `context_tokens` (with headroom), or the
-    original tier when it already fits / nothing larger helps. Never raises."""
-    try:
-        if not _CONTEXT_SIZE_ROUTING or not context_tokens or context_tokens <= 0:
-            return tier
-        needed = context_tokens / max(0.1, _CONTEXT_FIT_FRACTION)
-        if _tier_window(tier) >= needed:
-            return tier  # already fits with headroom
-        for _cand in _CONTEXT_PROMOTION_LADDER:
-            if _tier_window(_cand) >= needed and _tier_window(_cand) > _tier_window(tier):
-                return _cand
-        # nothing fully fits — pick the largest-window candidate available
-        _largest = max(_CONTEXT_PROMOTION_LADDER, key=_tier_window)
-        if _tier_window(_largest) > _tier_window(tier):
-            return _largest
-        return tier
-    except Exception:  # noqa: BLE001 — routing must never break
-        return tier
-
-
 def classification_from_policy(policy) -> Optional[str]:
     """Derive a request data_classification from a resolved policy/profile.
 
@@ -944,26 +890,13 @@ def _privacy_requires_local(data_classification: Optional[str]) -> bool:
         return False
 
 # ============================================================
-# TIER GOVERNANCE  (Phase 5 — the precedence inversion)
+# TIER GOVERNANCE
 # ============================================================
 #
-# With TIER_GOVERNANCE_ENABLED set, a request for a CAPABILITY resolves
-# through llm_tier_models — the assignments an administrator made on the Tiers
-# screen — instead of through the .env model constants. The constants become a
-# logged fallback for the case where a tier has nothing eligible.
-#
-# Default OFF. Off means the legacy chains in _LEGACY_CHAIN run exactly as they
-# did before Phase 5; tests/models/test_dispatch_equivalence.py pins that.
-# The flag is read per call, not at import, so an operator can flip it without
-# a restart and roll back the same way.
-#
-# The three readers of this flag have to agree, or the admin screen would
-# report a state the router is not in. Since §N.1 step 6 they agree by
-# construction rather than by comment: core.tiers owns the parse and everyone
-# else — here, routers/tier_governance_router.py, and the step-6 consumers
-# that never touch ModelRouter — delegates to it.
-def _governance_enabled() -> bool:
-    return _tiers_governance_enabled()
+# A request for a CAPABILITY resolves through llm_tier_models, the assignments
+# an administrator made on the Tiers screen. Phase 8 removed the env-constant
+# fallback and the TIER_GOVERNANCE_ENABLED switch: a tier with nothing eligible
+# raises NoEligibleModel.
 
 
 # Sentinel tier for a decision that came from the resolver. Not one of the
@@ -971,31 +904,6 @@ def _governance_enabled() -> bool:
 # names the user-explicit path. The tier that was actually requested travels
 # on RoutingDecision.requested_tier, which is what the §L.5 audit columns read.
 TIER_GOVERNED = "governed"
-
-# Variables we have already warned about, so a tier with no assignment logs
-# once per process rather than once per request. Unbounded growth is not a
-# concern: the key space is the fixed set of legacy tier names.
-_ENV_FALLBACK_WARNED: set = set()
-
-
-def _warn_env_fallback(legacy_tier: str, reason: object) -> None:
-    """Announce, once, that a tier fell back to its .env constant.
-
-    Once per tier per process rather than per request: a deployment that
-    upgrades with governance on but no assignments would otherwise emit this
-    on every single call, which turns a useful signal into log noise that
-    someone filters out. doctor.sh reports the same condition up front.
-    """
-    if legacy_tier in _ENV_FALLBACK_WARNED:
-        return
-    _ENV_FALLBACK_WARNED.add(legacy_tier)
-    logger.warning(
-        "ModelRouter: tier governance is ON but tier %r resolved to nothing "
-        "(%s) — falling back to the DEPRECATED .env model constants for this "
-        "tier. Assign a model to it on Model Governance > Tiers; the env "
-        "constants are removed in a later release.",
-        legacy_tier, reason,
-    )
 
 
 class ModelsBlockedByPolicy(Exception):
@@ -1006,18 +914,12 @@ class ModelsBlockedByPolicy(Exception):
 
       NoEligibleModel      the DEPLOYMENT cannot serve the tier — nothing is
                            assigned, or every candidate fails a constraint.
-                           _resolve_governed returns None and the legacy .env
-                           chain serves the request, which is D15's whole
-                           point.
+                           The fix is an assignment on the Tiers screen.
 
       ModelsBlockedByPolicy
                            the deployment can serve it and an ADMINISTRATOR
-                           said this user may not. Falling back to the .env
-                           constants here would dispatch an ungoverned cloud
-                           model in response to a governance rule — the exact
-                           escape the pre-migration comment at gateway.py:7591
-                           was written to prevent, and the reason this is a
-                           distinct type rather than a flag on the other one.
+                           said this user may not. The fix is an access rule,
+                           which is why this is a distinct type.
 
     So this propagates to the caller, which turns it into the 403 the Chat
     Auto path already returns. `blocked` is the ordered candidate list that
@@ -1271,6 +1173,19 @@ def model_family(model_id: Optional[str]) -> str:
         return ""
 
 
+def no_eligible_message(exc) -> str:
+    """The user-facing text for a NoEligibleModel: a privacy refusal or an unassigned tier."""
+    if getattr(getattr(exc, "constraints", None), "no_cloud_egress", False):
+        logger.error("ModelRouter: PRIVACY FLOOR — %s", exc)
+        return ("Error: this request carries data that may not be sent to a "
+                f"cloud provider, and no in-house model can serve it ({exc}). "
+                "Assign a deployment-local model to this tier, or configure a "
+                "local provider.")
+    logger.error("ModelRouter: %s", exc)
+    return (f"Error: {exc}. An administrator can assign a model to this tier "
+            "in Admin → Model Governance → Tiers.")
+
+
 def fully_blocked_candidates(tier, acl_filter: Optional[AclFilter]) -> Optional[List[str]]:
     """The tier's candidate ids when the ACL denies ALL of them, else None.
 
@@ -1281,10 +1196,9 @@ def fully_blocked_candidates(tier, acl_filter: Optional[AclFilter]) -> Optional[
     client has already begun rendering.
 
     Returns None — meaning "go ahead" — for every other outcome, including a
-    deployment with nothing assigned: that is NoEligibleModel's territory and
-    it degrades to the legacy chain, which is not this function's business.
+    deployment with nothing assigned: that is NoEligibleModel's, raised by route().
     """
-    if acl_filter is None or not _governance_enabled():
+    if acl_filter is None:
         return None
     try:
         from core.tier_resolver import resolve_tier_candidates
@@ -1345,24 +1259,23 @@ def resolve_pick_to_model_id(hint: Optional[str]) -> str:
     except Exception as exc:  # noqa: BLE001
         logger.debug("resolve_pick_to_model_id(%r): registry unavailable (%s)", key, exc)
 
-    if _governance_enabled():
-        try:
-            from core.tiers import (
-                EXPLICIT_MODEL, note_legacy_alias, resolve_legacy_alias,
-            )
-            alias = resolve_legacy_alias(key)
-            if isinstance(alias, Tier):
-                # Feeds the same counter that gates the shim's removal in
-                # Phase 10, exactly as §N.1 step 11's boundary does.
-                note_legacy_alias(key, "chat-pick")
-                from core.tier_resolver import resolve_tier
-                return resolve_tier(alias).model_id
-            if alias == EXPLICIT_MODEL:
-                note_legacy_alias(key, "chat-pick")
-                # The client named a vendor, not a model. There is nothing
-                # concrete to check; fall through to the legacy answer.
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("resolve_pick_to_model_id(%r): tier lookup failed (%s)", key, exc)
+    try:
+        from core.tiers import (
+            EXPLICIT_MODEL, note_legacy_alias, resolve_legacy_alias,
+        )
+        alias = resolve_legacy_alias(key)
+        if isinstance(alias, Tier):
+            # Feeds the same counter that gates the shim's removal in
+            # Phase 10, exactly as §N.1 step 11's boundary does.
+            note_legacy_alias(key, "chat-pick")
+            from core.tier_resolver import resolve_tier
+            return resolve_tier(alias).model_id
+        if alias == EXPLICIT_MODEL:
+            note_legacy_alias(key, "chat-pick")
+            # The client named a vendor, not a model. There is nothing
+            # concrete to check; fall through to the legacy answer.
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("resolve_pick_to_model_id(%r): tier lookup failed (%s)", key, exc)
 
     return hint_to_model_id(key) or ""
 
@@ -1857,18 +1770,6 @@ _TIER_TO_LEGACY_HINT: dict = {
 # intent-classification have no legacy equivalent at all, so they are
 # reachable only through a `tier=` call. Phase 5 is the first release in which
 # such a call dispatches rather than resolving to a Phase 1 stub.
-# Tiers for which falling back to the .env constants is NOT a coherent answer.
-#
-# The env-constant fallback works for the seven capability tiers because each
-# has a legacy chain that does the same JOB with a different model. These two
-# do not: _TIER_TO_LEGACY_HINT maps both onto "vision" purely so the Phase 1
-# map is total over Tier, and its own comment calls them stubs. Falling back
-# would hand an image-generation request to a text/vision model and return
-# prose — a confusing wrong answer where an error is a fixable one.
-#
-# image-input is deliberately absent: "vision" genuinely performs image
-# ANALYSIS, so degrading to it is a real answer to the question asked.
-_NO_ENV_FALLBACK = frozenset({Tier.IMAGE_OUTPUT, Tier.VIDEO_GENERATION})
 
 _LEGACY_TO_GOVERNED: dict = {
     TIER_MINI:     (Tier.MINI,        {}),
@@ -1916,12 +1817,8 @@ _LEGACY_TO_GOVERNED: dict = {
 #   behaviour nobody would choose on purpose: TIER_MEDIUM's blocking primary
 #   sends no `model` at all while its streaming twin does; TIER_SOLUTION
 #   reports was_fallback=True even when every hop failed; TIER_OPUS_48 never
-#   sets _last_actual_tier. These are preserved EXACTLY, because this is the
-#   path a deployment runs with TIER_GOVERNANCE_ENABLED off, and that path must
-#   not move in the same change that introduces the one that replaces it.
-#   tests/models/test_dispatch_equivalence.py pins all of it, 544 records
-#   captured from the pre-refactor code. Fix these quirks in Phase 10, when the
-#   legacy chains are deleted rather than reorganised.
+#   sets _last_actual_tier. Since Phase 8 only user SKU picks and Auto's local
+#   tiers still reach this table; Rev 22 stage 8.3 deletes it with them.
 
 
 @dataclass(frozen=True)
@@ -2272,12 +2169,8 @@ class ModelRouter:
 
         ── legacy_hint (Phase 6, decision D15) ──────────────────────────────
         What the call site used to pass, kept alongside the tier it now asks
-        for. The returned hint is only ever CONSUMED when governance is off,
-        or when governed resolution finds nothing — route() already treats the
-        coerced hint as exactly that fallback. So a migrated call site behaves
-        identically to its pre-migration self on any deployment that has not
-        set TIER_GOVERNANCE_ENABLED, and TIER_GOVERNANCE_ENABLED=false stays a
-        working rollback.
+        for. Since Phase 8 a tier= call resolves or raises, so the coerced hint
+        is no longer consumed for routing.
 
         This matters because _TIER_TO_LEGACY_HINT is not a faithful inverse of
         the migration: Tier.SIMPLE maps to "haiku" (cloud Claude Haiku) while
@@ -2824,15 +2717,11 @@ class ModelRouter:
                           complexity: str, is_vision: bool, hint,
                           constraints_kw: dict, channel,
                           acl_filter: Optional[AclFilter] = None):
-        """Resolve one tier through the admin's assignments, or None to fall back.
+        """Resolve one tier through the admin's assignments.
 
-        Returns None — meaning "run the legacy chain" — when the tier has
-        nothing eligible, after warning once about the .env constants that
-        will serve instead. The single exception is no_cloud_egress, where
-        falling back is the one thing that must not happen (§M.1/§M.5): that
-        re-raises so the caller can surface an explicit failure rather than
-        quietly sending confidential data to whichever cloud model the env
-        constants happen to name.
+        A tier with nothing eligible raises NoEligibleModel (D107): there is no
+        env-constant fallback since Phase 8, and a confidential turn must never
+        be answered by whatever model happens to be reachable (§M.1/§M.5).
 
         `acl_filter` (§N.1 step 9) narrows the resolved candidates to the ones
         this user is permitted to use. It runs HERE, on the resolved list,
@@ -2865,24 +2754,12 @@ class ModelRouter:
             candidates = resolve_tier_candidates(governed_tier, c, channel=channel)
             if acl_filter is not None:
                 candidates = self._apply_acl(governed_tier, candidates, acl_filter)
-        except ModelsBlockedByPolicy:
-            # Before the two handlers below, which both degrade to the .env
-            # chain. A governance rule must never be answered by dispatching
-            # an ungoverned model — see the class docstring.
+        except (ModelsBlockedByPolicy, NoEligibleModel):
             raise
-        except NoEligibleModel as exc:
-            if c.no_cloud_egress or governed_tier in _NO_ENV_FALLBACK:
-                raise
-            _warn_env_fallback(legacy_tier or governed_tier.value, exc)
-            return None
-        except Exception as exc:  # noqa: BLE001 — governance must never break routing
-            if governed_tier in _NO_ENV_FALLBACK:
-                raise
-            logger.warning(
-                "ModelRouter: tier resolution for %r raised %s — using the "
-                "legacy chain for this request.",
-                legacy_tier or governed_tier.value, exc)
-            return None
+        except Exception as exc:  # noqa: BLE001 — reported as the deployment gap it is
+            logger.warning("ModelRouter: tier resolution for %r failed: %s",
+                           legacy_tier or governed_tier.value, exc)
+            raise NoEligibleModel(governed_tier, c, {"resolver": str(exc)}) from exc
 
         top = candidates[0]
         logger.info(
@@ -2919,28 +2796,23 @@ class ModelRouter:
         tier: OPTIONAL approved application tier (core.tiers.Tier). Keyword-only
             and enum-typed so it can never collide with the legacy `model_hint`
             string vocabulary — see _coerce_tier. Mutually exclusive with
-            model_hint. With TIER_GOVERNANCE_ENABLED set this resolves through
-            the admin's tier assignments directly, which is the only way to
-            reach image-output, video-generation or intent-classification —
-            they have no legacy hint.
+            model_hint. Resolves through the admin's tier assignments
+            directly, which is the only way to reach image-output,
+            video-generation or intent-classification — they have no legacy hint.
         legacy_hint: OPTIONAL (Phase 6, D15) the hint this call site passed
-            BEFORE it was migrated to tier=. Used as the fallback whenever the
-            governed path does not produce a model — governance off, or the
-            tier has no eligible assignment — so migrating a call site is a
-            no-op until an operator turns governance on. Requires tier=; must
-            be a known hint. See _coerce_tier.
+            BEFORE it was migrated to tier=. No longer consulted for routing
+            since Phase 8 — a tier= call resolves or raises. Requires tier=;
+            must be a known hint. See _coerce_tier.
         data_classification: optional sensitivity tag (PUBLIC/INTERNAL/
             CONFIDENTIAL/RESTRICTED/PCI_SENSITIVE, per core/rag_acl.py). At or
-            above CONFIDENTIAL this becomes the no_cloud_egress constraint when
-            governance is on, and the historical TIER_SIMPLE pin when it is off.
+            above CONFIDENTIAL this becomes the no_cloud_egress constraint.
         no_cloud_egress: OPTIONAL policy assertion from a caller that knows its
             content must stay in the estate whatever the turn is labelled
             (§M.1, and §D.2's memory rows). OR-ed with the classification-
             derived value; neither can switch the other off.
         context_tokens: optional estimated token footprint of the whole turn.
-            Governance on: becomes min_context_window, filtering the requested
-            tier's candidates (§M.2). Governance off: promotes to a
-            larger-window TIER, as before.
+            Becomes min_context_window, filtering the requested tier's
+            candidates (§M.2).
 
         distinct_from_family / budget_state / needs_tools / needs_streaming:
             §M constraints that only the CALLER can know. Plumbed through to
@@ -2970,17 +2842,14 @@ class ModelRouter:
             NOT degrade to the legacy chain. Passed by the user-facing chat
             entry points only; §M.4 keeps application tiers unfiltered.
 
-        Raises NoEligibleModel only under no_cloud_egress, where falling back
-        is the one outcome the constraint exists to prevent. Every other
-        resolution failure degrades to the legacy chain with a warning —
-        except ModelsBlockedByPolicy, which is a policy decision rather than a
-        deployment gap and must reach the caller.
+        Raises NoEligibleModel when the requested tier has nothing eligible
+        (D107), and ModelsBlockedByPolicy when the user's ACL denies every
+        candidate.
         """
         requested_tier = Tier(tier) if tier is not None else None
         model_hint = self._coerce_tier(model_hint, tier, legacy_hint)
         prompt_str = _as_str(prompt)  # routing signals always derived from text
 
-        _governed = _governance_enabled()
         # §M.1 — two independent ways to require it, one meaning. The
         # classification is the data talking; the keyword is a caller that
         # KNOWS its content must stay in the estate regardless of how the turn
@@ -3013,9 +2882,7 @@ class ModelRouter:
 
         def _govern(legacy_tier, *, complexity, is_vision, hint,
                     explicit: Optional[Tier] = None, min_window=None):
-            """Try the assignments for this tier; None means run the legacy chain."""
-            if not _governed:
-                return None
+            """Resolve this tier through the assignments; None for a user's SKU pick."""
             if explicit is not None:
                 pair = (explicit, {})
             else:
@@ -3032,34 +2899,10 @@ class ModelRouter:
                 acl_filter=acl_filter,
             )
 
-        # 0. PRIVACY FLOOR (hard enterprise invariant) — runs FIRST so nothing
-        #    downstream (hint, vision, complexity) can re-route restricted data to
-        #    a cloud provider.
-        #
-        #    Governance OFF: the historical behaviour — the TIER is rewritten to
-        #    TIER_SIMPLE, so a hard reasoning task on confidential data runs on
-        #    the smallest local model.
-        #    Governance ON (§M.1): the tier is UNCHANGED and the candidate set
-        #    narrows to privacy_class == deployment_local. Capability and policy
-        #    stop being the same axis. The guarantee is identical either way —
-        #    confidential data never reaches a cloud provider — and under
-        #    governance the resolver additionally refuses to walk the fallback
-        #    ladder, so "no local model" fails loudly instead of degrading.
-        if _no_cloud and not _governed:
-            _cls = str(data_classification).strip().upper()
-            # AUDIT/ALERT: every enforcement is logged at WARNING so it surfaces
-            # in SIEM/alerting — a restricted turn hitting the cloud would be a
-            # compliance incident, so we make the on-prem pin explicit.
-            logger.warning(
-                "ModelRouter: PRIVACY FLOOR enforced — data_classification=%s → "
-                "pinned to LOCAL (TIER_SIMPLE); cloud providers bypassed "
-                "(hint=%r ignored for privacy)", _cls, model_hint,
-            )
-            return RoutingDecision(
-                tier=TIER_SIMPLE, model=_tier_label(TIER_SIMPLE),
-                complexity=TIER_SIMPLE, is_vision=False,
-                hint=model_hint, fallback=False,
-            )
+        # 0. PRIVACY FLOOR (hard enterprise invariant). The tier is unchanged
+        #    and the candidate set narrows to privacy_class == deployment_local
+        #    (§M.1); with no local model the resolver fails loudly rather than
+        #    walking a fallback ladder, so confidential data never egresses.
         if _no_cloud:
             logger.warning(
                 "ModelRouter: PRIVACY FLOOR enforced — data_classification=%s → "
@@ -3073,7 +2916,7 @@ class ModelRouter:
         #     intent-classification: _coerce_tier maps all three onto legacy
         #     hints that mean something else, which is fine while nothing
         #     dispatches on them and wrong the moment something does.
-        if requested_tier is not None and _governed:
+        if requested_tier is not None:
             _d = _govern(None, complexity=requested_tier.value,
                          is_vision=(requested_tier is Tier.IMAGE_INPUT),
                          hint=None, explicit=requested_tier)
@@ -3237,38 +3080,16 @@ class ModelRouter:
             except Exception:  # noqa: BLE001
                 context_tokens = 0
 
-        # Governance ON: the tier does NOT change. The same token count becomes
-        # min_context_window and filters the requested tier's own candidates
-        # (§M.2) — the window is a property of the model, and
-        # capabilities.context_window already holds it per model, so a per-tier
-        # constant table cannot be right for a tier with two models in it.
-        if _governed:
-            _d = _govern(
-                tier, complexity=complexity, is_vision=False, hint=None,
-                min_window=(int(context_tokens / max(0.1, _CONTEXT_FIT_FRACTION))
-                            if (_CONTEXT_SIZE_ROUTING and context_tokens > 0) else None),
-            )
-            if _d is not None:
-                return _d
-
-        # Governance OFF: promote to a larger-window TIER, as before.
-        #
-        # _TIER_CONTEXT_WINDOW and _CONTEXT_PROMOTION_LADDER survive here
-        # rather than being deleted as plan.html §M.2 asks. Deleting them would
-        # remove context promotion from the path a deployment runs with the
-        # flag OFF — a routing change in the very release whose safety argument
-        # is "turn the flag off and nothing moves". They go in Phase 10, with
-        # the rest of the legacy chain, once nothing reaches this branch.
-        if context_tokens and context_tokens > 0:
-            _promoted = _promote_for_context(tier, context_tokens)
-            if _promoted != tier:
-                logger.info(
-                    "ModelRouter: CONTEXT-SIZE ROUTING — context_tokens=%d exceeds "
-                    "tier=%s window (%d); promoting to tier=%s window(%d)",
-                    context_tokens, tier, _tier_window(tier),
-                    _promoted, _tier_window(_promoted),
-                )
-                tier = _promoted
+        # The tier does NOT change. The token count becomes min_context_window
+        # and filters the requested tier's own candidates (§M.2): the window is
+        # a property of the model, held in capabilities.context_window.
+        _d = _govern(
+            tier, complexity=complexity, is_vision=False, hint=None,
+            min_window=(int(context_tokens / max(0.1, _CONTEXT_FIT_FRACTION))
+                        if (_CONTEXT_SIZE_ROUTING and context_tokens > 0) else None),
+        )
+        if _d is not None:
+            return _d
 
         logger.info(f"ModelRouter: final tier={tier} (complexity={complexity} confidence={confidence:.2f})")
         # Fix 2: for TIER_SIMPLE, pin the catalog pick NOW (once per request) so
@@ -4155,18 +3976,10 @@ class ModelRouter:
                                   require_role=require_role,
                                   acl_filter=acl_filter)
         except Exception as exc:
-            # Only reachable under no_cloud_egress, which is the one constraint
-            # the resolver refuses to degrade around. Returned as a string
-            # because generate()'s contract is that it never raises.
+            # Returned as a string because generate()'s contract is that it never raises.
             if type(exc).__name__ != "NoEligibleModel":
                 raise
-            logger.error("ModelRouter: PRIVACY FLOOR — %s", exc)
-            return (
-                "Error: this request carries data that may not be sent to a "
-                f"cloud provider, and no in-house model can serve it ({exc}). "
-                "Assign a deployment-local model to this tier, or configure a "
-                "local provider."
-            )
+            return no_eligible_message(exc)
         self._record_selection(decision)
         logger.info(f"ModelRouter → {decision.model} (tier={decision.tier})")
         # PRIVACY FLOOR: when enforced, no-cloud-fallback is propagated into
@@ -4309,9 +4122,7 @@ class ModelRouter:
         except Exception as exc:
             if type(exc).__name__ != "NoEligibleModel":
                 raise
-            logger.error("ModelRouter: PRIVACY FLOOR — %s", exc)
-            yield ("Error: this request carries data that may not be sent to a "
-                   f"cloud provider, and no in-house model can serve it ({exc}).")
+            yield no_eligible_message(exc)
             return
         self._record_selection(decision)
         logger.info(f"ModelRouter.stream → {decision.model} (tier={decision.tier})"
@@ -4638,17 +4449,9 @@ def resolve_media_model(tier: Tier, *, channel: Optional[str] = None):
 
     Returns a core.tier_resolver.ResolvedModel and raises NoEligibleModel
     when the tier has no eligible assignment. It does NOT fall back to the
-    .env constants, for the reason _NO_ENV_FALLBACK already records: the
-    legacy hint for both tiers is "vision", which ANALYSES an image and
-    cannot make one. Answering "generate a video of a tiger" with a
+    .env constants: answering "generate a video of a tiger" with a
     paragraph about tigers is a confusing wrong answer; an error naming the
     unassigned tier is a fixable one.
-
-    Ignores TIER_GOVERNANCE_ENABLED deliberately. The flag exists so that
-    turning it off restores the previous routing — and the previous routing
-    for these two paths was a hardcoded provider, which is what this
-    replaces. There is no legacy behaviour here worth preserving, only a
-    hardcode worth removing (R3).
     """
     from core.tier_resolver import resolve_tier
     rm = resolve_tier(tier, channel=channel)

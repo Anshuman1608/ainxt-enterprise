@@ -141,7 +141,6 @@ def test_a_legacy_alias_resolves_to_the_tier_head(monkeypatch):
         )
 
     monkeypatch.setattr("core.tier_resolver.resolve_tier", fake_resolve)
-    monkeypatch.setattr("models.model_router._governance_enabled", lambda: True)
 
     assert resolve_pick_to_model_id("medium") == "claude-sonnet-4-6"
     assert resolve_pick_to_model_id("complex") == "claude-sonnet-5"
@@ -157,7 +156,6 @@ def test_a_legacy_alias_feeds_the_phase_10_removal_counter(monkeypatch):
     noted = []
     monkeypatch.setattr("core.tiers.note_legacy_alias",
                         lambda v, surface: noted.append((v, surface)))
-    monkeypatch.setattr("models.model_router._governance_enabled", lambda: True)
 
     from core.tier_resolver import ResolvedModel
     from core.tiers import Tier
@@ -181,18 +179,8 @@ def test_a_registry_id_is_not_counted_as_a_legacy_alias(monkeypatch):
     noted = []
     monkeypatch.setattr("core.tiers.note_legacy_alias",
                         lambda v, surface: noted.append(v))
-    monkeypatch.setattr("models.model_router._governance_enabled", lambda: True)
     resolve_pick_to_model_id("claude-sonnet-5")
     assert noted == []
-
-
-def test_governance_off_falls_back_to_the_legacy_answer(monkeypatch):
-    """D15 again. With the flag off, hint_to_model_id IS the right answer for
-    an alias, because the legacy chain is what will dispatch."""
-    monkeypatch.setattr("models.model_router._governance_enabled", lambda: False)
-    monkeypatch.setattr("core.llm_provider_registry.get_enabled_models",
-                        lambda **kw: [])
-    assert resolve_pick_to_model_id("complex") == hint_to_model_id("complex")
 
 
 def test_a_broken_registry_does_not_block_the_turn(monkeypatch):
@@ -201,7 +189,6 @@ def test_a_broken_registry_does_not_block_the_turn(monkeypatch):
     def boom(**kw):
         raise RuntimeError("db down")
     monkeypatch.setattr("core.llm_provider_registry.get_enabled_models", boom)
-    monkeypatch.setattr("models.model_router._governance_enabled", lambda: False)
     assert resolve_pick_to_model_id("claude-sonnet-4-6") == \
         hint_to_model_id("claude-sonnet-4-6")
 

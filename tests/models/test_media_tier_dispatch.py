@@ -107,22 +107,13 @@ def test_a_model_that_cannot_serve_the_modality_is_not_substituted(
         resolve_media_model(tier)
 
 
-def test_the_governance_flag_does_not_gate_media_resolution(registry, monkeypatch):
-    """Unlike the text tiers, these two ignore TIER_GOVERNANCE_ENABLED.
-
-    The flag's contract is "off restores the previous behaviour". For these
-    paths the previous behaviour was a hardcoded provider, so there is no
-    prior routing to restore — only a hardcode to remove (R3). Honouring the
-    flag here would mean shipping a switch that turns the hardcode back on.
-    """
+def test_media_resolution_reads_the_assignment(registry):
+    """The video tier resolves through its assignment (no hardcoded provider, R3)."""
     models, assign = registry
     models.append(_model("veo", family="gemini", modality=["video-out"],
                          model_id="veo-3.1-generate-preview"))
     assign(Tier.VIDEO_GENERATION, "veo")
 
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
-    assert resolve_media_model(Tier.VIDEO_GENERATION).model_id == "veo-3.1-generate-preview"
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
     assert resolve_media_model(Tier.VIDEO_GENERATION).model_id == "veo-3.1-generate-preview"
 
 

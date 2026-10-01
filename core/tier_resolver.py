@@ -7,11 +7,8 @@
 # approved tiers) and core/llm_provider_registry.py (what is configured) were
 # missing.
 #
-# Nothing calls this yet. models/model_router.py is untouched in Phase 3; the
-# switchover happens in Phase 5 behind TIER_GOVERNANCE_ENABLED. For now the
-# only consumer is the diagnostic endpoint GET /model-governance/tiers/resolved,
-# which lets an operator see what each tier WOULD resolve to before anything
-# depends on the answer.
+# models/model_router.py resolves every capability request through this module
+# (unconditionally since Phase 8), as does GET /model-governance/tiers/resolved.
 #
 # A leaf module by construction: imports core.tiers and
 # core.llm_provider_registry only, never models/. That keeps it importable from
@@ -135,7 +132,7 @@ class NoEligibleModel(Exception):
         self.constraints = constraints
         self.rejections = rejections
         detail = "; ".join(f"{k}: {v}" for k, v in list(rejections.items())[:6]) \
-            or "no candidates assigned"
+            or "no model is assigned to it"
         what = f"tier '{tier.value}'" if tier is not None else "the requested model"
         super().__init__(f"no eligible model for {what} ({detail})")
 

@@ -661,10 +661,8 @@ def cli_model_is_addressable(model_id: str) -> bool:
 def _legacy_cli_model_for_tier(hint: str) -> str:
     """The pre-governance answer: hint → .env constant → registry-by-family.
 
-    Retained verbatim as the D15/D50 fallback — governance off, or the tier
-    resolves to nothing usable — so `TIER_GOVERNANCE_ENABLED=` reproduces
-    today's model id exactly. It is not called on the governed path and it is
-    removed with the rest of the .env model constants in Phase 8.
+    The D15/D50 fallback when the tier resolves to nothing the CLI can address.
+    Removed with the .env model constants in Rev 22 stage 8.4.
     """
     if is_local_only():
         return LOCAL_LLM_MODEL_NAME
@@ -761,35 +759,28 @@ def cli_tier_model_id(tier, legacy_hint: str, override: str = "", *,
         return value
 
     # 2. The administrator's assignment.
+    rejected: list = []
     try:
-        from core.tiers import governance_enabled
-        governed = governance_enabled()
-    except Exception:                                    # noqa: BLE001
-        governed = False
+        from core.tier_resolver import Constraints, resolve_tier_candidates
+        from core.tiers import Tier
+        for cand in resolve_tier_candidates(
+                Tier(tier), Constraints(require_role=require_role)):
+            if is_blocked_model(cand.model_id):
+                rejected.append(f"{cand.model_id} (blocked on this deployment)")
+                continue
+            if not cli_model_is_addressable(cand.model_id):
+                _known = sorted(cli_acceptable_model_ids())
+                rejected.append(
+                    f"{cand.model_id} (the ainxt CLI refuses this id; it accepts "
+                    + (f"only {', '.join(_known)}" if _known
+                       else f"ids beginning {'/'.join(CLI_ADDRESSABLE_MODEL_PREFIXES)}")
+                    + ")")
+                continue
+            return cand.model_id
+    except Exception as exc:                          # noqa: BLE001
+        rejected.append(f"tier resolution unavailable ({exc})")
 
-    if governed:
-        rejected: list = []
-        try:
-            from core.tier_resolver import Constraints, resolve_tier_candidates
-            from core.tiers import Tier
-            for cand in resolve_tier_candidates(
-                    Tier(tier), Constraints(require_role=require_role)):
-                if is_blocked_model(cand.model_id):
-                    rejected.append(f"{cand.model_id} (blocked on this deployment)")
-                    continue
-                if not cli_model_is_addressable(cand.model_id):
-                    _known = sorted(cli_acceptable_model_ids())
-                    rejected.append(
-                        f"{cand.model_id} (the ainxt CLI refuses this id; it accepts "
-                        + (f"only {', '.join(_known)}" if _known
-                           else f"ids beginning {'/'.join(CLI_ADDRESSABLE_MODEL_PREFIXES)}")
-                        + ")")
-                    continue
-                return cand.model_id
-        except Exception as exc:                          # noqa: BLE001
-            rejected.append(f"tier resolution unavailable ({exc})")
-
-        _warn_cli_tier_fallback(tier, legacy_hint, rejected)
+    _warn_cli_tier_fallback(tier, legacy_hint, rejected)
 
     # 3. The pre-migration answer.
     return _legacy_cli_model_for_tier(legacy_hint)

@@ -62,8 +62,7 @@ def _quiet_warn_cache():
 
 @pytest.fixture
 def governed(monkeypatch):
-    """Governance on, with a settable candidate list."""
-    monkeypatch.setattr("core.tiers.governance_enabled", lambda: True)
+    """A settable candidate list (governance is always on since Phase 8)."""
     box = {"candidates": [], "raises": None}
 
     def _resolve(tier, constraints=None, **kw):
@@ -273,20 +272,6 @@ def test_a_resolver_failure_falls_back_rather_than_raising(governed):
     governed["raises"] = RuntimeError("database is down")
     assert mr.cli_tier_model_id(Tier.COMPLEX, "complex") == \
         mr._legacy_cli_model_for_tier("complex")
-
-
-def test_governance_off_is_byte_identical_to_the_pre_migration_answer(monkeypatch):
-    """D50. The parity contract for the concrete-id resolver: for each
-    (tier, legacy_hint) pair, flag-off returns exactly what the old
-    cli_model_for_tier(legacy_hint) returned."""
-    from core.tiers import Tier
-
-    monkeypatch.setattr("core.tiers.governance_enabled", lambda: False)
-    monkeypatch.setattr(mr, "LLM_PROVIDER", "cloud")
-    for tier, hint in ((Tier.SIMPLE, "haiku"), (Tier.COMPLEX, "complex"),
-                       (Tier.COMPLEX, "solution"), (Tier.MEDIUM, "medium"),
-                       (Tier.COMPLEX, "deep")):
-        assert mr.cli_tier_model_id(tier, hint) == mr._legacy_cli_model_for_tier(hint)
 
 
 # ── The two things that must be checked BEFORE the tier ─────────────────────

@@ -41,24 +41,10 @@ from core.tiers import (
 from models.model_router import (
     _HINT_MAP,
     _TIER_TO_LEGACY_HINT,
-    TIER_HAIKU,
     TIER_SIMPLE,
     ModelRouter,
 )
 
-
-@pytest.fixture(autouse=True)
-def _governance_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin TIER_GOVERNANCE_ENABLED off for this whole module.
-
-    Everything here describes the coercion layer — what a legacy hint and a
-    `tier=` kwarg mean BEFORE the resolver gets involved. Phase 5 made that
-    conditional on the flag, and a developer whose .env turns governance on
-    would otherwise watch every assertion here fail for a reason that has
-    nothing to do with what the test is about. Same fixture, same reason, as
-    tests/router_policy/test_privacy_floor_live.py.
-    """
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
 
 # The eight approved tiers, spelled out rather than derived from the enum, so
 # that a careless edit to core.tiers fails here instead of silently redefining
@@ -180,38 +166,10 @@ def test_unknown_value_is_not_an_alias() -> None:
     assert resolve_legacy_alias("") is None
 
 
-# ── 3. ZERO BEHAVIOUR CHANGE — the Phase 1 contract ──────────────────────────
-
-
-@pytest.mark.parametrize("hint", _LITERAL_HINTS)
-def test_legacy_hints_unchanged(hint: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every legacy hint still resolves to the tier ``_HINT_MAP`` declares.
-
-    ``_HINT_MAP`` is the untouched source of truth for legacy routing, so
-    asserting ``route()`` reproduces it proves the ``tier=`` parameter did not
-    perturb the existing path. The registry lookup in ``route()`` step 1a is
-    stubbed out because it would otherwise hit the DB and, for hints that
-    collide with a real model id, legitimately win over ``_HINT_MAP``.
-    """
-    router = ModelRouter()
-    monkeypatch.setattr(
-        "core.llm_provider_registry.get_model", lambda _mid: None, raising=False
-    )
-    decision = router.route("a short neutral prompt", model_hint=hint)
-    assert decision.tier == _HINT_MAP[hint], (
-        f"hint {hint!r} routed to {decision.tier!r}, expected {_HINT_MAP[hint]!r}"
-    )
-
-
-def test_no_hint_still_auto_routes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Passing neither argument must behave exactly as before (auto-routing)."""
-    router = ModelRouter()
-    monkeypatch.setattr(
-        "core.llm_provider_registry.get_model", lambda _mid: None, raising=False
-    )
-    decision = router.route("what is 2 + 2?")
-    assert decision.tier, "auto-routing must still produce a tier"
-    assert decision.hint is None
+# ── 3. (retired in Phase 8) ──────────────────────────────────────────────────
+# The Phase 1 "zero behaviour change with the flag off" tests went with
+# TIER_GOVERNANCE_ENABLED: a capability hint now always resolves through the
+# assignments, so there is no flag-off routing left to hold constant.
 
 
 # ── 4. The new parameter is unreachable by accident ──────────────────────────
@@ -252,42 +210,7 @@ def test_tier_kwarg_rejects_legacy_strings(bogus: str) -> None:
         router.route("hi", tier=bogus)
 
 
-@pytest.mark.parametrize("tier", list(Tier))
-def test_tier_kwarg_reaches_expected_legacy_tier(
-    tier: Tier, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Each Tier lands on the legacy tier ``_TIER_TO_LEGACY_HINT`` promises."""
-    router = ModelRouter()
-    monkeypatch.setattr(
-        "core.llm_provider_registry.get_model", lambda _mid: None, raising=False
-    )
-    expected = _HINT_MAP[_TIER_TO_LEGACY_HINT[tier]]
-    assert router.route("a short neutral prompt", tier=tier).tier == expected
-
-
-# ── 5. THE R1 REGRESSION TEST ────────────────────────────────────────────────
-
-
-def test_simple_collision_guarded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``"simple"`` and ``Tier.SIMPLE`` must NOT mean the same thing yet.
-
-    The legacy string dispatches to the in-house gateway (TIER_SIMPLE); the new
-    tier means cheap-and-short (TIER_HAIKU). They converge only when each call
-    site is migrated deliberately in Phase 6. If this test ever fails because
-    the two now agree, ~18 currently-local call sites have been repointed at a
-    cloud provider — a data-residency incident, not a cost regression.
-    """
-    router = ModelRouter()
-    monkeypatch.setattr(
-        "core.llm_provider_registry.get_model", lambda _mid: None, raising=False
-    )
-
-    legacy = router.route("summarise this", model_hint="simple").tier
-    new = router.route("summarise this", tier=Tier.SIMPLE).tier
-
-    assert legacy == TIER_SIMPLE, "legacy 'simple' must still route to the local tier"
-    assert new == TIER_HAIKU, "Tier.SIMPLE must route to the cheap cloud tier"
-    assert legacy != new, "the simple collision guard has been breached"
+# ── 5. An explicit in-house pick stays in-house ──────────────────────────────
 
 
 def test_local_hint_still_pins_local(monkeypatch: pytest.MonkeyPatch) -> None:

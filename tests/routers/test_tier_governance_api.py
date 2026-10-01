@@ -483,26 +483,12 @@ def test_every_candidate_is_accepted_and_every_omission_rejected(
     _put(client, tier, [])
 
 
-# ── Phase 4: governance_active ──────────────────────────────────────────────
+# ── governance_active ───────────────────────────────────────────────────────
 
 
-def test_governance_is_reported_inactive_by_default(client, monkeypatch):
-    """Phases 3 and 4 change no routing, and the screen must say so."""
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
-    assert client.get(BASE).json()["governance_active"] is False
-
-
-@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on"])
-def test_governance_active_when_the_flag_is_set(client, monkeypatch, raw):
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", raw)
+def test_governance_is_always_reported_active(client):
+    """Since Phase 8 the assignments are the only way a model is chosen."""
     assert client.get(BASE).json()["governance_active"] is True
-
-
-@pytest.mark.parametrize("raw", ["", "0", "false", "off", "no", "maybe"])
-def test_anything_not_clearly_true_reads_as_inactive(client, monkeypatch, raw):
-    """Fail safe: an unparseable value must not claim the runtime is live."""
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", raw)
-    assert client.get(BASE).json()["governance_active"] is False
 
 
 # ── Phase 4 exit criterion ──────────────────────────────────────────────────
@@ -603,13 +589,8 @@ def test_the_router_routes_to_the_model_this_api_reports(client, visible, monkey
     _put(client, "medium", [{"model_id": visible["text"], "priority": 1}])
     invalidate_tier_cache()
 
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
     assert client.get(BASE).json()["governance_active"] is True
 
     decision = ModelRouter().route("a question", model_hint="medium")
     assert decision.tier == TIER_GOVERNED
     assert decision.provider_model_override == expected
-
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
-    assert client.get(BASE).json()["governance_active"] is False
-    assert ModelRouter().route("a question", model_hint="medium").tier != TIER_GOVERNED

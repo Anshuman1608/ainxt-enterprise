@@ -10909,13 +10909,11 @@ def _oai_tool_channel(model_hint: Optional[str], explicit_id: str = "") -> tuple
     """(provider, model_id) for a tool-call turn, or (None, "") to keep today's.
 
     An explicit enabled registry id (``_oai_explicit_model_id``) is served as
-    itself, flag on or off, exactly as the plain-chat lane already does (D90).
+    itself, exactly as the plain-chat lane already does (D90).
 
     Otherwise returns ``(None, "")`` — meaning "leave the existing .env
-    expression exactly as it is" — in three cases, which together are the
-    whole of this function's flag-off parity contract (D57):
+    expression exactly as it is" — in two cases (D57):
 
-      * governance is off;
       * the hint is a USER'S PICK rather than a capability request;
       * nothing assigned to the tier can be addressed by the tools channel.
 
@@ -10944,8 +10942,7 @@ def _oai_tool_channel(model_hint: Optional[str], explicit_id: str = "") -> tuple
             provider = _FAMILY_TO_TOOL_PROVIDER.get(row["family"])
             if provider:
                 return provider, explicit_id
-            # No early return: falling through is what keeps today's answer
-            # in both flag states (the tier's Auto model on, the .env ladder off).
+            # No early return: falling through serves the tier's Auto model.
             logger.warning(
                 "[IDE-TOOLS] %r is a %s model, which has no tool-call channel — "
                 "serving this turn the way it was served before the pick was honoured.",
@@ -10955,13 +10952,9 @@ def _oai_tool_channel(model_hint: Optional[str], explicit_id: str = "") -> tuple
         from core.tiers import Tier as _TCh
         from core.tier_resolver import resolve_tier_candidates as _rtc
         from core.model_registry import is_blocked_model as _is_blocked
-        from core.tiers import governance_enabled as _gov_on
         from models.model_router import _HINT_MAP as _hm, _LEGACY_TO_GOVERNED as _l2g
     except Exception as exc:                      # noqa: BLE001
         logger.debug("[IDE-TOOLS] tier resolution unavailable (%s) — using .env", exc)
-        return None, ""
-
-    if not _gov_on():
         return None, ""
 
     key = (model_hint or "").strip().lower()

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-"""Phase 5 — the precedence inversion, behind TIER_GOVERNANCE_ENABLED.
+"""Phase 5's precedence inversion, unconditional since Phase 8 (D106, D107).
 
-The claim this phase makes is narrow and testable: with the flag ON, a request
-for a CAPABILITY is answered by the administrator's tier assignments; with it
-OFF, by the .env model constants, exactly as before. Everything here exists to
-hold one half of that or the boundary between them.
+A request for a CAPABILITY is answered by the administrator's tier
+assignments, and a tier with nothing eligible raises NoEligibleModel instead of
+falling back to .env model constants. The TIER_GOVERNANCE_ENABLED=off half of
+this file was retired with the switch.
 
 The boundary is the interesting part. Only seven of the router's sixteen
 internal tiers may be governed — see _LEGACY_TO_GOVERNED. Governing one of the
@@ -84,9 +84,6 @@ def world(monkeypatch):
     monkeypatch.setattr(mr, "_resolve_tier_model",
                         lambda env_value, family, tag: f"ENV:{family}/{tag}")
     monkeypatch.setattr(mr, "_tier_label", lambda t: f"LABEL[{t}]")
-    # Fresh per test: the warning is once per PROCESS by design, which would
-    # otherwise make the ordering of tests significant.
-    monkeypatch.setattr(mr, "_ENV_FALLBACK_WARNED", set())
 
     def assign(tier, row_id, priority=100, role=None):
         assignments.append({"tier": tier.value, "model_row_id": row_id,
@@ -97,16 +94,6 @@ def world(monkeypatch):
     w = World()
     w.models, w.assign, w.log, w.gw = models, assign, log, gw
     return w
-
-
-@pytest.fixture
-def on(monkeypatch):
-    monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", "true")
-
-
-@pytest.fixture
-def off(monkeypatch):
-    monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
 
 
 # ── 1. Precedence: the whole point of the phase ─────────────────────────────
@@ -120,7 +107,7 @@ _GOVERNED_HINTS = [
 
 
 @pytest.mark.parametrize("hint,tier", _GOVERNED_HINTS)
-def test_flag_on_selects_the_assignment_not_the_env_constant(world, on, hint, tier):
+def test_a_capability_hint_selects_the_assignment(world, hint, tier):
     modality = "image-in" if tier is Tier.IMAGE_INPUT else "text"
     world.models.append(_model("a", modality=[modality], privacy_class=_EXTERNAL))
     world.assign(tier, "a")
@@ -132,21 +119,11 @@ def test_flag_on_selects_the_assignment_not_the_env_constant(world, on, hint, ti
     assert d.requested_tier is tier
 
 
-@pytest.mark.parametrize("hint,tier", _GOVERNED_HINTS)
-def test_flag_off_ignores_the_assignment_entirely(world, off, hint, tier):
-    modality = "image-in" if tier is Tier.IMAGE_INPUT else "text"
-    world.models.append(_model("a", modality=[modality], privacy_class=_EXTERNAL))
-    world.assign(tier, "a")
-    d = ModelRouter().route("q", model_hint=hint)
-    assert d.tier != mr.TIER_GOVERNED
-    assert d.resolved is None
-
-
 # ── 2. The nine tiers governance must NOT touch ─────────────────────────────
 
 @pytest.mark.parametrize("hint", ["gemini", "opus-4-8", "opus-5", "sonnet-5",
                                   "tera", "luna", "local", "simple", "local_mini"])
-def test_a_users_sku_pick_is_never_resolved_through_a_tier(world, on, hint):
+def test_a_users_sku_pick_is_never_resolved_through_a_tier(world, hint):
     """Governance decides what the PLATFORM picks, never what a user picked.
 
     Each of these names a specific model or a deployment topology. Resolving
@@ -178,32 +155,34 @@ def test_the_role_constant_matches_the_resolvers(world):
     assert mr._ROLE_REVIEW == tr.ROLE_REVIEW
 
 
-# ── 3. Falling back to the env constants ────────────────────────────────────
+# ── 3. An unassigned tier fails loudly (D107) ───────────────────────────────
 
-def test_an_unassigned_tier_falls_back_and_warns_once_per_process(world, on, caplog):
+def test_an_unassigned_tier_raises_instead_of_using_env_models(world):
     world.models.append(_model("a", modality=["text"], privacy_class=_EXTERNAL))
-    # No assignment for medium at all.
-    r = ModelRouter()
-    with caplog.at_level("WARNING"):
-        first = r.route("q", model_hint="medium")
-        second = r.route("q", model_hint="medium")
-    assert first.tier == mr.TIER_MEDIUM and second.tier == mr.TIER_MEDIUM
-    hits = [rec for rec in caplog.records if "DEPRECATED .env model constants" in rec.getMessage()]
-    assert len(hits) == 1, "the fallback warning must not fire once per request"
+    from core.tier_resolver import NoEligibleModel
+    with pytest.raises(NoEligibleModel) as exc:
+        ModelRouter().route("q", model_hint="medium")
+    assert exc.value.tier is Tier.MEDIUM
 
 
-def test_a_resolver_failure_degrades_to_the_legacy_chain(world, on, monkeypatch):
-    """Governance is an improvement, not a new way for routing to break."""
+def test_generate_names_the_screen_that_fixes_it(world):
+    out = ModelRouter().generate("q", model_hint="medium")
+    assert out.startswith("Error:") and "Model Governance" in out
+    assert "cloud provider" not in out          # not the privacy message
+
+
+def test_a_resolver_failure_is_reported_not_routed_around(world, monkeypatch):
     def _boom(*a, **kw):
         raise RuntimeError("registry down")
     monkeypatch.setattr(tr, "resolve_tier_candidates", _boom)
-    d = ModelRouter().route("q", model_hint="complex")
-    assert d.tier == mr.TIER_COMPLEX
+    from core.tier_resolver import NoEligibleModel
+    with pytest.raises(NoEligibleModel, match="registry down"):
+        ModelRouter().route("q", model_hint="complex")
 
 
 # ── 4. §M.1 — privacy as a constraint, not a tier rewrite ───────────────────
 
-def test_confidential_data_keeps_its_tier_and_narrows_the_candidates(world, on):
+def test_confidential_data_keeps_its_tier_and_narrows_the_candidates(world):
     world.models.append(_model("cloud", modality=["text"], privacy_class=_EXTERNAL))
     world.models.append(_model("onprem", family="ollama", modality=["text"],
                                privacy_class=_LOCAL))
@@ -217,7 +196,7 @@ def test_confidential_data_keeps_its_tier_and_narrows_the_candidates(world, on):
     assert d.provider_model_override == "model-onprem"
 
 
-def test_confidential_data_fails_closed_when_nothing_is_deployment_local(world, on):
+def test_confidential_data_fails_closed_when_nothing_is_deployment_local(world):
     world.models.append(_model("cloud", modality=["text"], privacy_class=_EXTERNAL))
     world.assign(Tier.COMPLEX, "cloud")
     world.assign(Tier.MEDIUM, "cloud")     # the ladder's next rung, also external
@@ -227,7 +206,7 @@ def test_confidential_data_fails_closed_when_nothing_is_deployment_local(world, 
         ModelRouter().route("q", model_hint="complex", data_classification="RESTRICTED")
 
 
-def test_generate_turns_a_fail_closed_resolution_into_an_error_string(world, on):
+def test_generate_turns_a_fail_closed_resolution_into_an_error_string(world):
     """generate()'s contract is that it never raises, including here."""
     world.models.append(_model("cloud", modality=["text"], privacy_class=_EXTERNAL))
     world.assign(Tier.COMPLEX, "cloud")
@@ -237,7 +216,7 @@ def test_generate_turns_a_fail_closed_resolution_into_an_error_string(world, on)
     assert world.log == [], "no gateway may be called for a fail-closed turn"
 
 
-def test_privacy_never_walks_the_fallback_ladder(world, on):
+def test_privacy_never_walks_the_fallback_ladder(world):
     """A weaker tier's model is still a model that may be external (§M.5)."""
     world.models.append(_model("onprem", family="ollama", modality=["text"],
                                privacy_class=_LOCAL))
@@ -249,7 +228,7 @@ def test_privacy_never_walks_the_fallback_ladder(world, on):
 
 # ── 5. §M.2 — context size filters the tier, it no longer switches tier ─────
 
-def test_a_large_context_picks_a_wide_model_within_the_same_tier(world, on):
+def test_a_large_context_picks_a_wide_model_within_the_same_tier(world):
     world.models.append(_model("narrow", modality=["text"], privacy_class=_EXTERNAL,
                                context_window=8_000))
     world.models.append(_model("wide", modality=["text"], privacy_class=_EXTERNAL,
@@ -262,7 +241,7 @@ def test_a_large_context_picks_a_wide_model_within_the_same_tier(world, on):
     assert d.provider_model_override == "model-wide"
 
 
-def test_a_small_context_keeps_the_admins_priority_order(world, on):
+def test_a_small_context_keeps_the_admins_priority_order(world):
     world.models.append(_model("narrow", modality=["text"], privacy_class=_EXTERNAL,
                                context_window=8_000))
     world.models.append(_model("wide", modality=["text"], privacy_class=_EXTERNAL,
@@ -275,7 +254,7 @@ def test_a_small_context_keeps_the_admins_priority_order(world, on):
 
 # ── 6. §M.5 — within-tier fallback happens at DISPATCH time ─────────────────
 
-def test_a_failing_candidate_yields_to_the_next_one(world, on, monkeypatch):
+def test_a_failing_candidate_yields_to_the_next_one(world, monkeypatch):
     """The resolver filters candidates whose breaker is ALREADY open. A call
     that fails right now is a different question, and only the dispatcher can
     answer it — one failure does not open a breaker."""
@@ -310,14 +289,7 @@ def test_a_failing_candidate_yields_to_the_next_one(world, on, monkeypatch):
 
 # ── 7. §L.5 — the audit columns ─────────────────────────────────────────────
 
-def test_the_legacy_path_records_no_provenance(world, off):
-    r = ModelRouter()
-    r.generate("q", model_hint="complex")
-    assert r.last_selection_mode is None
-    assert r.last_requested_tier is None
-
-
-def test_walking_the_ladder_is_recorded_as_fallback(world, on):
+def test_walking_the_ladder_is_recorded_as_fallback(world):
     world.models.append(_model("m", modality=["text"], privacy_class=_EXTERNAL))
     world.assign(Tier.MEDIUM, "m")          # complex is unassigned; the ladder runs
     r = ModelRouter()
@@ -328,7 +300,7 @@ def test_walking_the_ladder_is_recorded_as_fallback(world, on):
 
 # ── 8. The modality tiers reach a real dispatch for the first time ──────────
 
-def test_video_generation_dispatches_when_a_model_can_serve_it(world, on):
+def test_video_generation_dispatches_when_a_model_can_serve_it(world):
     world.models.append(_model("veo", family="gemini", modality=["video-out"],
                                privacy_class=_EXTERNAL))
     world.assign(Tier.VIDEO_GENERATION, "veo")
@@ -336,7 +308,7 @@ def test_video_generation_dispatches_when_a_model_can_serve_it(world, on):
     assert d.provider_model_override == "model-veo"
 
 
-def test_image_output_raises_rather_than_substituting_a_text_model(world, on):
+def test_image_output_raises_rather_than_substituting_a_text_model(world):
     """Nothing substitutes for image generation, so there is no ladder to walk.
 
     A caller that asked for an image and received prose gets a confusing wrong

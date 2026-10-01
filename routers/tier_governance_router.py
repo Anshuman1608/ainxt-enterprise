@@ -42,7 +42,6 @@ from core.tiers import (
     TIER_LABEL,
     TIER_USED_BY,
     Tier,
-    governance_enabled,
 )
 
 router = APIRouter(prefix="/model-governance", tags=["tier-governance"])
@@ -112,26 +111,11 @@ def _parse_tier(value: str) -> Tier:
 
 
 def _governance_active() -> bool:
-    """Is the runtime actually resolving models through these assignments yet?
+    """Always True since Phase 8: assignments are the only way a model is chosen.
 
-    False for the whole of Phases 3 and 4: models/model_router.py is untouched
-    and still reads the env constants, so an assignment saved here changes what
-    GET /tiers/resolved reports but changes nothing about live routing. Phase 5
-    introduces TIER_GOVERNANCE_ENABLED and flips this on.
-
-    The admin screen has no other way to tell the difference — both states look
-    identical from the client — and an admin who reassigns a tier believing it
-    took effect is worse off than one with no screen at all. So the server says
-    which it is, and the banner disappears on its own when Phase 5 lands rather
-    than depending on someone remembering to delete it.
-
-    Delegates to core.tiers, which owns the parse. It used to be inlined here
-    to keep this router's import surface narrow, but core.tiers is a
-    stdlib-only leaf, so there is no surface to protect — and three
-    independent copies of one env rule is how the screen comes to report a
-    state the router is not in.
+    Still reported so existing clients reading `governance_active` keep working.
     """
-    return governance_enabled()
+    return True
 
 
 def _assignments_by_tier(db) -> dict[str, list[dict]]:
