@@ -1,0 +1,60 @@
+# Fork-only CodeQL. Lives on the fork's default branch only; workflow_run
+# always reads this file from there, so feature branches never carry it.
+name: CodeQL (fork)
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch to scan"
+        required: true
+        default: "main"
+
+concurrency:
+  group: codeql-${{ github.event.workflow_run.head_branch || inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # Scan pushes to this fork only, not runs triggered by PRs from elsewhere.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript, actions]
+    env:
+      SCAN_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/heads/{0}', inputs.ref) || format('refs/heads/{0}', github.event.workflow_run.head_branch) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.ref }}
+
+      - name: Resolve commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
+          # Attribute results to the scanned branch, not the default branch.
+          ref: ${{ env.SCAN_REF }}
+          sha: ${{ steps.sha.outputs.sha }}
