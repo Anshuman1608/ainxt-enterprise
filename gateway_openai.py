@@ -14,7 +14,6 @@ from core.logger import logger, get_request_id as _get_request_id
 from agents.compliance_engine import compliance_engine
 
 
-from core.model_registry import OPENAI_PRIMARY_MODEL, OPENAI_IMAGE_MODEL
 
 
 def _resolve_provider_base_url(family: str, env_var: str):
@@ -29,7 +28,16 @@ def _resolve_provider_base_url(family: str, env_var: str):
     except Exception:
         return (os.getenv(env_var) or "").strip() or None
 
-MODEL = OPENAI_PRIMARY_MODEL
+
+def _tier_openai_model(tier_name: str) -> str:
+    from core.tiers import Tier
+    from core.tier_resolver import family_model
+    return family_model(Tier(tier_name), "openai")
+
+
+def _default_model() -> str:
+    """Model for a call that names none: the medium tier's OpenAI model (§I.2)."""
+    return _tier_openai_model("medium")
 
 # Gap #2 (7/7): stream reasoning deltas live when the model actually exposes
 # reasoning text (o-series / providers that set delta.reasoning or
@@ -103,7 +111,7 @@ def _log_cache_effectiveness(
 
     Derives the per-token cost from core.model_registry.rates_for (the single source of truth)
     so savings estimates stay accurate when model pricing changes in the registry.
-    Local/in-house models (e.g. OPENAI_OSS_MODEL) have (0.0, 0.0) rates → savings = 0.
+    Local/in-house models have (0.0, 0.0) rates → savings = 0.
     OpenAI has no explicit cache_creation concept — caching is automatic and transparent.
     Always emitted so zero-cache calls are also visible in logs.
     """
@@ -216,7 +224,7 @@ class OpenAIGateway:
         non-/ask caller (image-gen, follow-up suggestion, SDLC, etc.).
         """
 
-        _model = model or MODEL
+        _model = model or _default_model()
         _upstream = _get_request_id()
         request_id = _upstream if _upstream and _upstream != "-" else str(uuid.uuid4())
 
@@ -396,7 +404,7 @@ class OpenAIGateway:
             context: str,
             tools: list,
             tool_executor,
-            model: str = MODEL,
+            model: str = "",
             max_tokens: int = 8000,
             max_tool_rounds: int = 8,
     ) -> str:
@@ -419,6 +427,7 @@ class OpenAIGateway:
         logger.info(f"{request_id} → OPENAI TOOL-USE START tools={tool_names}")
 
         from core.prompt_sanitizer import sanitize as _sanitize
+        model = model or _default_model()
         system_prompt = _sanitize(system_prompt)
         user_message  = _sanitize(user_message)
         context       = _sanitize(context) if context else context
@@ -604,7 +613,7 @@ def _anthropic_to_openai_tools(tools: list) -> list:
 
         def _call():
             return self.client.images.generate(
-                model=OPENAI_IMAGE_MODEL,
+                model=_tier_openai_model("image-output"),
                 prompt=f"{safe_prompt}. Photorealistic, professional quality, landscape orientation, no text, no watermarks.",
                 size=size,
                 quality="standard",
@@ -673,8 +682,10 @@ def generate_with_image_openai(
         ],
     })
 
+    _vision_model = _tier_openai_model("image-input")
+
     def _call():
-        return gw.client.chat.completions.create(model=MODEL, messages=messages)
+        return gw.client.chat.completions.create(model=_vision_model, messages=messages)
 
     breaker  = get_breaker("openai")
     response = breaker.call(retry_llm, _call)
@@ -683,5 +694,5 @@ def generate_with_image_openai(
     out_tok = getattr(response.usage, "completion_tokens", 0) if response.usage else 0
     output  = response.choices[0].message.content or "" if response.choices else ""
 
-    logger.info(f"[OPENAI VISION] model={MODEL} in={in_tok} out={out_tok}")
+    logger.info(f"[OPENAI VISION] model={_vision_model} in={in_tok} out={out_tok}")
     return output, in_tok, out_tok

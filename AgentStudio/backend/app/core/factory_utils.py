@@ -67,12 +67,10 @@ def resolve_factory_model() -> str:
     """Resolve the factory's own LLM model at CALL time.
 
     Delegates to ``app.core.config.factory_model()`` — the single source of
-    truth for this resolution (env override → core.llm_provider_registry's
-    configured default → legacy env fallback) — rather than duplicating that
-    chain here. Calling through a function (not a module-level constant)
-    still means an operator can fix ``FACTORY_MODEL`` in ``.env`` or change
-    the admin-configured default and have a ``--reload`` gateway pick it up
-    without a full process restart; the old import-time constant could go
+    truth for this resolution (core.llm_provider_registry's configured
+    default) — rather than duplicating it here. Calling through a function
+    (not a module-level constant) means a change to the admin-configured
+    default is picked up without a full process restart; the old import-time constant could go
     stale when only some modules were reloaded, which surfaced as the agent
     factory still calling a decommissioned default (``claude-sonnet-4-6``)
     after the workflow factory had already switched.
@@ -81,11 +79,9 @@ def resolve_factory_model() -> str:
     return _factory_model()
 
 
-# Back-compat: some call sites import ``FACTORY_MODEL`` directly. Keep it as a
-# snapshot of the resolved value, but prefer ``resolve_factory_model()`` /
-# ``build_factory_llm_config()`` (which read the env fresh) anywhere the value
-# must survive a live ``.env`` edit.
-FACTORY_MODEL: str = resolve_factory_model()
+# Snapshot of the resolved value for call sites that import a constant; prefer
+# ``resolve_factory_model()`` / ``build_factory_llm_config()`` (read fresh).
+DEFAULT_FACTORY_MODEL: str = resolve_factory_model()
 
 
 def build_factory_llm_config(

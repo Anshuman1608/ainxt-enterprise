@@ -7926,39 +7926,6 @@ def _part_aa15_codewiki_docs_approval_workflow_2026_09_03():
     print("  ✓ Part AA15: codewiki_doc_jobs approval-workflow columns added (requested_by, product_id, reviewed_by, reviewed_at, review_note)")
 
 
-# Role-constant → (family, tier_tags, billing_tier) used ONLY by the one-time
-# backfill below. This is the one deliberate hardcoded mapping in the whole
-# LLM-provider-config feature — its entire purpose is migrating deployments
-# OFF the env-var/hardcoded-literal model system and into the DB-backed
-# llm_providers/llm_models tables that core/llm_provider_registry.py reads.
-# New models added after this migration are never added here — they go
-# through the admin "LLM Providers" screen instead.
-_AC1_MODEL_ROLE_TAGS = {
-    "CLAUDE_PRIMARY_MODEL":     ("anthropic", ["complex", "claude", "sonnet"], "paid"),
-    "CLAUDE_HAIKU":             ("anthropic", ["haiku"], "paid"),
-    "CLAUDE_OPUS_MODEL":        ("anthropic", ["solution", "opus"], "paid"),
-    "CLAUDE_OPUS_48_MODEL":     ("anthropic", ["opus-4-8", "opus"], "paid"),
-    "CLAUDE_OPUS_5_MODEL":      ("anthropic", ["opus-5", "opus"], "paid"),
-    "CLAUDE_SONNET_5_MODEL":    ("anthropic", ["sonnet-5"], "paid"),
-    "OPENAI_SIMPLE_MODEL":      ("openai", ["simple", "mini"], "paid"),
-    "OPENAI_CODING_MODEL":      ("openai", ["medium", "coding"], "paid"),
-    "OPENAI_LATEST_MODEL":      ("openai", ["deep", "latest"], "paid"),
-    "OPENAI_TERA_MODEL":        ("openai", ["gpt56-tera"], "paid"),
-    "OPENAI_LUNA_MODEL":        ("openai", ["gpt56-luna"], "paid"),
-    "OPENAI_OSS_MODEL":         ("openai", ["oss"], "free"),
-    "GEMINI_TEXT_MODEL":        ("gemini", ["gemini", "coding"], "paid"),
-    "GEMINI_CODING_LITE_MODEL": ("gemini", ["gemini-lite"], "paid"),
-    "GEMINI_IMAGE_MODEL":       ("gemini", ["vision", "image-gen"], "paid"),
-    "VEO_MODEL":                ("gemini", ["video"], "paid"),
-    # LOCAL_LLM_MODEL_NAME deliberately excluded: unlike every other constant
-    # here (which default to "" and are skipped when unset), it defaults to
-    # the literal placeholder string "local-llm" — not a real, callable
-    # Ollama/local-proxy model name — so seeding it always created a bogus
-    # "local-llm" model row that admins could select but that could never
-    # actually be dispatched. Real local models come from the admin's
-    # "Sync installed models" / "Pull a new model" actions instead.
-}
-
 # Deterministic provider rows seeded when the corresponding credential/base-url
 # env var is present. Matches core/model_registry.py's four supported families
 # (see docs/PROVIDERS.md) — install.sh's db/bootstrap_llm_providers.py seeds
@@ -8115,10 +8082,11 @@ def _part_ac1_llm_provider_seed_2026_09_01():
                     db.flush()
                     print(f"  + seeded llm_providers row '{spec['slug']}' (family={spec['family']})")
 
-                for const_name, (family, tags, billing_tier) in _AC1_MODEL_ROLE_TAGS.items():
+                from db.phase8_env_prices import AC1_MODEL_ROLE_TAGS
+                for const_name, (family, tags, billing_tier) in AC1_MODEL_ROLE_TAGS.items():
                     if family != spec["family"]:
                         continue
-                    model_id = getattr(_mr, const_name, "") or ""
+                    model_id = (os.getenv(const_name) or "").strip()
                     if not model_id:
                         continue
                     dup = (
@@ -8232,7 +8200,7 @@ def _part_ac3_remove_bogus_local_llm_seed_2026_09_01():
     2026-09-01 — Delete the bogus "local-llm" model row Part AC1 used to seed
     under every Ollama-family provider.
 
-    LOCAL_LLM_MODEL_NAME (unlike every other constant Part AC1 reads)
+    The local placeholder model name (unlike every other variable Part AC1 reads)
     defaults to the literal placeholder string "local-llm", not a real,
     callable Ollama/local-proxy model name — so any deployment that ran the
     old Part AC1 got a selectable-but-nonfunctional "local-llm" entry in the
@@ -8274,14 +8242,10 @@ def _part_ae1_price_backfill_2026_10_01(environ=None):
     core.model_registry.rates_for, which reads capabilities.cost_per_1m_*.
     IDEMPOTENT and NEVER OVERWRITES: only rows with no price are touched.
     """
-    from db.phase8_env_prices import env_prices
+    from db.phase8_env_prices import env_prices, env_video_price
     env = os.environ if environ is None else environ
     prices = env_prices(env)
-    veo = (env.get("VEO_MODEL") or "").strip()
-    try:
-        veo_rate = float(env.get("VEO_COST_PER_SECOND") or "0.40")
-    except ValueError:
-        veo_rate = 0.40
+    veo, veo_rate = env_video_price(env)
     if not prices and not veo:
         print("  (skipped) Part AE1: no .env-era model ids set")
         return
@@ -8481,36 +8445,6 @@ def _part_ad1_tier_models_2026_09_25():
         need = MODALITY_REQUIREMENT[tier]
         return need in _modality_of(model.get("capabilities"))
 
-    # Each tier's resolution as the platform performs it TODAY. `_role_model`
-    # is core.model_registry's mirror of models/model_router._resolve_tier_model
-    # — same env-override → tier_tags → any-model-of-family chain — used here
-    # so the migration need not import the router (which pulls in the whole
-    # gateway stack). `tag` uses Part AC1's _AC1_MODEL_ROLE_TAGS vocabulary.
-    #
-    # IMPORTANT: this is NOT Phase 1's _TIER_TO_LEGACY_HINT. That map stubs
-    # IMAGE_OUTPUT and VIDEO_GENERATION onto "vision" because image and video
-    # generation bypass the router entirely today, which is harmless for a
-    # no-op translation but would seed the wrong model here.
-    def _legacy_pick(tier) -> str:
-        if tier == Tier.MINI:
-            return _reg._role_model(_reg.OPENAI_SIMPLE_MODEL, "openai", "simple")
-        if tier in (Tier.SIMPLE, Tier.INTENT_CLASSIFICATION):
-            return _reg._role_model(_reg.CLAUDE_HAIKU, "anthropic", "haiku")
-        if tier == Tier.MEDIUM:
-            return _reg._role_model(_reg.OPENAI_CODING_MODEL, "openai", "medium")
-        if tier == Tier.COMPLEX:
-            return _reg._role_model(_reg.CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
-        if tier == Tier.IMAGE_INPUT:
-            return _reg._role_model(_reg.GEMINI_IMAGE_MODEL, "gemini", "vision")
-        if tier == Tier.IMAGE_OUTPUT:
-            return _reg._role_model(_reg.GEMINI_IMAGE_MODEL, "gemini", "image-gen")
-        if tier == Tier.VIDEO_GENERATION:
-            try:
-                return _reg.veo_model()
-            except Exception:
-                return ""
-        return ""
-
     db = SessionLocal()
     try:
         try:
@@ -8525,14 +8459,6 @@ def _part_ad1_tier_models_2026_09_25():
                   "left unassigned (configure providers in the admin screen)")
             return
 
-        # model_id (the provider API string) → row. Ambiguous when two enabled
-        # providers expose the same string, so apply get_model()'s documented
-        # convention: lowest sort_order, then earliest created_at — which is
-        # already the order get_enabled_models() returns, so first wins.
-        by_model_id: dict = {}
-        for m in models:
-            by_model_id.setdefault(m["model_id"], m)
-
         existing = {
             row[0] for row in db.execute(_sa_text(
                 f"SELECT DISTINCT tier FROM {DB_SCHEMA}.llm_tier_models "
@@ -8546,22 +8472,12 @@ def _part_ad1_tier_models_2026_09_25():
                 skipped.append(tier.value)
                 continue
 
-            pick = by_model_id.get((_legacy_pick(tier) or "").strip())
-            if pick is not None and not _satisfies(pick, tier):
-                # The legacy chain named a model that cannot do this tier's
-                # job (e.g. a text model for image-output). Discard it rather
-                # than writing a row the resolver would have to reject anyway.
-                pick = None
-
-            if pick is None:
-                # Fall back within the tier's capability requirement, never
-                # across it. For the four text tiers this is effectively
-                # get_default_model_id(); for the three modality tiers it is a
-                # genuine capability match, and finding nothing means the
-                # deployment truly cannot serve that tier.
-                eligible = [m for m in models if _satisfies(m, tier)]
-                pick = next((m for m in eligible if m.get("is_default")),
-                            eligible[0] if eligible else None)
+            # Vendor-neutral (Phase 8 removed the .env pick): the registry's
+            # default model if it can do this tier's job, else the first one
+            # that can. Finding nothing means the deployment cannot serve it.
+            eligible = [m for m in models if _satisfies(m, tier)]
+            pick = next((m for m in eligible if m.get("is_default")),
+                        eligible[0] if eligible else None)
 
             if pick is None:
                 unassigned.append(tier.value)

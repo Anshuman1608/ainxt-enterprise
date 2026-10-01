@@ -7,26 +7,21 @@
 # in-house models (vLLM, Ollama, TGI, etc.) behind a single URL.
 #
 # Model Discovery:
-#   On first call (or after TTL expiry), GET /v1/models is fetched
-#   and the returned list is assigned to tiers:
+#   On first call (or after TTL expiry), GET /v1/models is fetched and
+#   each model gets a size bucket. The bucket is a catalogue hint only:
+#   which model serves a tier is the Tiers screen's decision (Phase 8).
 #
-#   Priority 1 — Explicit env vars (comma-separated, first = preferred):
-#     LOCAL_SIMPLE_MODELS   e.g. "llama3-8b,mistral-7b"
-#     LOCAL_MEDIUM_MODELS   e.g. "llama3-70b,mixtral-8x7b"
-#     LOCAL_COMPLEX_MODELS  e.g. "llama3-405b,command-r-plus"
-#
-#   Priority 2 — Size heuristic from model name:
+#   Size heuristic from model name:
 #     Params ≥ 30B  → complex
 #     Params 10-30B → medium
 #     Params < 10B  → simple
 #     No param hint → medium (safe default)
 #
-#   Priority 3 — If only one model: use it for all tiers.
+#   If only one model: use it for all buckets.
 #
 # Config (set in .env):
 #   LOCAL_LLM_BASE_URL   http://gpu01:4000          (required)
 #   LOCAL_LLM_API_KEY    sk-...                      (required if auth enabled)
-#   LOCAL_SIMPLE_MODELS  / LOCAL_MEDIUM_MODELS / LOCAL_COMPLEX_MODELS
 #   LOCAL_MODEL_REFRESH_SECS  (default 300)          (model list TTL)
 #
 # Backward compatibility: LOCAL_LLM_BASE_URL falls back to LITELLM_BASE_URL
@@ -62,11 +57,6 @@ try:
     LOCAL_LLM_TEMPERATURE = float(os.getenv("LOCAL_LLM_TEMPERATURE", "0.3"))
 except (TypeError, ValueError):
     LOCAL_LLM_TEMPERATURE = 0.3
-
-# Per-tier model preferences (comma-separated, priority order)
-_ENV_SIMPLE  = [m.strip() for m in os.getenv("LOCAL_SIMPLE_MODELS",  "").split(",") if m.strip()]
-_ENV_MEDIUM  = [m.strip() for m in os.getenv("LOCAL_MEDIUM_MODELS",  "").split(",") if m.strip()]
-_ENV_COMPLEX = [m.strip() for m in os.getenv("LOCAL_COMPLEX_MODELS", "").split(",") if m.strip()]
 
 # Models to hide from Chat/IDE UI (comma-separated exact IDs or substrings).
 # LOCAL_HIDDEN_MODELS env var lets admins add extra entries.
@@ -172,6 +162,19 @@ _ESTIMATE_CHARS_PER_TOKEN = 4
 _MAX_TOKENS_SAFETY_MARGIN = 512  # headroom for chat-template / special tokens
 
 
+def _local_vision_model() -> Optional[str]:
+    """First enabled deployment-local registry model that accepts images (§I.2: modality, not env)."""
+    try:
+        from core.llm_provider_registry import get_enabled_models
+        for m in get_enabled_models():
+            caps = m.get("capabilities") or {}
+            if "image-in" in (caps.get("modality") or []) and caps.get("privacy_class") == "deployment_local":
+                return m["model_id"]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"local vision model lookup failed: {exc}")
+    return None
+
+
 def _estimate_tokens(text: str) -> int:
     """Char/4 token estimate — same heuristic gateway.py uses elsewhere."""
     return max(1, len(text) // _ESTIMATE_CHARS_PER_TOKEN)
@@ -267,8 +270,6 @@ class _ModelCatalog:
             # _catalog.pick() (which returns candidates[0]) can return a different
             # model on each call when the backend load-balancer serves /v1/models
             # from different nodes that return models in different orders.
-            # Env-var-pinned models (_ENV_SIMPLE/MEDIUM/COMPLEX) are already
-            # deterministic; only the heuristic-classified remainder is affected.
             model_ids.sort()
             logger.debug(
                 "Local LLM: %d raw model(s), %d after embed/rerank filter: %s",
@@ -278,23 +279,9 @@ class _ModelCatalog:
             # Build tier → [model_id] map
             by_tier: dict = {"simple": [], "medium": [], "complex": []}
 
-            # Honour explicit env-var preferences first (models must be in the live list)
-            live_set = set(model_ids)
-            for mid in _ENV_SIMPLE:
-                if mid in live_set:
-                    by_tier["simple"].append(mid)
-            for mid in _ENV_MEDIUM:
-                if mid in live_set:
-                    by_tier["medium"].append(mid)
-            for mid in _ENV_COMPLEX:
-                if mid in live_set:
-                    by_tier["complex"].append(mid)
-
-            # Classify remaining models by size heuristic
-            assigned = set(by_tier["simple"] + by_tier["medium"] + by_tier["complex"])
+            # Classify by size heuristic
             for mid in model_ids:
-                if mid not in assigned:
-                    by_tier[_tier_from_name(mid)].append(mid)
+                by_tier[_tier_from_name(mid)].append(mid)
 
             # If only one model in the deployment — use it for all tiers
             if len(model_ids) == 1:
@@ -446,13 +433,13 @@ class LocalLLMGateway:
         self._last_selected_model = selected
 
         # Validate explicit model override against the live catalog.
-        # A mismatch means the caller (e.g. CHAT_FALLBACK_CHAIN) has a stale or
-        # wrong model name — warn loudly so it surfaces in logs before the API 403s.
+        # A mismatch means the caller has a stale or wrong model name — warn
+        # loudly so it surfaces in logs before the API 403s.
         if model and _catalog._all and model not in _catalog._all:
             logger.warning(
                 "Local LLM: requested model %r is NOT in the live catalog %s — "
                 "the API call will likely fail with 403. "
-                "Check CHAT_FALLBACK_CHAIN / LOCAL_*_MODELS env vars.",
+                "Check the model's registry row and the Tiers screen.",
                 model, _catalog._all,
             )
 
@@ -594,21 +581,20 @@ def generate_with_image_local(
     Send a prompt + base64 image to a vision-capable in-house hosted model.
     Uses the OpenAI-compatible /v1/chat/completions endpoint on LOCAL_LLM_BASE_URL.
 
-    model: explicit model override (e.g. "Kimi-k2.5", "glm-4.5v").
-           Falls back to the first entry in LOCAL_VISION_MODELS env var.
+    model: explicit model override (e.g. "Kimi-k2.5", "glm-4.5v"). Otherwise the
+           first enabled deployment-local registry model whose modality has image-in.
     Returns (text, in_tok, out_tok).
     """
     if not LOCAL_LLM_BASE_URL:
         raise RuntimeError("LOCAL_LLM_BASE_URL not configured — cannot call local vision model")
 
-    from core.model_registry import LOCAL_VISION_MODELS
     from core.prompt_sanitizer import sanitize as _sanitize
 
-    selected = model or (LOCAL_VISION_MODELS[0] if LOCAL_VISION_MODELS else None)
+    selected = model or _local_vision_model()
     if not selected:
         raise RuntimeError(
-            "No local vision model available. "
-            "Set LOCAL_VISION_MODELS env var (e.g. 'glm-4.5v,Kimi-k2.5')."
+            "No local vision model available. Give a deployment-local model the "
+            "image-in modality in Admin > LLM Providers."
         )
 
     safe_prompt = _sanitize(prompt)

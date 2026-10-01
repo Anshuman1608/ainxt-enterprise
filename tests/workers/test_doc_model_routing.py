@@ -194,19 +194,6 @@ def test_doc_intent_model_no_longer_silently_steers_titling(monkeypatch):
         importlib.reload(dw)
 
 
-def test_doc_intent_model_is_still_honoured_as_a_deprecated_fallback(monkeypatch):
-    """No deployment changes behaviour on upgrade just because the variable
-    was renamed."""
-    monkeypatch.setenv("DOC_INTENT_MODEL", "legacy-title-model")
-    import importlib
-    importlib.reload(dw)
-    try:
-        assert dw._title_route() == {"model_hint": "legacy-title-model"}
-    finally:
-        monkeypatch.delenv("DOC_INTENT_MODEL", raising=False)
-        importlib.reload(dw)
-
-
 # ── 7. No vendor pin survives anywhere in the pipeline ────────────────────
 
 

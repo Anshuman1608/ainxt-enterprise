@@ -657,8 +657,6 @@ def _mirror_code_nodes_to_kg(repo_name: str, nodes: list[dict],
     except Exception as e:
         logger.warning(f"index_worker: KG mirror failed: {e}")
 
-_ENRICH_MODEL = os.getenv("ENRICH_MODEL", "")   # set via ENRICH_MODEL in .env — no code default
-
 # §N.1 step 6 — chunk enrichment is the platform's highest-volume LLM consumer
 # (one call per code chunk per indexed repo) and until now nothing governed it:
 # ENRICH_MODEL is empty on a default install, and ModelRouter.route() gates its
@@ -666,8 +664,7 @@ _ENRICH_MODEL = os.getenv("ENRICH_MODEL", "")   # set via ENRICH_MODEL in .env �
 # entirely and every chunk was complexity-classified individually.
 #
 # It now asks for Tier.SIMPLE — short bounded output that still needs reliable
-# instruction-following, which is SIMPLE as against MINI. An explicit
-# ENRICH_MODEL still wins (a named model is a human decision).
+# instruction-following, which is SIMPLE as against MINI.
 #
 # WHAT THIS SENDS WHERE. The prompt contains source code. On a deployment whose
 # `simple` tier holds a cloud model, enrichment egresses every indexed chunk to
@@ -677,7 +674,6 @@ _ENRICH_MODEL = os.getenv("ENRICH_MODEL", "")   # set via ENRICH_MODEL in .env �
 _ENRICH_NO_CLOUD_EGRESS = (os.getenv("ENRICH_NO_CLOUD_EGRESS", "").strip().lower()
                            in ("1", "true", "yes", "on"))
 # ── Constants ──────────────────────────────────────────────────
-ENRICH_MODEL       = _ENRICH_MODEL
 LOCK_TTL           = 43200        # 12 hours — 100k+ vector repos run 10+ hours
 CHUNK_SIZE         = 512          # tokens (approximated as chars / 4)
 CHUNK_OVERLAP      = 64
@@ -769,18 +765,8 @@ def _enrich_chunk(chunk: dict) -> dict:
 
         # ── Cache miss: call LLM ──────────────────────────────────
         prompt      = _ENRICH_PROMPT.format(code=code)
-        if ENRICH_MODEL:
-            # Operator pinned a model — an explicit choice outranks a tier.
-            _route_kwargs = {"model_hint": ENRICH_MODEL}
-        else:
-            # legacy_hint is "haiku" rather than an exact reproduction of the
-            # old behaviour, because there isn't one: the old behaviour was
-            # "no hint at all" (auto-classify per chunk) and no _HINT_MAP key
-            # means that. So governance-off moves from auto to Haiku here —
-            # the one place in the migration where D15 is approximated rather
-            # than guaranteed, and it is called out rather than papered over.
-            _route_kwargs = {"tier": Tier.SIMPLE, "legacy_hint": "haiku",
-                             "no_cloud_egress": _ENRICH_NO_CLOUD_EGRESS}
+        _route_kwargs = {"tier": Tier.SIMPLE, "legacy_hint": "haiku",
+                         "no_cloud_egress": _ENRICH_NO_CLOUD_EGRESS}
         description = _mr.generate(prompt, **_route_kwargs).strip()
         if description and len(description) > 10:
             enriched = f"{description}\n\n{content}"

@@ -20,14 +20,13 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 from core.logger import logger
 
-# Which local model disambiguates fuzzy references ("that doc"). Fast, in-house.
-_REF_MODEL_HINT = (os.getenv("DOC_INTENT_MODEL", "") or "local").strip() or "local"
+# Fuzzy references ("that doc") are resolved in-house: "local" = simple tier, no cloud egress.
+_REF_MODEL_HINT = "local"
 
 
 @dataclass

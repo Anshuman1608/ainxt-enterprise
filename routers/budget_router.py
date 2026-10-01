@@ -282,7 +282,6 @@ def _build_model_alias_map() -> dict[str, str]:
     upstream to derive them from.
     """
     try:
-        from core.model_registry import CLAUDE_HAIKU
         from core.tiers import LEGACY_INBOUND_ALIASES as _HINTS
         from models.model_router import hint_to_model_id
     except ImportError:
@@ -313,7 +312,6 @@ def _build_model_alias_map() -> dict[str, str]:
         # ── auto-select placeholders → single bucket ─────────────────────
         "auto_select": "auto",
         # ── date-suffix variants → base model id ─────────────────────────
-        CLAUDE_HAIKU: CLAUDE_HAIKU,
         # Legacy date-suffixed ids that may still exist in stored rows, logs or
         # saved workspace configs. The Anthropic API does not accept a date
         # suffix on these models, so they are normalised to the base id rather
@@ -323,7 +321,7 @@ def _build_model_alias_map() -> dict[str, str]:
         # ── inline-comment artefact from "deepseek-v4-flash  # fast (~7s)" ─
         "~7s": "deepseek-v4-flash",
     })
-    # An env constant that is unset resolves to "", which would collapse
+    # A hint that resolves to nothing gives "", which would collapse
     # unrelated rows onto a single empty bucket. Drop those.
     aliases = {k: v for k, v in aliases.items() if k and v}
 

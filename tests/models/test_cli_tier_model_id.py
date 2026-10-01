@@ -48,18 +48,6 @@ class _Cand:
         self.family = family
 
 
-@pytest.fixture(autouse=True)
-def _quiet_warn_cache():
-    """The fallback warning is deduplicated per (tier, reasons) for the life of
-    the process — a pipeline resolving one phase forty times should log once,
-    not forty times. Cleared between tests so each one can observe it."""
-    mr._CLI_TIER_FALLBACK_WARNED.clear()
-    mr._CLI_OVERRIDE_WARNED.clear()
-    yield
-    mr._CLI_TIER_FALLBACK_WARNED.clear()
-    mr._CLI_OVERRIDE_WARNED.clear()
-
-
 @pytest.fixture
 def governed(monkeypatch):
     """A settable candidate list (governance is always on since Phase 8)."""
@@ -72,7 +60,6 @@ def governed(monkeypatch):
         return list(box["candidates"])
 
     monkeypatch.setattr("core.tier_resolver.resolve_tier_candidates", _resolve)
-    monkeypatch.setattr(mr, "LLM_PROVIDER", "cloud")
     return box
 
 
@@ -235,91 +222,52 @@ def test_a_blocked_candidate_is_skipped(governed, cli_config):
     assert mr.cli_tier_model_id(Tier.COMPLEX, "complex") == "known-model"
 
 
-def test_nothing_usable_falls_back_and_NAMES_each_rejection(governed, caplog, cli_config):
-    """A fallback that says only "no model available" leaves an operator
-    guessing which of their assignments is the problem. Step 6 learned this on
-    CodeWiki; the message shape is deliberately the same."""
+def test_nothing_usable_raises_and_NAMES_each_rejection(governed, cli_config):
+    """D107: no .env fallback. The error says which assignment is the problem."""
+    from core.tier_resolver import NoEligibleModel
     from core.tiers import Tier
 
     cli_config(_ONE_ALIAS)
     governed["candidates"] = [_Cand("mistral-large-2", "openai_compatible"),
                               _Cand("deepseek-v3", "openai_compatible")]
-    with caplog.at_level("WARNING"):
-        out = mr.cli_tier_model_id(Tier.COMPLEX, "complex")
-
-    assert out == mr._legacy_cli_model_for_tier("complex")
-    text = caplog.text
-    assert "mistral-large-2" in text and "deepseek-v3" in text
-    assert "Model Governance" in text
+    with pytest.raises(NoEligibleModel) as exc:
+        mr.cli_tier_model_id(Tier.COMPLEX, "complex")
+    assert "mistral-large-2" in str(exc.value) and "deepseek-v3" in str(exc.value)
 
 
-def test_the_fallback_warning_is_logged_once_per_reason(governed, caplog, cli_config):
-    from core.tiers import Tier
-
-    cli_config(_ONE_ALIAS)
-    governed["candidates"] = [_Cand("deepseek-v3", "openai_compatible")]
-    with caplog.at_level("WARNING"):
-        for _ in range(5):
-            mr.cli_tier_model_id(Tier.COMPLEX, "complex")
-    assert caplog.text.count("deepseek-v3") == 1
-
-
-def test_a_resolver_failure_falls_back_rather_than_raising(governed):
-    """An SDLC run must not die because Postgres blinked while resolving a
-    tier. It degrades to the .env chain, which is D15's whole point."""
+def test_a_resolver_failure_is_reported_not_routed_around(governed):
+    from core.tier_resolver import NoEligibleModel
     from core.tiers import Tier
 
     governed["raises"] = RuntimeError("database is down")
-    assert mr.cli_tier_model_id(Tier.COMPLEX, "complex") == \
-        mr._legacy_cli_model_for_tier("complex")
+    with pytest.raises(NoEligibleModel, match="database is down"):
+        mr.cli_tier_model_id(Tier.COMPLEX, "complex")
 
 
-# ── The two things that must be checked BEFORE the tier ─────────────────────
-
-
-def test_local_only_short_circuits_before_the_tier_is_consulted(governed, monkeypatch):
-    """LLM_PROVIDER=local means no cloud model id may reach a provider. A
-    governed answer is still a cloud id, so the posture is checked first —
-    the candidate list is never even asked for."""
+def test_an_override_naming_a_model_is_used_as_is(governed):
+    """The governance reviewer/fixer overrides still name concrete ids."""
     from core.tiers import Tier
 
-    monkeypatch.setattr(mr, "LLM_PROVIDER", "local")
     governed["candidates"] = [_Cand("claude-sonnet-5")]
-    assert mr.cli_tier_model_id(Tier.COMPLEX, "complex") == mr.LOCAL_LLM_MODEL_NAME
+    assert mr.cli_tier_model_id(Tier.COMPLEX, override="my-inhouse-qwen") == "my-inhouse-qwen"
     assert "asked" not in governed
 
 
-def test_an_operator_pin_beats_the_assignment(governed, caplog):
+def test_an_override_naming_a_TIER_resolves_that_tier(governed, cli_config):
     from core.tiers import Tier
 
-    governed["candidates"] = [_Cand("claude-sonnet-5")]
-    with caplog.at_level("WARNING"):
-        out = mr.cli_tier_model_id(Tier.COMPLEX, "complex", "my-inhouse-qwen",
-                                   override_name="SDLC_CLI_PLAN_MODEL")
-    assert out == "my-inhouse-qwen"
-    assert "DEPRECATED" in caplog.text
+    cli_config(_ONE_ALIAS + '\n[model.a]\nmodel = "model-a"\n')
+    governed["candidates"] = [_Cand("model-a")]
+    assert mr.cli_tier_model_id(Tier.COMPLEX, override="simple") == "model-a"
+    assert governed["asked"][0] is Tier.SIMPLE
 
 
-def test_a_pin_naming_a_TIER_is_still_read_as_a_tier(governed):
-    """SDLC_CLI_PLAN_MODEL=solution has always meant "the solution tier".
-    Reading it as a model id would hand the CLI the literal string
-    "solution"."""
+def test_a_blocked_override_falls_back_to_the_tier(governed, cli_config):
     from core.tiers import Tier
 
-    governed["candidates"] = [_Cand("claude-sonnet-5")]
-    assert mr.cli_tier_model_id(Tier.COMPLEX, "complex", "solution") == \
-        mr._legacy_cli_model_for_tier("solution")
-
-
-def test_the_historical_local_pin_still_means_what_it_meant(governed):
-    """"local" mapped to CLAUDE_HAIKU, not to the in-house model: the ainxt
-    CLI has no Ollama bridge. Surprising, and preserved because changing it
-    would move an operator's pin without telling them."""
-    from core.tiers import Tier
-
-    governed["candidates"] = [_Cand("claude-sonnet-5")]
-    assert mr.cli_tier_model_id(Tier.COMPLEX, "complex", "local") == \
-        mr._role_model(mr.CLAUDE_HAIKU, "anthropic", "haiku")
+    cli_config(_ONE_ALIAS + '\n[model.a]\nmodel = "model-a"\n')
+    governed["candidates"] = [_Cand("model-a")]
+    assert mr.cli_tier_model_id(Tier.COMPLEX, override="gpt-5.2") == "model-a"
 
 
 def test_the_role_preference_reaches_the_resolver(governed):
@@ -336,39 +284,37 @@ def test_the_role_preference_reaches_the_resolver(governed):
 # ── The named phases ────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("fn_name,tier_value,env_var", [
-    ("cli_classify_model",  "simple",  "SDLC_CLI_CLASSIFY_MODEL"),
-    ("cli_plan_model",      "complex", "SDLC_CLI_PLAN_MODEL"),
-    ("cli_implement_model", "complex", "SDLC_CLI_IMPLEMENT_MODEL"),
-    ("cli_coder_model",     "complex", "SDLC_MODEL_CODER"),
+@pytest.mark.parametrize("fn_name,tier_value", [
+    ("cli_classify_model",  "simple"),
+    ("cli_plan_model",      "complex"),
+    ("cli_implement_model", "complex"),
+    ("cli_coder_model",     "complex"),
 ])
-def test_each_named_phase_asks_for_its_tier(governed, monkeypatch,
-                                            fn_name, tier_value, env_var):
-    monkeypatch.delenv(env_var, raising=False)
+def test_each_named_phase_asks_for_its_tier(governed, cli_config, fn_name, tier_value):
+    cli_config(_ONE_ALIAS + '\n[model.s]\nmodel = "claude-sonnet-5"\n')
     governed["candidates"] = [_Cand("claude-sonnet-5")]
     getattr(mr, fn_name)()
     tier, _c = governed["asked"]
     assert tier.value == tier_value
 
 
-@pytest.mark.parametrize("fn_name,env_var", [
-    ("cli_classify_model",  "SDLC_CLI_CLASSIFY_MODEL"),
-    ("cli_plan_model",      "SDLC_CLI_PLAN_MODEL"),
-    ("cli_implement_model", "SDLC_CLI_IMPLEMENT_MODEL"),
-    ("cli_coder_model",     "SDLC_MODEL_CODER"),
-])
-def test_each_named_phase_honours_its_pin(governed, monkeypatch, fn_name, env_var):
-    monkeypatch.setenv(env_var, "claude-opus-4-8")
+def test_the_coder_pin_names_a_tier_only(governed, cli_config, monkeypatch):
+    """§I.3: SDLC_MODEL_CODER accepts a tier name; a model id is ignored."""
+    cli_config(_ONE_ALIAS + '\n[model.s]\nmodel = "claude-sonnet-5"\n')
     governed["candidates"] = [_Cand("claude-sonnet-5")]
-    assert getattr(mr, fn_name)() == "claude-opus-4-8"
+    monkeypatch.setenv("SDLC_MODEL_CODER", "claude-opus-4-8")
+    assert mr.cli_coder_model() == "claude-sonnet-5"
+    monkeypatch.setenv("SDLC_MODEL_CODER", "mini")
+    mr.cli_coder_model()
+    assert governed["asked"][0].value == "mini"
 
 
 def test_the_provider_biased_helpers_are_gone():
     """plan.html §F: "_tier_to_role hardcodes ("anthropic", …) for 3 of 5 tiers
     and ("openai", …) for 2 — the single most provider-biased map in the
-    codebase. Replaced wholesale." The map survives only inside
-    _legacy_cli_model_for_tier as the flag-off path, which Phase 8 removes
-    with the rest of the .env constants."""
+    codebase. Replaced wholesale." Phase 8 removed its last copy."""
     assert not hasattr(mr, "cli_model_for_tier")
     assert not hasattr(mr, "cli_model_for")
     assert not hasattr(mr, "openai_model_for_tier")
+    assert not hasattr(mr, "_legacy_cli_model_for_tier")
+    assert not hasattr(mr, "_role_model")

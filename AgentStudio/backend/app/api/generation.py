@@ -44,10 +44,7 @@ def _cli_reference_models() -> list[dict]:
     Providers" data GET /v1/all-models reads exclusively) — a provider
     configured purely through that screen (DB row, no matching env var) used
     to be invisible here even though it showed up correctly on the web Chat
-    picker. Falls back to the env-var-derived catalogue below only when the
-    registry itself can't be read (e.g. this module running under a package
-    root without `core/` on the path — see the ImportError comment below),
-    not merely because it's empty.
+    picker. An unreadable registry gives an empty catalogue.
     """
     try:
         from core.llm_provider_registry import get_cli_style_models
@@ -59,183 +56,14 @@ def _cli_reference_models() -> list[dict]:
         if not any(m.get("id") == "local" for m in models):
             models.append({
                 "id": "local", "hint": "local", "provider": "inhouse",
-                "label": os.getenv("LOCAL_LLM_DISPLAY", "Local (In-house)"),
+                "label": "Local (In-house)",
                 "tag": "In-house GPU · free · private",
             })
         return models
     except Exception as exc:
-        logger.warning(f"[AGENT] core.llm_provider_registry unavailable, falling back "
-                        f"to env-var-derived model catalogue: {exc}")
-
-    return _cli_reference_models_env_fallback()
-
-
-def _cli_reference_models_env_fallback() -> list[dict]:
-    """Legacy catalogue built from core.model_registry env vars — used only
-    when core.llm_provider_registry can't be imported/read at all.
-
-    Phase 7 note. The ENABLE_* gates below stay for now, for the reason given
-    at length on the twin of this function
-    (``routers/messages_compat_router.py::_list_models_compat_env_fallback``):
-    this path runs when the registry is unreadable, and on that path nothing
-    else can honour an operator's decision to disable a SKU. They retire in
-    Phase 8 along with the variables themselves (D63).
-
-    The duplication is deliberate — see the twin's docstring. This copy must
-    keep working when ``core`` is not importable, which is exactly what moving
-    the shared body into ``core/`` would break. Kept in step by
-    ``tests/routers/test_env_fallback_twins.py``.
-    """
-    try:
-        from core.model_registry import (
-            CLAUDE_PRIMARY_MODEL, CLAUDE_SONNET_5_MODEL,
-            CLAUDE_OPUS_MODEL, CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL,
-            CLAUDE_HAIKU, OPENAI_CODING_MODEL, OPENAI_SIMPLE_MODEL,
-            OPENAI_LATEST_MODEL, OPENAI_TERA_MODEL, OPENAI_LUNA_MODEL,
-            LOCAL_LLM_DISPLAY,
-            GEMINI_TEXT_MODEL, GEMINI_CODING_LITE_MODEL,
-            ENABLE_OPUS, ENABLE_SONNET_5, ENABLE_CLI_OPUS_48, ENABLE_CLI_OPUS_5,
-            ENABLE_GPT56_TERA, ENABLE_GPT56_LUNA,
-        )
-    except ImportError:
-        # The registry could not be imported (this module can run under a package
-        # root that does not have `core/` on the path).  The fallback used to
-        # hardcode every model id, which meant that on this path a deployment's
-        # configuration was ignored entirely: an operator who had set
-        # OPENAI_CODING_MODEL got the literal shipped here instead, silently.
-        #
-        # It also drifted. `OPENAI_LATEST_MODEL` was "gpt-5-5" here while the
-        # registry default is "gpt-5.5" -- two different strings for the same
-        # concept, and nothing to notice it.
-        #
-        # Now reads the SAME env vars with the SAME defaults, so the only thing
-        # lost on this path is the registry's own validation. Warned, not silent.
-        try:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "core.model_registry could not be imported; model identifiers are "
-                "being resolved directly from the environment. Tier routing and "
-                "provider validation from the registry are NOT in effect."
-            )
-        except Exception:
-            pass
-        CLAUDE_PRIMARY_MODEL     = os.getenv("CLAUDE_PRIMARY_MODEL", "")
-        CLAUDE_SONNET_5_MODEL    = os.getenv("CLAUDE_SONNET_5_MODEL", "")
-        CLAUDE_OPUS_MODEL        = os.getenv("CLAUDE_OPUS_MODEL", "")
-        CLAUDE_OPUS_48_MODEL     = os.getenv("CLAUDE_OPUS_48_MODEL", "")
-        CLAUDE_OPUS_5_MODEL      = os.getenv("CLAUDE_OPUS_5_MODEL", "")
-        CLAUDE_HAIKU             = os.getenv("CLAUDE_HAIKU", "")
-        OPENAI_CODING_MODEL      = os.getenv("OPENAI_CODING_MODEL", "")
-        OPENAI_SIMPLE_MODEL      = os.getenv("OPENAI_SIMPLE_MODEL", "")
-        OPENAI_LATEST_MODEL      = os.getenv("OPENAI_LATEST_MODEL", "")
-        OPENAI_TERA_MODEL        = os.getenv("OPENAI_TERA_MODEL", "")
-        OPENAI_LUNA_MODEL        = os.getenv("OPENAI_LUNA_MODEL", "")
-        GEMINI_TEXT_MODEL        = os.getenv("GEMINI_TEXT_MODEL", "")
-        GEMINI_CODING_LITE_MODEL = os.getenv("GEMINI_CODING_LITE_MODEL", "")
-        LOCAL_LLM_DISPLAY        = os.getenv("LOCAL_LLM_DISPLAY", "Local (In-house)")
-        ENABLE_OPUS              = os.getenv("ENABLE_OPUS", "true").lower() in ("true", "1", "yes")
-        ENABLE_SONNET_5          = os.getenv("ENABLE_SONNET_5", "true").lower() in ("true", "1", "yes")
-        ENABLE_CLI_OPUS_48       = os.getenv("ENABLE_CLI_OPUS_48", "true").lower() in ("true", "1", "yes")
-        ENABLE_CLI_OPUS_5        = os.getenv("ENABLE_CLI_OPUS_5", "false").lower() in ("true", "1", "yes")
-        ENABLE_GPT56_TERA        = os.getenv("ENABLE_GPT56_TERA", "true").lower() in ("true", "1", "yes")
-        ENABLE_GPT56_LUNA        = os.getenv("ENABLE_GPT56_LUNA", "true").lower() in ("true", "1", "yes")
-
-    models = [
-        {
-            "id": CLAUDE_PRIMARY_MODEL, "hint": CLAUDE_PRIMARY_MODEL,
-            "provider": "anthropic", "label": "Claude Sonnet 4.6",
-            "tag": "Complex reasoning · SDLC · Primary",
-        },
-    ]
-    if ENABLE_SONNET_5:
-        models += [
-            {
-                "id": CLAUDE_SONNET_5_MODEL, "hint": CLAUDE_SONNET_5_MODEL,
-                "provider": "anthropic", "label": "Claude Sonnet 5",
-                "tag": "Latest Sonnet · explicit selection",
-            },
-        ]
-    if ENABLE_OPUS:
-        models += [
-            {
-                "id": CLAUDE_OPUS_MODEL, "hint": CLAUDE_OPUS_MODEL,
-                "provider": "anthropic", "label": "Claude Opus 4.7",
-                "tag": "Deepest reasoning · most capable",
-            },
-        ]
-        if ENABLE_CLI_OPUS_48:
-            models += [
-                {
-                    "id": CLAUDE_OPUS_48_MODEL, "hint": CLAUDE_OPUS_48_MODEL,
-                    "provider": "anthropic", "label": "Claude Opus 4.8",
-                    "tag": "Latest Opus · CLI/IDE opt-in",
-                },
-            ]
-    if ENABLE_CLI_OPUS_5:
-        models += [
-            {
-                "id": CLAUDE_OPUS_5_MODEL, "hint": CLAUDE_OPUS_5_MODEL,
-                "provider": "anthropic", "label": "Claude Opus 5",
-                "tag": "Next-gen Opus · CLI/IDE opt-in",
-            },
-        ]
-
-    models += [
-        {
-            "id": CLAUDE_HAIKU, "hint": "haiku",
-            "provider": "anthropic", "label": "Claude Haiku",
-            "tag": "Fast · lightweight tasks",
-        },
-        {
-            "id": OPENAI_CODING_MODEL, "hint": OPENAI_CODING_MODEL,
-            "provider": "openai", "label": "GPT-5.4",
-            "tag": "Coding · agents · OpenAI",
-        },
-        {
-            "id": OPENAI_SIMPLE_MODEL, "hint": OPENAI_SIMPLE_MODEL,
-            "provider": "openai", "label": "GPT-5-mini",
-            "tag": "Fast · simple Q&A · OpenAI",
-        },
-        {
-            "id": OPENAI_LATEST_MODEL, "hint": OPENAI_LATEST_MODEL,
-            "provider": "openai", "label": "GPT-5-5",
-            "tag": "Latest OpenAI · explicit selection",
-        },
-    ]
-    if ENABLE_GPT56_TERA:
-        models += [
-            {
-                "id": OPENAI_TERA_MODEL, "hint": "tera",
-                "provider": "openai", "label": "GPT-5.6 Tera",
-                "tag": "GPT-5.6 high-capacity · Chat + CLI",
-            },
-        ]
-    if ENABLE_GPT56_LUNA:
-        models += [
-            {
-                "id": OPENAI_LUNA_MODEL, "hint": "luna",
-                "provider": "openai", "label": "GPT-5.6 Luna",
-                "tag": "GPT-5.6 efficient · Chat + CLI",
-            },
-        ]
-    models += [
-        {
-            "id": GEMINI_TEXT_MODEL, "hint": GEMINI_TEXT_MODEL,
-            "provider": "google", "label": "Gemini 3.5 Flash",
-            "tag": "Coding · text · Google",
-        },
-        {
-            "id": GEMINI_CODING_LITE_MODEL, "hint": GEMINI_CODING_LITE_MODEL,
-            "provider": "google", "label": "Gemini 3.1 Flash-Lite",
-            "tag": "Lightweight coding · fast · Google",
-        },
-        {
-            "id": "local", "hint": "local",
-            "provider": "inhouse", "label": LOCAL_LLM_DISPLAY,
-            "tag": "In-house GPU · free · private",
-        },
-    ]
-    return models
+        # Unreadable registry = empty catalogue (Phase 8 removed the env fallback).
+        logger.error(f"[AGENT] core.llm_provider_registry unavailable: {exc}")
+        return []
 
 
 def _matches_discovered_model(model_id: str, discovered_ids: set[str]) -> bool:
@@ -577,7 +405,7 @@ async def list_llm_models_debug(
         "LOCAL_LLM_API_KEY", "LITELLM_API_KEY",
         "LOCAL_MODEL_REFRESH_SECS", "LOCAL_HIDDEN_MODELS",
         "OPENAI_COMPATIBLE_BASE_URL", "OPENAI_COMPATIBLE_API_KEY",
-        "FACTORY_BASE_URL", "FACTORY_API_KEY", "FACTORY_MODEL",
+        "FACTORY_BASE_URL", "FACTORY_API_KEY",
         "SSL_VERIFY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
     )
     sources["env"] = {k: ("set" if os.getenv(k) else "unset") for k in env_keys}
@@ -707,13 +535,8 @@ def _build_instructions_llm_config(
     configured for runtime agent execution.
 
     Sourced via factory_model()/factory_base_url()/factory_api_key() — same
-    resolution chain as build_meta_llm_config() elsewhere in this file: explicit
-    FACTORY_* env override → the admin's configured default in
-    core.llm_provider_registry → a safe fallback. Previously this read
-    FACTORY_MODEL/FACTORY_BASE_URL/FACTORY_API_KEY directly and 503'd whenever
-    any was unset — which is always true on a deployment configured purely
-    through the "LLM Providers" admin screen, since install.sh's admin-only
-    setup never sets these role-specific env vars.
+    resolution chain as build_meta_llm_config() elsewhere in this file: the
+    admin's configured default in core.llm_provider_registry.
     """
     from app.models import LLMConfig, LLMProvider
 
@@ -723,8 +546,8 @@ def _build_instructions_llm_config(
     if not model:
         raise HTTPException(
             status_code=503,
-            detail="Generate Instructions is not configured. Set FACTORY_MODEL, or add and "
-                   "enable at least one model in Admin → LLM Providers.",
+            detail="Generate Instructions is not configured. Add and enable at least "
+                   "one model in Admin → LLM Providers.",
         )
     return LLMConfig(
         provider=LLMProvider.CUSTOM,

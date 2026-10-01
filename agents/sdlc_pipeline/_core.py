@@ -436,7 +436,7 @@ def _llm(prompt: str, hint=None, agent_id: str = None) -> str:
     # Token + cost estimation (4 chars ≈ 1 token — rough but consistent).
     # Rate from the single-source-of-truth helper (R3) — replaces the prior
     # hand-rolled table that over-billed Opus 3× and billed Sonnet/Haiku at
-    # GPT-mini rates. tier_cost_per_1m reads ENABLE_OPUS at call time.
+    # GPT-mini rates. tier_cost_per_1m prices the tier's head model.
     from core.model_registry import tier_cost_per_1m
     _tokens_in  = len(prompt) // 4
     _tokens_out = len(result) // 4 if result else 0
@@ -6041,8 +6041,8 @@ def _phase_normalize(run_id: str, issue: dict, jira_key: str, repo_ctx: dict,
 def _phase_classify(run_id: str, issue: dict, jira_key: str, repo_resolved: str,
                      repo_ctx: dict, workspace_root: str, work_item: dict,
                      run_type: str = "feature") -> Optional[dict]:
-    """CLASSIFY via CLI (WS-1) — read-only, small/haiku/local model
-    (SDLC_CLI_CLASSIFY_MODEL), emits open_questions AT THE END. This is the
+    """CLASSIFY via CLI (WS-1) — read-only, the `simple` tier's model
+    (cli_classify_model), emits open_questions AT THE END. This is the
     pipeline's SINGLE question gate (GATE 2). Reuses the stored CLASSIFYING
     artifact (when not STALE) instead of re-invoking the CLI. Returns the
     classification dict, or None when the run has suspended (gate or hard

@@ -57,7 +57,7 @@
 import hashlib
 from typing import List, Optional
 
-from core.config import RDB_CACHE, KB_FOLLOWUP_CONDENSE_MODEL_CHAIN
+from core.config import RDB_CACHE
 from core.kv import get_kv
 from core.logger import logger
 
@@ -77,9 +77,6 @@ _MAX_STANDALONE_NEWLINES = 0
 
 # The condense rewrite asks for the `simple` tier. Still never the user's
 # chosen chat model (q.model) — that serves the actual answer in gateway.py.
-# _CONDENSE_OVERRIDE is the deprecated env pin, empty unless set; first entry
-# only, since ordering is the tier assignment's job. Removed in Phase 8.
-_CONDENSE_OVERRIDE = (KB_FOLLOWUP_CONDENSE_MODEL_CHAIN or [""])[0]
 
 
 def _cache_key(history_text: str, question: str) -> str:
@@ -198,12 +195,10 @@ def condense_followup(
         from core.tiers import Tier
         from models.model_router import model_router, tier_request
 
-        _asked = _CONDENSE_OVERRIDE or Tier.SIMPLE.value
+        _asked = Tier.SIMPLE.value
         standalone = None
         try:
-            raw = model_router.generate(prompt, **tier_request(
-                Tier.SIMPLE, "haiku", _CONDENSE_OVERRIDE,
-                override_name="KB_FOLLOWUP_CONDENSE_MODEL_CHAIN"))
+            raw = model_router.generate(prompt, **tier_request(Tier.SIMPLE, "haiku"))
         except Exception as _exc:
             logger.warning(
                 f"followup_condenser: {_asked!r} raised ({_exc}), falling back "

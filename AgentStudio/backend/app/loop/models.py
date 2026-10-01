@@ -104,7 +104,7 @@ class VerifySpec(BaseModel):
     """Independent pre-ship verifier switch. Honoured in P4 (VerifierAgent)."""
     independent_agent: bool = False
     criteria: Optional[str] = None
-    # Overrides VERIFIER_MODEL when set.
+    # Overrides the factory default verifier model when set.
     model: Optional[str] = None
 
 

@@ -498,3 +498,19 @@ def resolve_explicit(model_id: str, user: Optional[dict] = None, *,
         None, Constraints(),
         {model_id: "not an enabled model on this channel"},
     )
+
+
+def family_model(tier: Tier, family: str) -> str:
+    """For a gateway that must name a model: `tier`'s first candidate from `family`,
+    else that family's first enabled model; "" when it has none."""
+    try:
+        for cand in resolve_tier_candidates(tier):
+            if cand.family == family:
+                return cand.model_id
+    except Exception:  # noqa: BLE001 — an unassigned tier still has a family default
+        pass
+    try:
+        from core.llm_provider_registry import get_enabled_models
+        return next((m["model_id"] for m in get_enabled_models() if m["family"] == family), "")
+    except Exception:  # noqa: BLE001
+        return ""

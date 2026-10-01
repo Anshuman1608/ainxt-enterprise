@@ -74,14 +74,6 @@ def test_build_history_text_skips_empty_content():
 
 # ── the condense model request (core/config.py wiring) ──────────────────────
 
-def test_condense_override_default_is_empty():
-    """Empty by default, and that is load-bearing: a value here is passed as
-    tier_request(override=), which outranks the tier assignment. A non-empty
-    default would make governance unreachable for this call site."""
-    from core.config import KB_FOLLOWUP_CONDENSE_MODEL_CHAIN
-    assert KB_FOLLOWUP_CONDENSE_MODEL_CHAIN == []
-    assert fc._CONDENSE_OVERRIDE == ""
-
 
 def test_condense_override_takes_only_the_first_entry():
     """The remaining hops are the tier assignment's job now."""
@@ -101,15 +93,12 @@ def test_the_condenser_asks_for_a_tier_not_a_sku(monkeypatch, fake_redis):
         seen.update(kw)
         return "standalone q"
 
-    monkeypatch.setattr(fc, "_CONDENSE_OVERRIDE", "")
     monkeypatch.setattr("models.model_router.model_router.generate", _capture)
     fc.condense_followup("what about step 3?", _history())
 
     assert seen.get("tier") is Tier.SIMPLE
     assert "model_hint" not in seen
-    assert seen.get("legacy_hint") == "haiku", (
-        "legacy_hint keeps flag-off routing identical (D15) and must survive"
-    )
+    assert seen.get("legacy_hint") == "haiku"   # the D15 audit trail
     assert LEGACY_INBOUND_ALIASES.get("haiku") is Tier.SIMPLE
 
 
@@ -221,32 +210,6 @@ def test_condense_followup_redis_setex_failure_does_not_raise(monkeypatch, fake_
 # this module. It is now a single pin handed to tier_request(override=), which
 # warns once per process. Phase 8 removes it. Ordering is the admin's priority
 # order on the `simple` tier, walked by resolve_tier_candidates().
-
-def test_an_explicit_override_wins_over_the_tier(monkeypatch, fake_redis):
-    seen = {}
-
-    def _capture(prompt, **kw):
-        seen.update(kw)
-        return "standalone q"
-
-    monkeypatch.setattr(fc, "_CONDENSE_OVERRIDE", "some-pinned-model")
-    monkeypatch.setattr("models.model_router.model_router.generate", _capture)
-    fc.condense_followup("what about step 3?", _history())
-
-    assert seen == {"model_hint": "some-pinned-model"}
-
-
-def test_the_override_warns_that_it_is_deprecated(monkeypatch, fake_redis, caplog):
-    import models.model_router as _mr
-    monkeypatch.setattr(_mr, "_TIER_OVERRIDE_WARNED", set())
-    monkeypatch.setattr(fc, "_CONDENSE_OVERRIDE", "some-pinned-model")
-    monkeypatch.setattr("models.model_router.model_router.generate",
-                        lambda p, **kw: "standalone q")
-    with caplog.at_level("WARNING"):
-        fc.condense_followup("what about step 3?", _history())
-    joined = " ".join(r.getMessage() for r in caplog.records)
-    assert "KB_FOLLOWUP_CONDENSE_MODEL_CHAIN" in joined
-    assert "DEPRECATED" in joined.upper()
 
 
 # ── the cost guard ──────────────────────────────────────────────────────────

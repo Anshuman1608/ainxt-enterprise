@@ -153,42 +153,7 @@ from core.telemetry import telemetry_metrics, tracer, span_store
 agent = OrchestratorAgent()
 _postgres_memory = PostgresMemory()
 
-from core.model_registry import (
-    OPENAI_SIMPLE_MODEL as _OPENAI_SIMPLE,
-    OPENAI_CODING_MODEL as _OPENAI_CODING,
-    OPENAI_LATEST_MODEL as _OPENAI_LATEST,
-    OPENAI_DEEP_RESEARCH_MINI as _DR_MINI,
-    OPENAI_DEEP_RESEARCH as _DR_FULL,
-    CLAUDE_PRIMARY_MODEL as _CLAUDE_PRIMARY,
-    CLAUDE_HAIKU as _CLAUDE_HAIKU,
-    CLAUDE_OPUS_MODEL as _CLAUDE_OPUS,
-    CLAUDE_OPUS_48_MODEL as _CLAUDE_OPUS_48,
-    CLAUDE_OPUS_5_MODEL as _CLAUDE_OPUS_5,
-    CLAUDE_SONNET_5_MODEL as _CLAUDE_SONNET_5,
-    ENABLE_RAW_OPENAI_API as _ENABLE_RAW_OPENAI_API,
-    GEMINI_VISION_MODEL as _GEMINI_VISION,
-    GEMINI_TEXT_MODEL as _GEMINI_TEXT,
-    GEMINI_CODING_LITE_MODEL as _GEMINI_CODING_LITE,
-    GEMINI_IMAGE_MODEL as _GEMINI_IMAGE,
-    CLAUDE_PRIMARY_DISPLAY as _CLAUDE_PRIMARY_DISPLAY,
-    CLAUDE_HAIKU_DISPLAY as _CLAUDE_HAIKU_DISPLAY,
-    CLAUDE_OPUS_DISPLAY as _CLAUDE_OPUS_DISPLAY,
-    CLAUDE_OPUS_48_DISPLAY as _CLAUDE_OPUS_48_DISPLAY,
-    CLAUDE_OPUS_5_DISPLAY as _CLAUDE_OPUS_5_DISPLAY,
-    CLAUDE_SONNET_5_DISPLAY as _CLAUDE_SONNET_5_DISPLAY,
-    OPENAI_CODING_DISPLAY as _OPENAI_CODING_DISPLAY,
-    OPENAI_SIMPLE_DISPLAY as _OPENAI_SIMPLE_DISPLAY,
-    OPENAI_LATEST_DISPLAY as _OPENAI_LATEST_DISPLAY,
-    OPENAI_TERA_MODEL as _OPENAI_TERA,
-    OPENAI_LUNA_MODEL as _OPENAI_LUNA,
-    OPENAI_TERA_DISPLAY as _OPENAI_TERA_DISPLAY,
-    OPENAI_LUNA_DISPLAY as _OPENAI_LUNA_DISPLAY,
-    GEMINI_DISPLAY as _GEMINI_DISPLAY,
-    GEMINI_TEXT_DISPLAY as _GEMINI_TEXT_DISPLAY,
-    GEMINI_CODING_LITE_DISPLAY as _GEMINI_CODING_LITE_DISPLAY,
-    GEMINI_IMAGE_DISPLAY as _GEMINI_IMAGE_DISPLAY,
-    OPENAI_CODING_MODEL,
-)
+from core.model_registry import ENABLE_RAW_OPENAI_API as _ENABLE_RAW_OPENAI_API
 
 def _write_request_audit(
     *,
@@ -346,11 +311,9 @@ def _resolve_model_id(model: str) -> str:
     that slipped through (e.g. "GPT-5.4 (gpt-5.4)" → "gpt-5.4").
     """
     if not model or model.strip().lower() in ("auto", "default", ""):
-        from core.model_registry import CLAUDE_PRIMARY_MODEL, LOCAL_LLM_MODEL_NAME
-        # Return whichever is configured — prefer cloud primary, fall back to
-        # local display name. If neither is set, return "unknown" so audit rows
-        # are queryable rather than carrying an empty string.
-        return CLAUDE_PRIMARY_MODEL or LOCAL_LLM_MODEL_NAME or "unknown"
+        # No model ran: "unknown" keeps audit rows queryable and does not name
+        # a model that did not run (D91).
+        return "unknown"
     # Strip display-label wrapper: "Display Name (model-id)" → "model-id".
     # [^)]* (not [^)]+) so an empty "()" — a display label built from an
     # unresolved/blank model id — still matches instead of falling through to
@@ -1799,6 +1762,15 @@ async def startup():
         warn_legacy_env_once()
     except Exception as _le_err:
         logger.warning("Legacy env audit failed: %s", _le_err)
+
+    # LLM_PROVIDER=local is an assertion: name every enabled cloud model.
+    try:
+        from core.model_registry import posture_violations
+        _pv = posture_violations()
+        if _pv:
+            logger.error("LLM_PROVIDER=local but these enabled models are not deployment-local: %s", ", ".join(_pv))
+    except Exception as _pv_err:
+        logger.warning("Provider posture audit failed: %s", _pv_err)
 
     # ------------------------------------------------------------
     # PLATFORM VERSION
@@ -3307,18 +3279,8 @@ def _enhance_core(prompt: str, include_followups: bool = True) -> dict:
    # positive PCI blocks on every enhance request.  Same pattern as /ask
    # (see precleared handling ~line 3930).
    _precleared_findings = _chk.get("findings", [])
-   _allowed_hints = {"simple", "mini", "medium", "complex", "haiku", "gemini", "deep", "solution"}
-   _hint = os.getenv("ENHANCE_MODEL_HINT", "mini").strip().lower()
-   _hint = _hint if _hint in _allowed_hints else "mini"
-   # §N.1 step 9 / §F "Prompt enhancement … → mini". The allowlist above
-   # already stops a raw model id reaching here, so D28's two branches reduce
-   # to: the default asks the tier, and anything an operator deliberately set
-   # is honoured verbatim and warned once — which is what it does today.
-   _enhance_route = _tier_request(
-       _Tier.MINI, "mini",
-       _hint if _hint != "mini" else "",
-       override_name="ENHANCE_MODEL_HINT",
-   )
+   # §N.1 step 9 / §F "Prompt enhancement … → mini" (Phase 8: no env override).
+   _enhance_route = _tier_request(_Tier.MINI, "mini")
    if include_followups:
        _system = (
             "You are a prompt quality assistant for an enterprise AI platform serving "
@@ -4083,8 +4045,8 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
         _otel.record_event("stage.products", product_id_count=len(_rc.product_ids))
 
     # ── DOCUMENT-INTENT ROUTING (backend authority, ONE call, NO regex) ───────
-    # Every non-ephemeral prompt is classified by the SMALL local model
-    # (models.doc_intent.classify → DOC_INTENT_MODEL). If it's a document
+    # Every non-ephemeral prompt is classified by the intent-classification tier
+    # (models.doc_intent.classify). If it's a document
     # request, we enqueue the platform skillset generation job and return a
     # {route:"doc"} signal INSTEAD of streaming a prose answer — so "create a
     # ppt on X" reliably produces a document (with live updates) rather than a
@@ -9617,8 +9579,9 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
                     except Exception:
                         pass
 
+                from models.model_router import model_router as _it_mr
                 _it_cost = _estimate_cost(
-                    _OPENAI_CODING,
+                    getattr(_it_mr, "last_model_label", "") or "",
                     int(len(safe_question.split()) * 1.3),
                     int(len(_it_full.split()) * 1.3),
                 )
@@ -10074,7 +10037,7 @@ async def ask_ai(q: Question, request: Request, authorization: Optional[str] = _
         telemetry_metrics.inc("agent_executions")
 
         # Shared dict populated in finally; read by post-finally __meta__ yield.
-        _meta = {"out_tok": 0, "in_tok": 0, "model": _OPENAI_CODING, "cost": 0.0, "latency": 0.0}
+        _meta = {"out_tok": 0, "in_tok": 0, "model": "", "cost": 0.0, "latency": 0.0}
 
         # Acquire LLM concurrency slot — prevents >120 simultaneous agent.run() calls
         # under high load, protecting upstream API rate limits.
@@ -10732,7 +10695,7 @@ class _OAIMessage(BaseModel):
         return ""
 
 class _OAIChatRequest(BaseModel):
-    model: str = _OPENAI_CODING
+    model: str = "auto"
     messages: List[_OAIMessage]
     stream: bool = True
     max_tokens: Optional[int] = None
@@ -10782,8 +10745,8 @@ _OAI_MODEL_MAP = {
     "claude-opus":         "solution", # generic "claude-opus" → latest Opus (4.7)
     "claude":              "claude",
     # Specific Gemini IDs first so prefix matching in _oai_model_hint picks them
-    # over the generic "gemini" entry. Hint = the literal model ID; model_router
-    # resolves it via _GEMINI_SPECIFIC_HINTS to the registry constant.
+    # over the generic "gemini" entry. Hint = the literal model ID, which the
+    # router serves as that registry model (or refuses if none is registered).
     "gemini-3.5-flash":       "gemini-3.5-flash",
     "gemini-3.1-flash-lite":  "gemini-3.1-flash-lite",
     "gemini-3.1-flash-image": "gemini-3.1-flash-image",
@@ -10793,30 +10756,6 @@ _OAI_MODEL_MAP = {
     "gemini-flash":        "gemini",
     "gemini":              "gemini",
 }
-# Ensure env-var-configured model IDs are also covered
-_OAI_MODEL_MAP[_OPENAI_CODING]  = "gpt"
-_OAI_MODEL_MAP[_OPENAI_SIMPLE]  = "mini"   # direct GPT-5-mini, not medium tier
-_OAI_MODEL_MAP[_OPENAI_LATEST]  = "deep"
-_OAI_MODEL_MAP[_CLAUDE_PRIMARY] = "claude"
-_OAI_MODEL_MAP[_CLAUDE_HAIKU]   = "haiku"
-_OAI_MODEL_MAP[_GEMINI_VISION]      = "gemini"
-_OAI_MODEL_MAP[_GEMINI_TEXT]        = _GEMINI_TEXT          # explicit model ID → identical hint
-_OAI_MODEL_MAP[_GEMINI_CODING_LITE] = _GEMINI_CODING_LITE
-_OAI_MODEL_MAP[_GEMINI_IMAGE]       = _GEMINI_IMAGE
-_OAI_MODEL_MAP[_CLAUDE_OPUS]    = "solution"
-_OAI_MODEL_MAP[_CLAUDE_OPUS_48] = "opus-4-8"
-_OAI_MODEL_MAP[_CLAUDE_OPUS_5]  = "opus-5"
-_OAI_MODEL_MAP[_CLAUDE_SONNET_5] = "sonnet-5"
-_OAI_MODEL_MAP[_OPENAI_TERA]    = "tera"
-_OAI_MODEL_MAP[_OPENAI_LUNA]    = "luna"
-# Every assignment above keys off an env-var-backed alias that defaults to ""
-# when unconfigured — on any install that doesn't set every single one of
-# these (i.e. nearly all of them), the last blank alias silently leaves an
-# "" entry in the dict. Because "x".startswith("") is True for every string,
-# _oai_model_hint() would then match EVERY unrecognised model name against
-# whatever hint that blank alias happened to carry, instead of correctly
-# falling through to None (auto-route by complexity). Strip it unconditionally.
-_OAI_MODEL_MAP.pop("", None)
 
 # Hints that route to the Anthropic tools-stream (_tools_claude_stream).
 # NOTE: _tools_claude_stream flattens content to text and CANNOT carry images.
@@ -10824,8 +10763,16 @@ _OAI_MODEL_MAP.pop("", None)
 # the browser-agent passthrough lane.
 _CLAUDE_TOOL_HINTS = frozenset({"claude", "solution", "haiku", "opus-4-8", "opus-5", "sonnet-5"})
 
-# Deep research models — require `tools` to be supplied by the caller
-_DEEP_RESEARCH_MODELS: set[str] = {_DR_MINI, _DR_FULL, "o4-mini-deep-research", "o3-deep-research"}
+def _requires_tools(model_id: str) -> bool:
+    """Deep-research models reject a call without `tools`: capabilities.requires_tools."""
+    try:
+        from core.llm_provider_registry import get_model as _rt_get
+        row = _rt_get(model_id or "")
+        if row is not None:
+            return bool((row.get("capabilities") or {}).get("requires_tools"))
+    except Exception:  # noqa: BLE001
+        pass
+    return "deep-research" in (model_id or "").lower()
 
 def _oai_model_hint(model_name: str) -> Optional[str]:
     """Translate an OpenAI-style model name to a AiNxt routing hint."""
@@ -10860,8 +10807,8 @@ def _oai_explicit_model_id(model_name: str) -> str:
 
     _oai_model_hint() above prefix-matches, which destroys the id before the
     router can see it: `claude-opus-5-5` becomes the hint `opus-5`, and the
-    router resolves that to whatever CLAUDE_OPUS_5_MODEL holds — empty on any
-    deployment configured through the admin screen. Measured on this one, 9 of
+    router resolved that to an env constant that was empty on any deployment
+    configured through the admin screen. Measured on this one, 9 of
     the 11 advertised cloud ids dispatched a different model than requested.
 
     model_router already resolves this correctly for every other caller: it
@@ -11415,13 +11362,13 @@ def openai_chat_completions(
             def _empty_stream():
                 _chunk = {
                     "id": _empty_id, "object": "chat.completion.chunk",
-                    "created": _empty_ts, "model": req.model or _OPENAI_CODING,
+                    "created": _empty_ts, "model": req.model or "auto",
                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": _empty_msg}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(_chunk)}\n\n"
                 _done = {
                     "id": _empty_id, "object": "chat.completion.chunk",
-                    "created": _empty_ts, "model": req.model or _OPENAI_CODING,
+                    "created": _empty_ts, "model": req.model or "auto",
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
                 yield f"data: {json.dumps(_done)}\n\n"
@@ -11430,7 +11377,7 @@ def openai_chat_completions(
             return _SR_empty(_empty_stream(), media_type="text/event-stream")
         return {
             "id": _empty_id, "object": "chat.completion", "created": _empty_ts,
-            "model": req.model or _OPENAI_CODING,
+            "model": req.model or "auto",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": _empty_msg}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
@@ -11996,7 +11943,6 @@ def openai_chat_completions(
     def _tools_proxy_stream():
         """Stream tokens + tool_calls from the appropriate OpenAI model when the request includes tools."""
         from agents.compliance_engine import compliance_engine
-        from core.model_registry import OPENAI_CODING_MODEL, OPENAI_LATEST_MODEL, OPENAI_SIMPLE_MODEL
 
         # ── Helper: yield a properly-formatted OpenAI SSE JSON chunk ──
         # _tools_proxy_stream() yields pre-serialised JSON that oai_stream()
@@ -12194,26 +12140,21 @@ def openai_chat_completions(
             return
 
         _tools_endpoint  = "/llm/gemini-tools-stream" if _use_gemini else "/llm/openai-tools-stream"
-        # Phase 6.6: the assignment wins for a capability request ("deep",
-        # "mini", or no hint); the .env rungs below remain the answer for a
-        # user's own pick and for the whole governance-off path. The Auto case
-        # used to be OPENAI_CODING_MODEL unconditionally — a hardcoded vendor
-        # SKU serving every agentic turn the admin screen could not reach.
+        # The helper's answer wins (an explicit pick, or the tier's model). Else
+        # this lane's vendor model from the tier assignments (Phase 8: no .env rungs).
+        from core.tier_resolver import family_model as _lane_model
         if _tool_provider in ("openai", "gemini") and _tool_model_id:
             _tools_model = _tool_model_id
         elif _use_gemini:
-            _tools_model = _GEMINI_VISION
-        elif _model_hint == "deep":
-            _tools_model = OPENAI_LATEST_MODEL
-        elif _model_hint == "mini":
-            _tools_model = OPENAI_SIMPLE_MODEL
+            _tools_model = _lane_model(_Tier.IMAGE_INPUT, "gemini")
         else:
-            _tools_model = OPENAI_CODING_MODEL
+            _tools_model = _lane_model({"deep": _Tier.COMPLEX, "mini": _Tier.MINI}.get(
+                _model_hint, _Tier.MEDIUM), "openai")
 
         # Passthrough image turn steered here from a Claude hint: pin a
-        # vision-capable gpt-4o-class model explicitly (don't rely on fall-through).
+        # vision-capable model explicitly (don't rely on fall-through).
         if _force_proxy_for_image:
-            _tools_model = OPENAI_CODING_MODEL
+            _tools_model = _lane_model(_Tier.IMAGE_INPUT, "openai")
 
         _payload: dict = {
             "messages":    oai_messages,
@@ -12362,11 +12303,6 @@ def openai_chat_completions(
         envelope, via `_c()`) and model selection are unchanged.
         """
         from agents.compliance_engine import compliance_engine
-        from core.model_registry import (
-            CLAUDE_PRIMARY_MODEL, SOLUTION_MODEL,
-            CLAUDE_HAIKU,
-            CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL, CLAUDE_SONNET_5_MODEL,
-        )
 
         # ── Helper: make an OpenAI-format SSE chunk ───────────────
         def _c(content: str, finish: str = None, tool_calls_delta: list = None) -> str:
@@ -12461,22 +12397,15 @@ def openai_chat_completions(
         # ── Select Claude model for tool-use stream ──────────────────────────────
         # Routes through services/cloud_tool_stream.stream_cloud_tools()
         #
-        # Phase 6.6: the administrator's assignment wins when this turn is a
-        # capability request — "claude", "solution", "haiku" or no hint at
-        # all. The ladder below is what remains: the SKU aliases a user picked
-        # from an IDE dropdown (opus-4-8, opus-5, sonnet-5), which §G keeps,
-        # plus the whole governance-off path. Before this, every rung was an
-        # .env constant and the final one, CLAUDE_PRIMARY_MODEL, served every
-        # Auto agentic turn on this endpoint regardless of what was assigned.
+        # The helper's answer wins (an explicit pick, or the tier's Anthropic
+        # model). A SKU alias a user picked (opus-5, sonnet-5, …) is the registry
+        # model it names (§G); otherwise the tier's Anthropic model (Phase 8).
+        from core.tier_resolver import family_model as _cl_model
+        from models.model_router import resolve_explicit_alias as _cl_alias
         _claude_tools_model = (
-            _tool_model_id          if _tool_provider == "claude" else
-            SOLUTION_MODEL          if _model_hint == "solution" else
-            CLAUDE_OPUS_48_MODEL    if _model_hint == "opus-4-8" else
-            CLAUDE_OPUS_5_MODEL     if _model_hint == "opus-5" else
-            CLAUDE_SONNET_5_MODEL   if _model_hint == "sonnet-5" else
-            CLAUDE_HAIKU            if _model_hint == "haiku" else
-            CLAUDE_PRIMARY_MODEL
-        )
+            _tool_model_id if _tool_provider == "claude" else
+            _cl_alias(_model_hint) if _model_hint in ("opus-4-8", "opus-5", "sonnet-5") else ""
+        ) or _cl_model(_Tier.SIMPLE if _model_hint == "haiku" else _Tier.COMPLEX, "anthropic")
         _meta["model"] = _claude_tools_model
 
         try:
@@ -13363,7 +13292,7 @@ def openai_responses(
         )
 
     # ── Validate tools mandatory for deep-research models ─────────
-    if req.model in _DEEP_RESEARCH_MODELS and not req.tools:
+    if _requires_tools(req.model) and not req.tools:
         from fastapi.responses import JSONResponse as _JR_dr
         return _JR_dr(
             status_code=422,
@@ -15277,8 +15206,7 @@ async def voice_stt(
 
 # ============================================================
 # IMAGE ASK ENDPOINT — multipart/form-data with optional image
-# Routes vision queries directly to Gemini (GEMINI_VISION_MODEL —
-# defaults to gemini-3.1-flash-image; env-overridable).
+# Routes vision queries through the image-input tier's assignments.
 # Falls back to /ask SSE stream when no image is attached.
 # ============================================================
 
@@ -15307,10 +15235,10 @@ async def ask_with_image(
     Multipart endpoint for chat messages that may include an image attachment.
 
     Vision routing (configurable via env vars):
-      - model is a LOCAL_VISION_MODELS entry (e.g. Kimi-k2.5, glm-4.5v)
+      - model is a deployment-local registry model (e.g. Kimi-k2.5, glm-4.5v)
           → in-house GPU proxy via OpenAI-compat API (no data leaves the network)
       - model is any other value / empty
-          → PRIMARY_VISION_PROVIDER (default: gemini) with FALLBACK_VISION_PROVIDER
+          → the image-input tier's providers, in priority order
           → if LLM_PROXY_URL set: routed through proxy service (the LLM proxy server)
           → otherwise: called directly from this process (dev mode)
 
@@ -15496,13 +15424,8 @@ async def ask_with_image(
         _labeled_question = question
 
     # ── Route vision call ─────────────────────────────────────
-    from core.model_registry import (
-        PRIMARY_VISION_PROVIDER,
-        FALLBACK_VISION_PROVIDER,
-        LOCAL_VISION_MODELS,
-        GEMINI_VISION_MODEL as _GEMINI_MODEL,
-        rates_for as _rates_for,
-    )
+    from core.model_registry import rates_for as _rates_for
+    from models.model_router import is_deployment_local as _vis_is_local
 
     # Resolve the actual model name — mirrors the text /ask path convention:
     #   model="local" + local_model="Kimi-k2.5"  → _model_hint = "Kimi-k2.5"
@@ -15510,7 +15433,7 @@ async def ask_with_image(
     #   model="" (auto)                           → _model_hint = ""
     _raw_model  = (model or "").strip()
     _model_hint = (local_model or "").strip() if _raw_model == "local" else _raw_model
-    _vision_label = _model_hint or PRIMARY_VISION_PROVIDER
+    _vision_label = _model_hint or "image-input"
     _in_tok = _out_tok = 0
     _start  = time.time()
 
@@ -15556,18 +15479,11 @@ async def ask_with_image(
 
     # ── Which provider analyses the image, in which order ──────────────────
     #
-    # Phase 6 §N.1 step 5 / §F "Image analysis". PRIMARY_VISION_PROVIDER and
-    # FALLBACK_VISION_PROVIDER named PROVIDERS in application config — two of
-    # the leaks R3 tracks — and hardcoded a chain of exactly two. The
-    # image-input tier expresses the same thing as data: its assignments are
-    # already priority-ordered, and priority IS the primary→fallback order,
-    # for as many entries as an administrator cares to add.
-    #
-    # LOCAL_VISION_MODELS stays for now as the allow-list for a USER'S
-    # explicit pick, which is not a governed decision. Replacing it with
-    # capabilities.modality is Phase 7, where the picker itself is rebuilt.
+    # Phase 6 §N.1 step 5 / §F "Image analysis": the image-input tier's
+    # assignments, priority-ordered, are the primary→fallback order. A user's
+    # explicit pick of a deployment-local model goes to the local gateway.
     def _vision_provider_chain() -> list:
-        """Ordered provider families to try. Falls back to the env pair."""
+        """Ordered provider families from the image-input tier; [] when unassigned."""
         try:
             from core.tiers import Tier as _VTier
             from core.tier_resolver import resolve_tier_candidates as _vcands
@@ -15578,19 +15494,12 @@ async def ask_with_image(
             if fams:
                 return fams
         except Exception as _vexc:      # noqa: BLE001
-            # Unlike image-output and video-generation, degrading here is
-            # correct: every candidate returns TEXT ABOUT an image, so the
-            # env pair answers the same question, just without governance.
-            logger.warning(
-                f"ask_with_image: image-input tier unresolved ({_vexc}) — "
-                f"falling back to PRIMARY/FALLBACK_VISION_PROVIDER"
-            )
-        return [p for p in (PRIMARY_VISION_PROVIDER, FALLBACK_VISION_PROVIDER)
-                if p and p.lower() != "none"]
+            logger.warning(f"ask_with_image: image-input tier unresolved ({_vexc})")
+        return []
 
     try:
-        if _model_hint and _model_hint in LOCAL_VISION_MODELS:
-            # User explicitly selected a local vision model (Kimi-k2.5, glm-4.5v, …)
+        if _model_hint and _vis_is_local(_model_hint):
+            # User explicitly selected a deployment-local model (Kimi-k2.5, glm-4.5v, …)
             _answer, _in_tok, _out_tok = _call_local_vision()
             _vision_label = _model_hint
         else:
@@ -15623,7 +15532,7 @@ async def ask_with_image(
     _latency = round(time.time() - _start, 3)
 
     # Cost estimation
-    _cost_in, _cost_out = _rates_for(_GEMINI_MODEL)
+    _cost_in, _cost_out = _rates_for(_vision_label)
     _img_cost = round((_in_tok * _cost_in + _out_tok * _cost_out) / 1_000_000, 6)
 
     # ── Persist ALL uploaded images SERVER-SIDE so previews survive

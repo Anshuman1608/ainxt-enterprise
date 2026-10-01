@@ -86,17 +86,6 @@ def test_the_legacy_hint_is_a_real_hint():
         f"_coerce_tier raises ValueError for exactly this")
 
 
-def test_an_operator_pin_still_wins():
-    """D22. A named model is a human decision and outranks a capability
-    request — the same precedence Phase 6.5 item 1 set for run()."""
-    src = _src(WORKER)
-    assert "if ENRICH_MODEL:" in src
-    assert '{"model_hint": ENRICH_MODEL}' in src
-    i_pin = src.index("if ENRICH_MODEL:")
-    i_tier = src.index('"tier": Tier.SIMPLE')
-    assert i_pin < i_tier, "the tier branch is checked before the operator's pin"
-
-
 def test_the_call_dispatches_through_the_kwargs_mapping():
     """A branch that computes _route_kwargs and then does not use them is the
     way this change silently becomes a no-op."""

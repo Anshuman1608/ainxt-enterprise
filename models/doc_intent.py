@@ -15,7 +15,7 @@
 #   none      — not a document request at all
 #
 # RULE: intent classification is done ENTIRELY by the fast in-house/quantized
-# local model (config.DOC_INTENT_MODEL, e.g. gemma/kimi/glm-class). There is NO
+# model the intent-classification tier is assigned (e.g. gemma/kimi/glm-class). There is NO
 # regex-based intent detection anywhere. Authoring is done later by the cloud
 # model ("complex" → Claude Sonnet). The model is instructed to ALWAYS return a
 # concrete format so `is_doc` alone is enough to route to document generation.
@@ -31,17 +31,7 @@ from core.logger import logger
 
 # Phase 6 §N.1 step 2 / §F "Document intent classification".
 #
-# Read the RAW env var rather than core.config.DOC_INTENT_MODEL, which
-# coalesces blank to "haiku" and so can never be empty — and an override that
-# is always set would permanently beat the tier assignment it is supposed to
-# be deprecated in favour of. Blank here means "no override; ask for the
-# intent-classification tier".
-#
-# The "haiku" default moves to the legacy_hint at the call site below, where
-# it is what it always was: the model this call site used before governance
-# existed, kept for deployments that have not opted in (D15).
-import os as _os
-_INTENT_MODEL = (_os.getenv("DOC_INTENT_MODEL", "") or "").strip()
+# Asks the intent-classification tier (Phase 8 removed the env override).
 
 # Single source of truth for doc-gen intents. "none" = not a document request.
 ACTION_INTENTS = ("generate", "summarize", "convert", "extract", "compare", "revise")
@@ -474,8 +464,7 @@ def classify(text: str, *, has_attachments: bool = False,
         from models.model_router import tier_request as _tier_request
         raw = (model_router.generate(
             prompt, return_meta=False,
-            **_tier_request(_Tier.INTENT_CLASSIFICATION, "haiku",
-                            _INTENT_MODEL, override_name="DOC_INTENT_MODEL"),
+            **_tier_request(_Tier.INTENT_CLASSIFICATION, "haiku"),
         ) or "").strip()
         if not raw or raw.startswith("Error:"):
             raise RuntimeError(f"all models unavailable ({raw[:80]!r})")

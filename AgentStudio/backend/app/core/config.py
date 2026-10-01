@@ -113,18 +113,10 @@ def factory_model() -> str:
     ``factory_model()`` call sites across the engine, the platform-wide
     fallback whenever nothing more specific picks a model.
 
-    Resolution order: explicit env override → the admin's configured default
-    in core.llm_provider_registry (preferring a free/self-hosted model, since
-    this is a cheap, frequent orchestration call, not a specific user-facing
-    generation) → "". Previously this fell through to ``LOCAL_LLM_MODEL``,
-    an env var nothing in this deployment sets (the documented one is
-    ``LOCAL_LLM_MODEL_NAME``) — so on any install configured purely through
-    the "LLM Providers" screen this returned "", which is what made
-    "Create with AI" 400 (an empty ``model`` field sent to Ollama).
+    Resolution: the admin's configured default in core.llm_provider_registry,
+    preferring a free/self-hosted model (a cheap, frequent orchestration call)
+    → "". Phase 8 removed the env override.
     """
-    explicit = os.getenv("FACTORY_MODEL", "").strip()
-    if explicit:
-        return explicit
     try:
         from core.llm_provider_registry import get_default_model_id
         default_id = get_default_model_id(prefer_free=True)
@@ -132,9 +124,8 @@ def factory_model() -> str:
             return default_id
     except Exception as exc:
         from core.logger import logger
-        logger.warning(f"[FACTORY] llm_provider_registry unavailable, falling back "
-                        f"to env-var model resolution: {exc}")
-    return os.getenv("LOCAL_LLM_MODEL", "").strip() or os.getenv("CLAUDE_PRIMARY_MODEL", "").strip()
+        logger.warning(f"[FACTORY] llm_provider_registry unavailable: {exc}")
+    return ""
 
 
 def factory_agent_model() -> str:
@@ -146,15 +137,12 @@ def factory_agent_model() -> str:
     the *generated agents* will run on at execution time — should prefer a
     strong instruction-following model, not necessarily the cheapest one.
 
-    Resolution order: ``ABSTUDIO_AGENT_DEFAULT_MODEL`` override → the admin's
-    configured default in core.llm_provider_registry → ``factory_model()`` as
+    Resolution order: the admin's configured default in
+    core.llm_provider_registry → ``factory_model()`` as
     a last resort (so this is never blank as long as at least one model is
     configured). A user who names a model in the factory chat overrides this
     per-run (see ``workflow_factory/pipeline.py`` ``preferred_model`` handling).
     """
-    explicit = os.getenv("ABSTUDIO_AGENT_DEFAULT_MODEL", "").strip()
-    if explicit:
-        return explicit
     try:
         from core.llm_provider_registry import get_default_model_id
         default_id = get_default_model_id(prefer_free=False)
@@ -288,11 +276,8 @@ def budget_defaults() -> dict:
 
 
 def verifier_model() -> str:
-    """LLM model name for the P4 ``VerifierAgent``. Falls through to
-    ``factory_model()`` when unset so an operator who hasn't configured a
-    dedicated verifier model still gets a working independent pre-ship
-    check on the same SKU the maker uses."""
-    return os.getenv("VERIFIER_MODEL", "").strip() or factory_model()
+    """LLM model name for the P4 ``VerifierAgent``: ``factory_model()`` (Phase 8)."""
+    return factory_model()
 
 
 def verifier_temperature() -> float:
@@ -400,14 +385,8 @@ def triage_max_inbox_items() -> int:
 
 
 def triage_model() -> Optional[str]:
-    """LLM model name the TriageSkill summariser should use.
-
-    Returns ``None`` when unset — TriageSkill falls through to
-    ``factory_model()`` in that case so a fresh install gets a working
-    triage prompt without bespoke configuration.
-    """
-    raw = os.getenv("TRIAGE_MODEL", "").strip()
-    return raw or None
+    """None: TriageSkill falls through to ``factory_model()`` (Phase 8 removed the override)."""
+    return None
 
 
 def triage_include_log_alerts() -> bool:

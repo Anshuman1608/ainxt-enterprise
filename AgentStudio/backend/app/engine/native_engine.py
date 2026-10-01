@@ -3197,8 +3197,7 @@ class NativeEngine(OrchestrationEngine):
                 # swarm planner. The user picks this model in Agent
                 # Configuration (frontend ``AgentModelPicker`` → ``data.modelName``);
                 # without this hand-off the SwarmOrchestrator would resolve
-                # its model from ``SWARM_ORCHESTRATOR_MODEL`` / ``FACTORY_MODEL``
-                # env vars instead — which in SIT can diverge from the
+                # its model from the factory default instead — which in SIT can diverge from the
                 # llm_proxy-populated UI dropdown and surface as planner
                 # "model not found" errors after a clean user pick.
                 _llm_cfg_model = (data.get("llm_config") or {}).get("model_name")
@@ -3208,17 +3207,15 @@ class NativeEngine(OrchestrationEngine):
                 # is one grep away from the truth. The three values map 1:1 to
                 # the resolution order ``_extract_llm_config`` uses, so the
                 # operator can see which field actually carried the model
-                # (or if BOTH were blank, in which case env defaults won).
-                logger.info(f'[AGENT] [SWARM] model_resolution node_id={node_id} llm_config.model_name={_llm_cfg_model!r} data.modelName={_node_model!r} resolved={_parent_node_model!r} (blank → env SWARM_ORCHESTRATOR_MODEL/FACTORY_MODEL wins)')
+                # (or if BOTH were blank, in which case the factory default won).
+                logger.info(f'[AGENT] [SWARM] model_resolution node_id={node_id} llm_config.model_name={_llm_cfg_model!r} data.modelName={_node_model!r} resolved={_parent_node_model!r} (blank → the factory default wins)')
 
                 def _swarm_runtime_factory():
                     return _SwarmRuntime(
                         runner_factory=_runner_factory,
                         orchestrator_model=_parent_node_model,
                         # Same model runs planner AND reducer — the user
-                        # picked one model in Agent Configuration; surface
-                        # divergence only via explicit env override
-                        # (``SWARM_AGGREGATOR_MODEL``) for advanced ops.
+                        # picked one model in Agent Configuration.
                         aggregator_model=_parent_node_model,
                     )
 

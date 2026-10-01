@@ -322,74 +322,34 @@ def _normalise_model(model: str) -> str:
     here; full model IDs pass through unchanged so the LLM proxy calls the
     exact model the user selected.
     """
-    from core.model_registry import (
-        CLAUDE_PRIMARY_MODEL, CLAUDE_OPUS_MODEL,
-        CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL, CLAUDE_HAIKU,
-        OPENAI_CODING_MODEL, OPENAI_SIMPLE_MODEL,
-        OPENAI_LATEST_MODEL, GEMINI_VISION_MODEL,
-        GEMINI_TEXT_MODEL, GEMINI_CODING_LITE_MODEL, GEMINI_IMAGE_MODEL,
-        ENABLE_OPUS,
-    )
     m = model.lower().strip()
 
-    # Observability only — does NOT change what this function returns.
-    # Records that a CLI client sent a provider/SKU-shaped alias rather than a
-    # concrete model id, so the Phase 1 compatibility shim has a removal gate
-    # (see core/tiers.py::note_legacy_alias). Concrete model ids and in-house
-    # names fall through the table and are not counted.
+    # Observability only: records that a CLI client sent a legacy alias, so the
+    # boundary shim has a removal gate (core/tiers.py::note_legacy_alias).
     from core.tiers import LEGACY_INBOUND_ALIASES as _LEGACY_ALIASES, note_legacy_alias
     if m in _LEGACY_ALIASES:
         note_legacy_alias(m, surface="cli")
 
-    # ── Anthropic Claude ───────────────────────────────────────────────────────
-    if m in ("claude", "sonnet", "complex", "claude-sonnet-4-6"):
-        return CLAUDE_PRIMARY_MODEL
-    # Opus hints — resolve to the concrete model ID (blocked models are rejected
-    # by the caller immediately after _normalise_model() returns).
-    if m in ("opus", "solution", "opus-4-7", "claude-opus-4-7"):
-        return CLAUDE_OPUS_MODEL
-    if m in ("opus-4-8", "claude-opus-4-8"):
-        return CLAUDE_OPUS_48_MODEL
-    if m in ("opus-5", "claude-opus-5"):
-        return CLAUDE_OPUS_5_MODEL
-    if m == "haiku":
-        return CLAUDE_HAIKU
-
-    # ── OpenAI ─────────────────────────────────────────────────────────────────
-    if m in ("gpt", "gpt-5.4", "medium", "coding", "agents"):
-        return OPENAI_CODING_MODEL
-    if m in ("gpt-mini", "gpt-5-mini", "mini"):
-        return OPENAI_SIMPLE_MODEL
-    if m in ("gpt-5-5", "deep", "latest"):
-        return OPENAI_LATEST_MODEL
-
-    # ── Google ─────────────────────────────────────────────────────────────────
-    if m in ("gemini-3.5-flash", "gemini-coding", "gemini-flash"):
-        return GEMINI_TEXT_MODEL
-    if m in ("gemini-3.1-flash-lite", "gemini-lite", "gemini-coding-lite"):
-        return GEMINI_CODING_LITE_MODEL
-    if m in ("gemini-3.1-flash-image", "gemini-image", "vision"):
-        return GEMINI_IMAGE_MODEL
-    # Generic "gemini" hint + legacy 2.x aliases → current Gemini default
-    # (GEMINI_VISION_MODEL aliases to the image model so legacy /image and
-    # vision-keyword routing continues to land on the image model).
-    if m in ("gemini", "gemini-2.5-flash", "gemini-2.0-flash"):
-        return GEMINI_VISION_MODEL
-
-    # In-house / local models (live catalog or in-house name patterns) pass through
-    # UNCHANGED so the local backend receives the exact id the user selected — never
-    # remapped to Claude (which would both mis-route and bill the user).
+    # In-house / local models pass through UNCHANGED so the local backend gets
+    # the exact id selected — never remapped to a cloud model.
     if _is_in_house_model(m) or _is_local_catalog_model(m):
         return model
-    # Recognised full provider IDs pass through unchanged (e.g. "claude-sonnet-4-6").
-    # Anything unrecognised ("default", blank, an in-house alias) defaults to the
-    # platform-primary Claude model so the agent always reaches a WORKING model
-    # instead of the disabled local tier (which returns "Error generating response").
-    # Full provider IDs pass through unchanged — blocked ones are rejected by the
-    # caller immediately after _normalise_model() returns.
+    # An alias resolves through the registry and the tier assignments (Phase 8);
+    # an id the registry knows, or a provider-shaped one, passes through.
+    from models.model_router import hint_to_model_id
+    resolved = hint_to_model_id(model.strip())
+    if resolved:
+        return resolved
+    if m in _LEGACY_ALIASES:
+        return model    # an alias nothing serves: the blocked/unavailable gate reports it
     if m.startswith(("claude", "gpt", "o1", "o3", "o4", "gemini", "local", "ollama")):
         return model
-    return CLAUDE_PRIMARY_MODEL
+    # Anything unrecognised ("default", blank): the registry's default model.
+    try:
+        from core.llm_provider_registry import get_default_model_id
+        return get_default_model_id(channel="cli") or model
+    except Exception:  # noqa: BLE001
+        return model
 
 
 # ── System text ───────────────────────────────────────────────────────────────
@@ -2444,12 +2404,10 @@ def _persist_model_usage_async(
         try:
             from core.kafka_producer import produce, TOPIC_METRICS
             from core.time_utils import now_ist_iso as _now_ist_iso_cli_mu
-            # Resolve "auto"/"default" to the platform default model so every
-            # model_usages row carries a real, queryable model ID.
+            # "auto"/"default" with nothing dispatched is recorded as "unknown".
             _resolved_model = model
             if not _resolved_model or _resolved_model.strip().lower() in ("auto", "default", ""):
-                from core.model_registry import CLAUDE_PRIMARY_MODEL
-                _resolved_model = CLAUDE_PRIMARY_MODEL
+                _resolved_model = "unknown"   # no model ran; never name one that did not (D91)
             _sent_to_kafka = produce(TOPIC_METRICS, {
                 "event":              "llm_cost",
                 "request_id":         request_id or None,
@@ -3023,8 +2981,8 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
     model_hint  = _normalise_model(req.model)
 
     # ── Blocked-model gate ────────────────────────────────────────────────────
-    # Reject immediately if the requested model is disabled (e.g. any Opus model
-    # when ENABLE_OPUS=false). This fires before the routing log so a blocked
+    # Reject immediately if the requested model is a retired one. This fires
+    # before the routing log so a blocked
     # request never appears as "routing … provider=claude" in the logs.
     from core.model_registry import is_blocked_model as _is_blocked_model
     if _is_blocked_model(model_hint):
@@ -3037,36 +2995,10 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
             detail=f"Model '{req.model}' is not available. Some models are disabled. Please select a different model.",
         )
 
-    # ── G10: server-side model lock for Buddy/cowork ─────────────────────────────
-    # The desktop UI pins Buddy to BUDDY_FORCED_MODEL, but a UI-only lock is
-    # bypassable by a crafted client. When the request is tagged as a cowork surface
-    # (x-ainxt-surface: cowork, or x-ainxt-client: cowork — sent by the Buddy CLI)
-    # AND the lock is enabled, we OVERRIDE the requested model server-side so the
-    # policy cannot be bypassed. Non-cowork traffic (Code tab, IDE, API) is untouched.
+    # G10's server-side Buddy model lock read BUDDY_FORCED_MODEL from .env;
+    # Phase 8 removed it. A lock needs an admin setting (plan.html §Q.4).
     _surface = (request.headers.get("x-ainxt-surface")
                 or request.headers.get("x-ainxt-client") or "").strip().lower().split("/")[0]
-    if _surface == "cowork" and os.getenv("BUDDY_MODEL_LOCKED", "true").strip().lower() in ("1", "true", "yes"):
-        _forced = _normalise_model(os.getenv("BUDDY_FORCED_MODEL", "").strip())
-        if _forced and _forced != model_hint:
-            # BUDDY_FORCED_MODEL is a bare literal with no built-in guarantee it's
-            # still enabled in core.llm_provider_registry — an admin who disables
-            # or removes that exact model in the "LLM Providers" screen would
-            # otherwise silently pin every cowork session to a dead route. Only
-            # force it when it's currently enabled; registry lookup failures
-            # fail OPEN (force anyway) so a transient DB/cache hiccup doesn't
-            # bypass the policy lock.
-            try:
-                from core.llm_provider_registry import get_enabled_models
-                _enabled_ids = {m["model_id"] for m in get_enabled_models()}
-                _forced_ok = not _enabled_ids or _forced in _enabled_ids or _forced.startswith("local")
-            except Exception:
-                _forced_ok = True
-            if _forced_ok:
-                logger.info(f"[CLI] cowork model lock: overriding {model_hint} → {_forced}")
-                model_hint = _forced
-            else:
-                logger.warning(f"[CLI] cowork model lock: BUDDY_FORCED_MODEL={_forced!r} is not "
-                                f"an enabled model in llm_provider_registry — leaving {model_hint!r} in place")
 
     # Utilization channel tag for the model_usages audit row.
     #
@@ -3479,10 +3411,8 @@ async def list_models_compat(request: Request):
     """
     _resolve_user(request)
 
-    # Primary source: the DB-backed "LLM Providers" registry — same admin-managed
-    # data GET /v1/all-models reads exclusively. Falls through to the legacy
-    # env-var-derived catalogue below only if the registry itself can't be read
-    # (e.g. DB unavailable), not merely because it's empty.
+    # The DB-backed "LLM Providers" registry — same admin-managed data
+    # GET /v1/all-models reads. Unreadable means an empty catalogue (Phase 8).
     # This handler also serves /v1/models and /models for IDE and SDK callers
     # (it claims both paths ahead of gateway.py's own registration), so the
     # channel is the caller's, not a literal "cli" — otherwise an admin's
@@ -3493,17 +3423,13 @@ async def list_models_compat(request: Request):
         _channel = getattr(request.state, "client_source", "") or "cli"
         models = _get_cli_style_models(channel=_channel)
     except Exception as exc:
-        logger.warning(f"[CLI /v1/models] llm_provider_registry read failed, "
-                        f"falling back to env-var catalogue: {exc}")
-        models = None
-
-    if models is None:
-        models = _list_models_compat_env_fallback()
+        logger.error(f"[CLI /v1/models] llm_provider_registry read failed: {exc}")
+        models = []
 
     if not any(m.get("id") == "local" for m in models):
         models.append({
             "id": "local", "hint": "local", "provider": "inhouse",
-            "label": os.getenv("LOCAL_LLM_DISPLAY", "Local (In-house)"),
+            "label": "Local (In-house)",
             "tag": "In-house GPU · free · private",
         })
 
@@ -3523,176 +3449,6 @@ async def list_models_compat(request: Request):
         pass
 
     return _finish_list_models_compat(models)
-
-
-def _list_models_compat_env_fallback() -> list:
-    """Legacy catalogue built from core.model_registry env vars — used only
-    when core.llm_provider_registry can't be read at all. See
-    list_models_compat's docstring for why the registry is now primary.
-
-    Phase 7 note — why the ENABLE_* gates below are still here.
-
-    plan.html's Phase 7 says to "delete the per-SKU feature-flag gating inside
-    the CLI env fallback while keeping the fallback itself for the DB-down
-    case". Deleting them here would be wrong, and the reason is the condition
-    this function exists for: it runs ONLY when the registry is unreadable.
-    On that path nothing else honours an operator's decision to disable a SKU
-    — `capabilities.channels` lives in the registry that is down, and
-    `filter_allowed_models` is equally DB-backed, so it cannot re-block the
-    model either. Dropping the gates would make a deliberately disabled model
-    both offered here and servable, precisely while governance is blind.
-
-    So the gates retire in Phase 8, together with the variables they read
-    (§I) — one atomic change rather than a window where a disabled SKU is
-    reachable. Recorded as D63.
-
-    This function is a near-twin of
-    ``AgentStudio/backend/app/api/generation.py::_cli_reference_models_env_fallback``
-    and the two are deliberately NOT unified: that copy exists for the case
-    where ``core`` is not importable at all, so moving the shared body into
-    ``core/`` would make it unreachable in the only situation it serves.
-    ``tests/routers/test_env_fallback_twins.py`` keeps them in step.
-    """
-    try:
-        from core.model_registry import (
-            CLAUDE_PRIMARY_MODEL, CLAUDE_OPUS_MODEL,
-            CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL, CLAUDE_HAIKU,
-            OPENAI_CODING_MODEL, OPENAI_SIMPLE_MODEL,
-            OPENAI_LATEST_MODEL, GEMINI_VISION_MODEL, LOCAL_LLM_DISPLAY,
-            GEMINI_TEXT_MODEL, GEMINI_CODING_LITE_MODEL, GEMINI_IMAGE_MODEL,
-            ENABLE_OPUS, ENABLE_CLI_OPUS_48, ENABLE_CLI_OPUS_5,
-            CLAUDE_SONNET_5_MODEL, ENABLE_SONNET_5,
-            OPENAI_TERA_MODEL, OPENAI_LUNA_MODEL,
-            OPENAI_TERA_DISPLAY, OPENAI_LUNA_DISPLAY,
-            ENABLE_GPT56_TERA, ENABLE_GPT56_LUNA,
-        )
-    except ImportError:
-        # Registry unavailable — read env vars directly with no hardcoded defaults.
-        # Operators must set these vars; empty strings are filtered out of the
-        # model list so unconfigured models are simply not offered.
-        CLAUDE_PRIMARY_MODEL     = os.getenv("CLAUDE_PRIMARY_MODEL", "")
-        CLAUDE_OPUS_MODEL        = os.getenv("CLAUDE_OPUS_MODEL", "")
-        CLAUDE_OPUS_48_MODEL     = os.getenv("CLAUDE_OPUS_48_MODEL", "")
-        CLAUDE_OPUS_5_MODEL      = os.getenv("CLAUDE_OPUS_5_MODEL", "")
-        CLAUDE_HAIKU             = os.getenv("CLAUDE_HAIKU", "")
-        OPENAI_CODING_MODEL      = os.getenv("OPENAI_CODING_MODEL", "")
-        OPENAI_SIMPLE_MODEL      = os.getenv("OPENAI_SIMPLE_MODEL", "")
-        OPENAI_LATEST_MODEL      = os.getenv("OPENAI_LATEST_MODEL", "")
-        GEMINI_TEXT_MODEL        = os.getenv("GEMINI_TEXT_MODEL", "")
-        GEMINI_CODING_LITE_MODEL = os.getenv("GEMINI_CODING_LITE_MODEL", "")
-        GEMINI_IMAGE_MODEL       = os.getenv("GEMINI_IMAGE_MODEL", "")
-        GEMINI_VISION_MODEL      = os.getenv("GEMINI_VISION_MODEL", GEMINI_IMAGE_MODEL)
-        LOCAL_LLM_DISPLAY        = os.getenv("LOCAL_LLM_DISPLAY", "Local (In-house)")
-        ENABLE_OPUS              = os.getenv("ENABLE_OPUS", "true").lower() in ("true", "1", "yes")
-        ENABLE_CLI_OPUS_48       = os.getenv("ENABLE_CLI_OPUS_48", "true").lower() in ("true", "1", "yes")
-        ENABLE_CLI_OPUS_5        = os.getenv("ENABLE_CLI_OPUS_5", "false").lower() in ("true", "1", "yes")
-        CLAUDE_SONNET_5_MODEL    = os.getenv("CLAUDE_SONNET_5_MODEL", "")
-        ENABLE_SONNET_5          = os.getenv("ENABLE_SONNET_5", "true").lower() in ("true", "1", "yes")
-        OPENAI_TERA_MODEL        = os.getenv("OPENAI_TERA_MODEL", "")
-        OPENAI_LUNA_MODEL        = os.getenv("OPENAI_LUNA_MODEL", "")
-        OPENAI_TERA_DISPLAY      = os.getenv("OPENAI_TERA_DISPLAY", "GPT-5.6 Terra")
-        OPENAI_LUNA_DISPLAY      = os.getenv("OPENAI_LUNA_DISPLAY", "GPT-5.6 Luna")
-        ENABLE_GPT56_TERA        = os.getenv("ENABLE_GPT56_TERA", "true").lower() in ("true", "1", "yes")
-        ENABLE_GPT56_LUNA        = os.getenv("ENABLE_GPT56_LUNA", "true").lower() in ("true", "1", "yes")
-
-    models = [
-        # ── Anthropic Claude ──────────────────────────────────────────────────
-        {
-            "id": CLAUDE_PRIMARY_MODEL, "hint": CLAUDE_PRIMARY_MODEL,
-            "provider": "anthropic", "label": "Claude Sonnet 4.6",
-            "tag": "Complex reasoning · SDLC · Primary",
-        },
-    ]
-
-    # Opus models — only add when ENABLE_OPUS=true (env-controlled)
-    if ENABLE_OPUS:
-        models += [
-            {
-                "id": CLAUDE_OPUS_MODEL, "hint": CLAUDE_OPUS_MODEL,
-                "provider": "anthropic", "label": "Claude Opus 4.7",
-                "tag": "Deepest reasoning · most capable",
-            },
-        ]
-    if ENABLE_OPUS and ENABLE_CLI_OPUS_48:
-        models += [
-            {
-                "id": CLAUDE_OPUS_48_MODEL, "hint": CLAUDE_OPUS_48_MODEL,
-                "provider": "anthropic", "label": "Claude Opus 4.8",
-                "tag": "Latest Opus · CLI/IDE opt-in",
-            },
-        ]
-    if ENABLE_CLI_OPUS_5:
-        models += [
-            {
-                "id": CLAUDE_OPUS_5_MODEL, "hint": CLAUDE_OPUS_5_MODEL,
-                "provider": "anthropic", "label": "Claude Opus 5",
-                "tag": "Next-gen Opus · CLI/IDE opt-in",
-            },
-        ]
-
-    # Sonnet 5 — available on all channels, gated by ENABLE_SONNET_5
-    if ENABLE_SONNET_5:
-        models.append({
-            "id": CLAUDE_SONNET_5_MODEL, "hint": "sonnet-5",
-            "provider": "anthropic", "label": "Claude Sonnet 5",
-            "tag": "Next-gen Sonnet · all channels · Anthropic",
-        })
-
-    models += [
-        {
-            "id": CLAUDE_HAIKU, "hint": "haiku",
-            "provider": "anthropic", "label": "Claude Haiku",
-            "tag": "Fast · lightweight tasks",
-        },
-        # ── OpenAI ────────────────────────────────────────────────────────────
-        {
-            "id": OPENAI_CODING_MODEL, "hint": OPENAI_CODING_MODEL,
-            "provider": "openai", "label": "GPT-5.4",
-            "tag": "Coding · agents · OpenAI",
-        },
-        {
-            "id": OPENAI_SIMPLE_MODEL, "hint": "gpt-5-mini",
-            "provider": "openai", "label": "GPT-5-mini",
-            "tag": "Fast · simple Q&A · OpenAI",
-        },
-        {
-            "id": OPENAI_LATEST_MODEL, "hint": "gpt-5-5",
-            "provider": "openai", "label": "GPT-5-5",
-            "tag": "Latest OpenAI · explicit selection",
-        },
-    ]
-
-    # GPT-5.6 Tera — high-capacity variant, gated by ENABLE_GPT56_TERA
-    if ENABLE_GPT56_TERA:
-        models.append({
-            "id": OPENAI_TERA_MODEL, "hint": "tera",
-            "provider": "openai", "label": OPENAI_TERA_DISPLAY,
-            "tag": "High-capacity · GPT-5.6 Tera · OpenAI",
-        })
-
-    # GPT-5.6 Luna — efficient variant, gated by ENABLE_GPT56_LUNA
-    if ENABLE_GPT56_LUNA:
-        models.append({
-            "id": OPENAI_LUNA_MODEL, "hint": "luna",
-            "provider": "openai", "label": OPENAI_LUNA_DISPLAY,
-            "tag": "Efficient · GPT-5.6 Luna · OpenAI",
-        })
-
-    models += [
-        # ── Google Gemini ─────────────────────────────────────────────────────
-        {
-            "id": GEMINI_TEXT_MODEL, "hint": GEMINI_TEXT_MODEL,
-            "provider": "google", "label": "Gemini 3.5 Flash",
-            "tag": "Coding · text · Google",
-        },
-        {
-            "id": GEMINI_CODING_LITE_MODEL, "hint": GEMINI_CODING_LITE_MODEL,
-            "provider": "google", "label": "Gemini 3.1 Flash-Lite",
-            "tag": "Lightweight coding · fast · Google",
-        },
-        # Gemini 3.1 Flash Image model intentionally hidden from CLI /v1/models
-    ]
-    return models
 
 
 def _finish_list_models_compat(models: list) -> dict:

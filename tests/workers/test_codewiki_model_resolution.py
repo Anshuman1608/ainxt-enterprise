@@ -158,16 +158,6 @@ def test_the_fallback_names_the_screen_that_fixes_it():
 # ── Precedence and the ladder ─────────────────────────────────────────────
 
 
-def test_an_operator_pin_skips_resolution_entirely():
-    """D22, and it also keeps the pinned path byte-identical: a deployment
-    that has configured CODEWIKI_MAIN_MODEL must not even consult the tier."""
-    src = _src()
-    assert 'if not (os.getenv("CODEWIKI_MAIN_MODEL") or "").strip():' in src
-    i_guard = src.index('if not (os.getenv("CODEWIKI_MAIN_MODEL") or "").strip():')
-    i_call = src.index("_tier_cfg = _codewiki_llm_from_tier(")
-    assert i_guard < i_call
-
-
 def test_main_and_fallback_come_from_the_candidate_ladder():
     """CodeWiki's --main-model/--fallback-model pair IS a priority ladder, so
     the first two eligible candidates map onto it directly."""
@@ -177,13 +167,6 @@ def test_main_and_fallback_come_from_the_candidate_ladder():
     assert "usable[1][0] if len(usable) > 1 else main" in src, (
         "a single-candidate tier must give main == fallback — that is what "
         "CODEWIKI_FALLBACK_MODEL's default already does and is not a bug")
-
-
-def test_env_still_overrides_each_model_individually():
-    src = _src()
-    for var in ("CODEWIKI_MAIN_MODEL", "CODEWIKI_CLUSTER_MODEL",
-                "CODEWIKI_FALLBACK_MODEL"):
-        assert f'os.getenv("{var}")' in src, f"{var} no longer overrides the tier"
 
 
 def test_the_fallback_model_flag_uses_the_resolved_value():

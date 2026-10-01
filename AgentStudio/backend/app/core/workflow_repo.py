@@ -54,14 +54,6 @@ from app.core.kb_retriever import KB_MODE_NONE
 # deployment that configured its own models gets templates that reference them --
 # previously a seeded template named a shipped cloud id the adopter had no
 # credentials for, and the workflow failed at run time rather than at seed time.
-def _tmpl_model(env_var: str, shipped: str = "") -> str:
-    """Return the env-var value for a model, or ``shipped`` if unset.
-
-    ``shipped`` defaults to ``""`` — callers that pass a concrete model ID
-    as the fallback should migrate to ``""`` so no model name is hardcoded.
-    """
-    return os.getenv(env_var, shipped)
-
 # Canonical "no KB attached" blob — shared default for the agents.knowledge
 # and workflows.knowledge JSONB columns. Defined once so the dozen sites
 # that need to seed a fresh row don't drift on the spelling.
@@ -2954,7 +2946,7 @@ Ground every statement in the inputs and the previous stage's output -- never in
 Pass the message architecture to the next agent.
 Ground every statement in the inputs and the previous stage's output -- never invent facts, figures, names, or policy terms. Ask for missing inputs rather than guessing."""
                         ),
-                        "provider": "custom", "apiKey": "", "modelName": _tmpl_model("CLAUDE_HAIKU"),
+                        "provider": "custom", "apiKey": "", "modelName": "",
                         "temperature": 0.3, "maxTokens": 4096, "topP": 1.0, "baseUrl": "",
                         "tools": [],
                     },
@@ -2968,7 +2960,7 @@ Ground every statement in the inputs and the previous stage's output -- never in
                             """You write channel-native copy. For each target channel in the brief, draft within its exact constraints (word counts, post counts, character limits, hashtag counts, hook-first for video). Reuse the proof points with figures unchanged -- never round or embellish metrics. Produce the final deliverable as a Word document (.docx) - one review pack with one channel per section, each labelled DRAFT - brand review required, and a one-line rationale per channel, using the attached skill(s); keep it clean, consistently formatted, and ready to share. Publishing happens only after human brand approval.
 Ground every statement in the inputs and the previous stage's output -- never invent facts, figures, names, or policy terms. Ask for missing inputs rather than guessing."""
                         ),
-                        "provider": "custom", "apiKey": "", "modelName": _tmpl_model("CLAUDE_OPUS_46_MODEL"),
+                        "provider": "custom", "apiKey": "", "modelName": "",
                         "temperature": 0.6, "maxTokens": 4096, "topP": 1.0, "baseUrl": "",
                         "tools": [],
                         "skills": [
@@ -3083,7 +3075,7 @@ Ground every statement in the inputs and the previous stage's output -- never in
 4. Produce the final deliverables as a Word document (.docx) working draft and a PDF review copy - containing headline, subhead, dateline lead, body paragraphs, proposed-quote slots, boilerplate, media contact, with the embargo line on top, using the attached skill(s); keep them clean, consistently formatted, and ready to share.
 Ground every statement in the inputs and the previous stage's output -- never invent facts, figures, names, or policy terms. Ask for missing inputs rather than guessing."""
                         ),
-                        "provider": "custom", "apiKey": "", "modelName": _tmpl_model("CLAUDE_OPUS_46_MODEL"),
+                        "provider": "custom", "apiKey": "", "modelName": "",
                         "temperature": 0.4, "maxTokens": 4096, "topP": 1.0, "baseUrl": "",
                         "tools": [],
                         "skills": [
@@ -4131,7 +4123,7 @@ If information is missing, insufficient, or ambiguous, explicitly state that sta
 
 Produce the output in a format suitable for direct handoff to other agents."""
                         ),
-                        "provider": "custom", "apiKey": "", "modelName": _tmpl_model("CLAUDE_HAIKU"),
+                        "provider": "custom", "apiKey": "", "modelName": "",
                         "temperature": 0.1, "maxTokens": 8192, "topP": 1.0, "baseUrl": "",
                         "tools": [],
                     },
@@ -4254,7 +4246,7 @@ Rules
 - Prefer "Not Specified" over making assumptions.
 - Sort the Risk Register by Risk Score (highest first)."""
                         ),
-                        "provider": "custom", "apiKey": "", "modelName": _tmpl_model("CLAUDE_HAIKU"),
+                        "provider": "custom", "apiKey": "", "modelName": "",
                         "temperature": 0.1, "maxTokens": 8192, "topP": 1.0, "baseUrl": "",
                         "tools": [],
                     },
@@ -4341,7 +4333,7 @@ Rules
   [TBD – Stakeholder Input Required]
 - Keep the structure concise, executive-ready, and suitable for committee review."""
                         ),
-                        "provider": "custom", "apiKey": "", "modelName": _tmpl_model("CLAUDE_HAIKU"),
+                        "provider": "custom", "apiKey": "", "modelName": "",
                         "temperature": 0.1, "maxTokens": 8192, "topP": 1.0, "baseUrl": "",
                         "tools": [],
                     },
@@ -4464,7 +4456,7 @@ Rules
   [TBD – Stakeholder Input Required]
 - Ensure the document is suitable for executive review and direct handoff to delivery teams."""
                         ),
-                        "provider": "custom", "apiKey": "", "modelName": _tmpl_model("CLAUDE_HAIKU"),
+                        "provider": "custom", "apiKey": "", "modelName": "",
                         "temperature": 0.1, "maxTokens": 8192, "topP": 1.0, "baseUrl": "",
                         "tools": [],
                     },
@@ -4563,7 +4555,7 @@ Rules
 - Ensure all tables remain tables.
 - Produce a final professional .docx document suitable for executive review and approval workflows."""
                         ),
-                        "provider": "custom", "apiKey": "", "modelName": _tmpl_model("CLAUDE_OPUS_MODEL"),
+                        "provider": "custom", "apiKey": "", "modelName": "",
                         "temperature": 0.1, "maxTokens": 32000, "topP": 1.0, "baseUrl": "",
                         "tools": [],
                         "skills": [

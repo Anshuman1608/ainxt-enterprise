@@ -18,7 +18,6 @@ from core.claude_cache_egress import (
 )
 from agents.compliance_engine import compliance_engine
 
-from core.model_registry import CLAUDE_PRIMARY_MODEL
 
 
 def _resolve_provider_base_url(family: str, env_var: str):
@@ -42,7 +41,13 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
 from core.ckms import load_at_boot as _ckms_load_at_boot
 _ckms_load_at_boot()
 
-CLAUDE_MODEL = CLAUDE_PRIMARY_MODEL
+
+
+def _default_model() -> str:
+    """Model for a call that names none: the complex tier's Anthropic model (§I.2)."""
+    from core.tiers import Tier
+    from core.tier_resolver import family_model
+    return family_model(Tier.COMPLEX, "anthropic")
 
 # Stream extended-thinking (reasoning) deltas live as first-class events, not
 # only as a post-hoc __meta__.thinking blob. Yields a ReasoningMarker per
@@ -116,20 +121,6 @@ def _log_cache_effectiveness(
 
 class ClaudeGateway:
     from core.model_registry import BLOCKED_MODELS
-
-    # CLAUDE_MODEL (= CLAUDE_PRIMARY_MODEL) is blank for any deployment
-    # configured purely through the "LLM Providers" admin screen — install.sh
-    # only ever writes the raw ANTHROPIC_API_KEY, never this role-specific
-    # override (see core/model_registry.py). core.model_registry.BLOCKED_MODELS
-    # can itself contain "" (e.g. CLAUDE_OPUS_5_MODEL, also blank by default,
-    # gets added to it whenever ENABLE_CLI_OPUS_5 is off — the default), so
-    # "" in BLOCKED_MODELS is true on a fresh admin-only install. Without the
-    # `CLAUDE_MODEL and` guard, that made "" match, raising this exception at
-    # CLASS-DEFINITION time — meaning gateway_claude.py could never be
-    # imported at all, so EVERY Claude model (not just one) failed with
-    # "Error: no gateway available", regardless of which one was requested.
-    if CLAUDE_MODEL and CLAUDE_MODEL in BLOCKED_MODELS:
-        raise Exception("Blocked Claude model attempted")
 
     def __init__(self):
 
@@ -208,7 +199,7 @@ class ClaudeGateway:
         context: str,
         tools: list,
         tool_executor,
-        model: str = CLAUDE_MODEL,
+        model: str = "",
         max_tokens: int = 32000,
         max_tool_rounds: int = 5,
     ) -> str:
@@ -223,6 +214,7 @@ class ClaudeGateway:
         Returns the final text answer as a plain string.
         tool_executor: callable(tool_name: str, inputs: dict) -> str
         """
+        model = model or _default_model()
         from core.proxy_tool_use import _execute_with_web_search_governance, _WebSearchBudgetExhausted, flush_web_search_billing
         _upstream = _get_request_id()
         request_id = _upstream if _upstream and _upstream != "-" else str(uuid.uuid4())
@@ -424,12 +416,13 @@ class ClaudeGateway:
     def generate(
         self,
         prompt,
-        model: str = CLAUDE_MODEL,
+        model: str = "",
         temperature: float = 0,
         max_tokens: int = 32000,
         stream: bool = True
     ) -> Generator[str, None, None]:
         """prompt: str (single turn) OR list[dict] (multi-turn OpenAI-format messages array)."""
+        model = model or _default_model()
 
         _upstream = _get_request_id()
         request_id = _upstream if _upstream and _upstream != "-" else str(uuid.uuid4())
@@ -485,12 +478,10 @@ class ClaudeGateway:
             from core.retry import retry_llm
             from core.circuit_breaker import get_breaker
 
-            # Models that reject the `temperature` parameter — see
-            # core.model_registry.models_without_temperature() for the
-            # maintained default list (opus-5, sonnet-5, opus-4-7/4-8, ...),
-            # additive with MODELS_WITHOUT_TEMPERATURE for anything newer.
-            from core.model_registry import models_without_temperature
-            _supports_temp = not model.startswith(models_without_temperature())
+            # Models that reject `temperature`: the registry row's
+            # supports_temperature, else core.model_registry's built-in prefixes.
+            from core.model_registry import accepts_temperature
+            _supports_temp = accepts_temperature(model)
             _base_kwargs: dict = {
                 "model":        model,
                 "max_tokens":   max_tokens,

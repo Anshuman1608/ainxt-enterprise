@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Migration Part AE1's input: the .env-era price of each model (Phase 8).
+"""Migration Parts AC1 and AE1's inputs: the .env-era models and prices (Phase 8).
 
 The only place the removed model env vars are still named in application code,
 and only so their prices survive the removal. Excluded from the legacy-env-refs
@@ -42,3 +42,48 @@ def env_prices(environ=None) -> dict:
         if mid:
             out[mid] = (cin, cout)   # a later entry wins, as in the old dict literal
     return out
+
+
+
+def env_video_price(environ=None) -> tuple:
+    """(the env-pinned video model id or "", its per-second price)."""
+    env = os.environ if environ is None else environ
+    try:
+        rate = float(env.get("VEO_COST_PER_SECOND") or "0.40")
+    except ValueError:
+        rate = 0.40
+    return (env.get("VEO_MODEL") or "").strip(), rate
+
+
+# Env var → (family, tier_tags, billing_tier), used ONLY by migration Part AC1's
+# one-time backfill (db/migrate.py), read straight from the environment. This is the one deliberate hardcoded mapping in the whole
+# LLM-provider-config feature — its entire purpose is migrating deployments
+# OFF the env-var/hardcoded-literal model system and into the DB-backed
+# llm_providers/llm_models tables that core/llm_provider_registry.py reads.
+# New models added after this migration are never added here — they go
+# through the admin "LLM Providers" screen instead.
+AC1_MODEL_ROLE_TAGS = {
+    "CLAUDE_PRIMARY_MODEL":     ("anthropic", ["complex", "claude", "sonnet"], "paid"),
+    "CLAUDE_HAIKU":             ("anthropic", ["haiku"], "paid"),
+    "CLAUDE_OPUS_MODEL":        ("anthropic", ["solution", "opus"], "paid"),
+    "CLAUDE_OPUS_48_MODEL":     ("anthropic", ["opus-4-8", "opus"], "paid"),
+    "CLAUDE_OPUS_5_MODEL":      ("anthropic", ["opus-5", "opus"], "paid"),
+    "CLAUDE_SONNET_5_MODEL":    ("anthropic", ["sonnet-5"], "paid"),
+    "OPENAI_SIMPLE_MODEL":      ("openai", ["simple", "mini"], "paid"),
+    "OPENAI_CODING_MODEL":      ("openai", ["medium", "coding"], "paid"),
+    "OPENAI_LATEST_MODEL":      ("openai", ["deep", "latest"], "paid"),
+    "OPENAI_TERA_MODEL":        ("openai", ["gpt56-tera"], "paid"),
+    "OPENAI_LUNA_MODEL":        ("openai", ["gpt56-luna"], "paid"),
+    "OPENAI_OSS_MODEL":         ("openai", ["oss"], "free"),
+    "GEMINI_TEXT_MODEL":        ("gemini", ["gemini", "coding"], "paid"),
+    "GEMINI_CODING_LITE_MODEL": ("gemini", ["gemini-lite"], "paid"),
+    "GEMINI_IMAGE_MODEL":       ("gemini", ["vision", "image-gen"], "paid"),
+    "VEO_MODEL":                ("gemini", ["video"], "paid"),
+    # LOCAL_LLM_MODEL_NAME deliberately excluded: unlike every other constant
+    # here (which default to "" and are skipped when unset), it defaults to
+    # the literal placeholder string "local-llm" — not a real, callable
+    # Ollama/local-proxy model name — so seeding it always created a bogus
+    # "local-llm" model row that admins could select but that could never
+    # actually be dispatched. Real local models come from the admin's
+    # "Sync installed models" / "Pull a new model" actions instead.
+}

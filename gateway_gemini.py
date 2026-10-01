@@ -11,7 +11,7 @@ from google import genai
 
 from core.logger import logger, get_request_id as _get_request_id
 from agents.compliance_engine import compliance_engine
-from core.model_registry import GEMINI_VISION_MODEL, GEMINI_IMAGE_MODEL, veo_model as _veo_model
+from core.model_registry import veo_model as _veo_model
 
 
 def _resolve_provider_base_url(family: str, env_var: str):
@@ -27,13 +27,16 @@ def _resolve_provider_base_url(family: str, env_var: str):
         return (os.getenv(env_var) or "").strip() or None
 
 
-# Default model for generate() when caller passes no `model`.
-# GEMINI_VISION_MODEL now defaults to GEMINI_TEXT_MODEL (gemini-3.5-flash) —
-# a multimodal model that can analyse images and return text. Previously
-# aliased to GEMINI_IMAGE_MODEL (gemini-3.1-flash-image) which caused empty
-# responses for vision-analysis calls (response.text = "").
-# Text/coding callers (model_router for TIER_GEMINI) pass model= explicitly.
-MODEL = GEMINI_VISION_MODEL
+
+def _tier_gemini_model(tier_name: str) -> str:
+    from core.tiers import Tier
+    from core.tier_resolver import family_model
+    return family_model(Tier(tier_name), "gemini")
+
+
+def _default_model() -> str:
+    """Model for a call that names none: must return text, so the image-input tier (§I.2)."""
+    return _tier_gemini_model("image-input")
 
 # Gap #2 (7/7): surface Gemini "thought" parts (2.5 thinking models) as
 # first-class reasoning deltas instead of silently discarding them. Emitted
@@ -176,9 +179,7 @@ class GeminiGateway:
         still runs using the precleared_findings the first pass produced.
         Default False preserves full second-pass safety for non-/ask callers.
 
-        model: optional explicit Gemini model ID. When None, falls back to the
-        module-level MODEL constant (GEMINI_VISION_MODEL, which aliases to the
-        image model by default — see model_registry).
+        model: optional explicit Gemini model ID. When None, _default_model().
         """
 
         _upstream = _get_request_id()
@@ -230,7 +231,7 @@ class GeminiGateway:
             from core.retry import retry_llm
             from core.circuit_breaker import get_breaker
 
-            _effective_model = model or MODEL
+            _effective_model = model or _default_model()
 
             def _call():
                 return self.client.models.generate_content(
@@ -330,7 +331,7 @@ class GeminiGateway:
             context: str,
             tools: list,
             tool_executor,
-            model: str = MODEL,
+            model: str = "",
             max_tokens: int = 8000,
             max_tool_rounds: int = 8,
     ) -> str:
@@ -355,6 +356,7 @@ class GeminiGateway:
         from core.prompt_sanitizer import sanitize as _sanitize
         from google.genai import types as _gtypes
 
+        model = model or _default_model()
         system_prompt = _sanitize(system_prompt)
         user_message  = _sanitize(user_message)
 
@@ -691,11 +693,8 @@ class GeminiGateway:
         try:
             from google.genai import types as _gtypes
 
-            # Image-generation model. The caller's image-output tier decides
-            # when it passes one; GEMINI_IMAGE_MODEL is the fallback for
-            # callers that do not. Kept identical to the proxy branch above so
-            # local dev and production pick the same model for the same call.
-            _GEMINI_MULTIMODAL = (model or "").strip() or GEMINI_IMAGE_MODEL
+            # Image-generation model: the caller's, else the image-output tier's.
+            _GEMINI_MULTIMODAL = (model or "").strip() or _tier_gemini_model("image-output")
 
             def _call():
                 return self.client.models.generate_content(
@@ -766,10 +765,8 @@ class GeminiGateway:
         `model` lets the caller pass an already-resolved model id (e.g.
         `routers/chat_router.py` resolves it once up front for its budget
         check and reuses the same value here) — when omitted, resolves via
-        `core.model_registry.veo_model()` (env override → an enabled
-        "gemini"-family registry model tagged "video" → ""). Always the
-        actual value dispatched, never the raw possibly-blank VEO_MODEL
-        constant, so `meta["model"]` is accurate for cost/audit callers.
+        `core.model_registry.veo_model()` (the video-generation tier, or "").
+        Always the actual value dispatched, so `meta["model"]` is accurate.
 
         Veo is a Long-Running Operation:
           1. Submit `models.generate_videos(...)` → returns an Operation handle.
@@ -991,8 +988,7 @@ def generate_with_image(
         _gateway: "GeminiGateway | None" = None,
 ) -> str:
     """
-    Send a prompt + inline image to Gemini vision (model: GEMINI_VISION_MODEL —
-    defaults to gemini-3.5-flash; env-overridable via GEMINI_VISION_MODEL).
+    Send a prompt + inline image to Gemini vision (the image-input tier's Gemini model).
     Returns the full response text (not streamed).
     Compliance checks run on input.
 
@@ -1071,9 +1067,11 @@ def generate_with_image(
         from core.retry import retry_llm
         from core.circuit_breaker import get_breaker
 
+        _vision_model = _default_model()
+
         def _call():
             return gw.client.models.generate_content(
-                model=MODEL,
+                model=_vision_model,
                 contents=_gtypes.Content(parts=parts, role="user"),
             )
 
@@ -1089,13 +1087,13 @@ def generate_with_image(
                 gw._last_input_tokens  = _p
                 gw._last_output_tokens = _c
                 logger.info(
-                    f"[GEMINI USAGE] vision model={MODEL} "
+                    f"[GEMINI USAGE] vision model={_vision_model} "
                     f"prompt={_p} candidates={_c} cached_in={_ci} "
                     f"billed_in={_p - _ci} total={getattr(_um, 'total_token_count', 0) or 0}"
                 )
                 _log_cache_effectiveness(
                     request_id="vision",
-                    model=MODEL,
+                    model=_vision_model,
                     cache_read=_ci,
                     prompt_total=_p,
                     context="vision",

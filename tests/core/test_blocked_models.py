@@ -113,14 +113,7 @@ def test_surrounding_whitespace_is_ignored(deny):
 
 @pytest.mark.parametrize("empty", ["", "   ", None])
 def test_an_empty_id_answers_exactly_what_plain_membership_answered(deny, empty):
-    """NOT a correctness improvement, deliberately.
-
-    "" IS in BLOCKED_MODELS on an admin-only install — the blank SKU constants
-    get added under their flags — and gateway_claude.py:118 records what
-    changing that costs: the check ran at CLASS-DEFINITION time, so "" matching
-    made the module unimportable and EVERY Claude model failed, not one. The
-    matcher must reproduce today's answer in both directions.
-    """
+    """An empty id is not a blocked model (the flag-driven blank entries went in Phase 8)."""
     deny(_RETIRED)
     assert not mreg.is_blocked_model(empty)
 
@@ -249,18 +242,12 @@ def test_blocked_enabled_models_reports_exactly_the_complement(db_rows):
 
 #: The one module that may still test membership directly.
 #:
-#: gateway_claude.py's is a CLASS-DEFINITION-time check on the CLAUDE_MODEL env
-#: constant, not on a caller's pick. Widening it means a deployment that pinned
-#: a dated retired id fails to import the module at all, taking every Claude
-#: model with it — the failure its own comment at :118 describes. Phase 8
-#: deletes the constant.
-#:
 #: agents/sdlc_cli_engine.py calls is_blocked_model() first and then keeps a
-#: lowercased copy: the SDLC guard is case-insensitive and re-reads ENABLE_OPUS
-#: at call time, neither of which the shared matcher does. It only adds to the
-#: matcher's answer, never subtracts. Found by D95's alias resolution.
+#: lowercased copy: the SDLC guard is case-insensitive, which the shared
+#: matcher is not. It only adds to the matcher's answer, never subtracts. Found
+#: by D95's alias resolution. (gateway_claude.py's class-definition check on
+#: the CLAUDE_MODEL env constant went with the constant in Phase 8.)
 ALLOWED_DIRECT = {
-    "gateway_claude.py",
     "agents/sdlc_cli_engine.py",
 }
 

@@ -389,9 +389,8 @@ def test_the_seed_really_does_put_tier_names_in_capabilities():
     capabilities.tier_tags, the row above would be testing a leak that cannot
     happen, and the whole file would be theatre.
     """
-    migrate = (ROOT / "db" / "migrate.py").read_text(encoding="utf-8", errors="replace")
-    i = migrate.index("_AC1_MODEL_ROLE_TAGS")
-    body = migrate[i:i + 4000]
+    # Part AC1's table moved beside its sibling migration input in Phase 8.
+    body = (ROOT / "db" / "phase8_env_prices.py").read_text(encoding="utf-8", errors="replace")
     leaked = sorted(t for t in TIER_NAMES if f'"{t}"' in body)
     assert leaked, (
         "db/migrate.py's role-tag seed no longer writes any tier name into "

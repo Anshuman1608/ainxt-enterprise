@@ -108,33 +108,19 @@ def _normalise(model_id: str) -> str:
 # ── registry resolution ────────────────────────────────────────────────────
 
 def _from_registry() -> ApprovedModels:
-    """Pull defaults from core.model_registry env-resolved constants.
-
-    We accept any uppercase str-valued attribute whose VALUE looks like a
-    known provider model id (via _provider_of). This is more robust than
-    matching attribute-name prefixes — e.g. CLAUDE_HAIKU and SOLUTION_MODEL
-    are obviously model ids by value but don't follow the *_MODEL suffix
-    convention.
-    """
+    """The enabled models in the provider registry (Phase 8: no env constants)."""
     approved = ApprovedModels()
     try:
-        from core import model_registry as mr  # type: ignore
+        from core.llm_provider_registry import get_enabled_models
+        rows = get_enabled_models()
     except Exception as e:
-        logger.warning(f"[llm_spend.approved_models] model_registry import failed: {e}")
+        logger.warning(f"[llm_spend.approved_models] provider registry unavailable: {e}")
         return approved
 
     seen: Set[str] = set()
-    for attr in dir(mr):
-        if not attr.isupper():
-            continue
-        # Skip non-model constants that happen to start with provider words.
-        if attr.endswith("_DISPLAY") or attr.endswith("_PROVIDER"):
-            continue
-        val = getattr(mr, attr, None)
-        if not isinstance(val, str) or not val:
-            continue
-        canon = _normalise(val)
-        if canon in seen:
+    for row in rows:
+        canon = _normalise(row.get("model_id") or "")
+        if not canon or canon in seen:
             continue
         seen.add(canon)
         provider = _provider_of(canon)
@@ -144,7 +130,6 @@ def _from_registry() -> ApprovedModels:
             approved.anthropic.add(canon)
         elif provider == "gemini":
             approved.gemini.add(canon)
-        # Anything else (local-llm, display strings, etc.) is ignored.
     return approved
 
 

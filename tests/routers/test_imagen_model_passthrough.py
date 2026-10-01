@@ -119,7 +119,7 @@ def test_the_direct_dev_path_honours_it_too():
     """The no-proxy branch is what local development runs. If only the proxy
     branch honoured the model, dev and production would pick different models
     for the same call — and the bug would be un-reproducible locally."""
-    assert '_GEMINI_MULTIMODAL = (model or "").strip() or GEMINI_IMAGE_MODEL' in _src(GATEWAY)
+    assert '_GEMINI_MULTIMODAL = (model or "").strip() or _tier_gemini_model("image-output")' in _src(GATEWAY)
 
 
 def test_chat_router_sends_the_tier_resolved_model():

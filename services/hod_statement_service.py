@@ -209,7 +209,7 @@ def generate_and_send_hod(
             log_context=f"dept={corrected_department_name}",
             month=month,
             year=year,
-            model_hint=None,  # uses HOD_STATEMENT_LLM_MODEL
+            model_hint=None,  # the medium tier when narration is enabled
             db=db,
         )
 

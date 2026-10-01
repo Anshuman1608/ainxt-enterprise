@@ -53,19 +53,8 @@ from services.digest_service import (
 # (raise the number) the cohort without code changes.
 MANAGER_DIGEST_MIN_AD_LEVEL: int = int(os.getenv("MANAGER_DIGEST_MIN_AD_LEVEL", "3"))
 
-# Optional independent model hint for manager digests; falls back to the HOD
-# model when not set so a single env var still controls both pipelines.
-# This value is threaded through to _call_llm_for_inferences via its
-# model_hint parameter.
-MANAGER_STATEMENT_LLM_MODEL: str = (
-    os.getenv("MANAGER_STATEMENT_LLM_MODEL")
-    or os.getenv("HOD_STATEMENT_LLM_MODEL", "")
-).strip()
-
-logger.info(
-    "manager_statement: configured min_ad_level=%d llm_model=%r",
-    MANAGER_DIGEST_MIN_AD_LEVEL, MANAGER_STATEMENT_LLM_MODEL,
-)
+# Narration follows HOD_STATEMENT_LLM_ENABLED and the `medium` tier (digest_service).
+logger.info("manager_statement: configured min_ad_level=%d", MANAGER_DIGEST_MIN_AD_LEVEL)
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────
@@ -285,7 +274,7 @@ def generate_and_send_manager(
             log_context=f"manager={manager_email}",
             month=month,
             year=year,
-            model_hint=MANAGER_STATEMENT_LLM_MODEL or None,
+            model_hint=None,
             db=db,
         )
 

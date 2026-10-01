@@ -50,7 +50,7 @@ class WorkerSpec:
     timeout_s:         int            = 90
     # Inherited from the parent agent node's modelName when the runtime
     # promotes a WorkerPlan via ``from_plan_entry``. Empty string falls
-    # through to FACTORY_MODEL in the AgentRunner (which itself routes
+    # through to the factory default in the AgentRunner (which itself routes
     # via the LLM_PROXY-aware helpers, so SIT remains reachable). Adding
     # this here — instead of inferring at runner load — keeps the per-
     # worker model visible to the SwarmRuntime for structured logging
@@ -84,7 +84,7 @@ class WorkerSpec:
 
         ``worker_model`` is forwarded by the SwarmRuntime so every spec
         carries the parent agent's selected model. Empty string is
-        valid — ``AgentRunner`` then falls through to ``FACTORY_MODEL``
+        valid — ``AgentRunner`` then falls through to the factory default
         which itself routes via the LLM_PROXY helpers, so SIT stays
         reachable. Keeping the field on the spec (vs. resolving lazily)
         lets the runtime emit it in structured logs / JSON dumps.

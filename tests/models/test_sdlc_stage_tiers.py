@@ -136,27 +136,24 @@ def test_an_unknown_stage_is_not_silently_given_a_tier():
     assert sdlc_stage_route("no_such_stage") == {"model_hint": ""}
 
 
-def test_the_per_stage_env_pin_still_wins(monkeypatch):
-    """D47. §I restricts SDLC_MODEL_<STAGE> to the eight tier names, but that
-    is Phase 8 — doing it here would break an operator's pin on upgrade."""
+def test_a_per_stage_pin_names_a_tier(monkeypatch):
+    """§I.3, Phase 8: SDLC_MODEL_<STAGE> accepts one of the eight tier names."""
+    from core.tiers import Tier
     from models.model_router import sdlc_stage_route
 
-    monkeypatch.setenv("SDLC_MODEL_CODER", "my-inhouse-qwen")
-    assert sdlc_stage_route("coder") == {"model_hint": "my-inhouse-qwen"}
+    monkeypatch.setenv("SDLC_MODEL_CODER", "medium")
+    assert sdlc_stage_route("coder")["tier"] is Tier.MEDIUM
 
-
-def test_a_pinned_stage_does_not_also_get_the_constraint(monkeypatch):
-    """An operator who names a model has answered the question. Adding
-    require_role on top would be the router second-guessing an explicit
-    instruction — and require_role is meaningless without a tier to rank
-    within."""
+def test_a_model_id_pin_is_ignored(monkeypatch):
+    """A model id is no longer an override: the stage keeps its own tier and constraint."""
+    from core.tier_resolver import ROLE_REVIEW
+    from core.tiers import Tier
     from models.model_router import sdlc_stage_route
 
     monkeypatch.setenv("SDLC_MODEL_CODE_REVIEW", "gpt-5.5")
     route = sdlc_stage_route("code_review")
-    assert route == {"model_hint": "gpt-5.5"}
-    assert "require_role" not in route
-
+    assert route["tier"] is Tier.COMPLEX and route["require_role"] == ROLE_REVIEW
+    assert "model_hint" not in route
 
 # ── The old mechanism is gone ───────────────────────────────────────────────
 

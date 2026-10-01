@@ -41,12 +41,6 @@ from core.logger import logger
 # from a fixed vocabulary, fast, reliably parseable"; that is the
 # intent-classification tier, and an administrator picks what serves it.
 #
-# CIL_INTENT_MODEL survives as a DEPRECATED override (§I.3) for one release.
-# Note it must be genuinely UNSET to let the tier win: a `${VAR:-default}` in
-# docker-compose substitutes on empty as well as unset, which is why the
-# compose default for it is now bare.
-import os as _os
-_INTENT_MODEL = (_os.getenv("CIL_INTENT_MODEL", "") or "").strip()
 
 # ── Classification cache (PERF) ────────────────────────────────────────────
 # classify() previously called the local LLM unconditionally on every turn,
@@ -686,7 +680,7 @@ def classify(text: str, *, rag_mode: str = "off",
         # without needing to reproduce the exact request.
         logger.debug(
             "[cil] SLM input | model=%s user_turn=%r",
-            _INTENT_MODEL or "tier:intent-classification", text[:300],
+            "tier:intent-classification", text[:300],
         )
         # model_router.generate() already cascades small->cloud on outage; a
         # TOTAL outage yields an 'Error:' sentinel which we treat as failure.
@@ -694,8 +688,7 @@ def classify(text: str, *, rag_mode: str = "off",
         from models.model_router import tier_request as _tier_request
         raw = (model_router.generate(
             prompt, return_meta=False,
-            **_tier_request(_Tier.INTENT_CLASSIFICATION, "local_mini",
-                            _INTENT_MODEL, override_name="CIL_INTENT_MODEL"),
+            **_tier_request(_Tier.INTENT_CLASSIFICATION, "local_mini"),
         ) or "").strip()
         # Log the raw SLM response — the single most useful thing for debugging
         # misclassifications (e.g. vid_intent="none" when it should be "generate").

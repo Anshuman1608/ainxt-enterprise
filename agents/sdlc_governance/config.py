@@ -25,7 +25,6 @@ SDLC_GOVERNANCE_FIX_MODEL — concrete model id used by fix_model() for the
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional, Union
 
 from agents.sdlc_cli_utils import _env_str, _env_int
@@ -33,10 +32,7 @@ from core.logger import logger
 
 # core.model_registry only defines env-var-backed string constants (no heavy
 # imports, no I/O) — a top-level import is safe and keeps this module simple.
-from core.model_registry import (
-    CLAUDE_OPUS_MODEL, CLAUDE_OPUS_46_MODEL,
-    is_blocked_model, cli_coder_model, cli_tier_model_id,
-)
+from core.model_registry import is_blocked_model, cli_coder_model, cli_tier_model_id
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -107,8 +103,8 @@ def review_model() -> str:
     tagged role='review' — this is a review gate, and §M.3a makes "a stronger
     model reviews" a role within the tier rather than a tier of its own. A
     preference, so a single-model deployment still runs the scan with author
-    and reviewer coinciding. Falls back to the deprecated .env chain when
-    governance is off or nothing assigned is addressable by the CLI."""
+    and reviewer coinciding. Raises NoEligibleModel when nothing assigned is
+    addressable by the CLI."""
     from core.tiers import Tier
     from core.tier_resolver import ROLE_REVIEW
     return cli_tier_model_id(
@@ -124,12 +120,6 @@ def fix_model() -> str:
     does not review it (§N.1 step 10, D43).
 
     Guard: an env-supplied value still cannot resolve to a BLOCKED_MODELS entry.
-    NOTE (conservative choice — ambiguity not covered by the plan): the guard
-    predicate (BLOCKED_MODELS membership, ENABLE_OPUS-aware) is replicated here
-    against the raw concrete id rather than routed through the shared resolver,
-    because cli_tier_model_id() takes a TIER plus an override and this function
-    wants to log WHICH source won. Kept as-is through step 10 so the logging
-    contract does not change in the same commit as the resolution does.
     """
     default_model = cli_coder_model()
     raw = _env_str("SDLC_GOVERNANCE_FIX_MODEL", "").strip()
@@ -138,13 +128,7 @@ def fix_model() -> str:
                      model=default_model, source="default")
         return default_model
 
-    # ENABLE_OPUS is re-read at call time, so those two stay local; everything
-    # else goes through the shared matcher (D85).
-    opus_off = set()
-    if os.getenv("ENABLE_OPUS", "true").strip().lower() not in ("true", "1", "yes"):
-        opus_off = {CLAUDE_OPUS_MODEL, CLAUDE_OPUS_46_MODEL}
-
-    model = default_model if (raw in opus_off or is_blocked_model(raw)) else raw
+    model = default_model if is_blocked_model(raw) else raw
     logger.info("[SDLC-GOV] Resolved governance fixer model", model=model, source="env")
     return model
 

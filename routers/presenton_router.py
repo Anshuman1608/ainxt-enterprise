@@ -29,7 +29,7 @@ from typing import Optional
 
 from auth.dependencies import get_current_user
 from agents.compliance_engine import compliance_engine
-from core.config import PRESENTON_URL, PRESENTON_USER, PRESENTON_PASSWORD, PPT_LLM_MODEL, PLATFORM_NAME as _PLATFORM_NAME
+from core.config import PRESENTON_URL, PRESENTON_USER, PRESENTON_PASSWORD, PLATFORM_NAME as _PLATFORM_NAME
 
 # Volume mount: container /app_data  →  host $HOME/.ainxt/presenton_data
 _PRESENTON_DATA_DIR = os.path.expanduser(
@@ -188,11 +188,7 @@ def generate_outline(req: OutlineRequest, _user=Depends(get_current_user)):
         # deprecates it in one step; its default is "complex", so a deployment
         # that never set it sees no change.
         from models.model_router import tier_request as _tier_request
-        _ppt_override = PPT_LLM_MODEL if PPT_LLM_MODEL.strip() != "complex" else ""
-        raw = model_router.generate(
-            sanitize(prompt),
-            **_tier_request(Tier.COMPLEX, "complex", _ppt_override,
-                            override_name="PPT_LLM_MODEL"))
+        raw = model_router.generate(sanitize(prompt), **_tier_request(Tier.COMPLEX, "complex"))
         raw = (raw or "").strip()
         raw = re.sub(r"^```[a-z]*\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw.strip())

@@ -336,8 +336,8 @@ def parse_image(path: str, filename: str) -> str:
 
     Delegates to gateway_gemini.generate_with_image(), which already handles BOTH
     transports: it forwards to LLM_PROXY_URL → POST /llm/generate-image when the
-    proxy is configured (UAT/prod), and calls Gemini directly via GEMINI_API_KEY /
-    GEMINI_VISION_MODEL when it is not (dev/OSS).
+    proxy is configured (UAT/prod), and calls Gemini directly via GEMINI_API_KEY and
+    the image-input tier's Gemini model when it is not (dev/OSS).
 
     This used to hand-roll the proxy call only, and raised "LLM_PROXY_URL not set"
     the moment the proxy was absent — so every uploaded image was stored as

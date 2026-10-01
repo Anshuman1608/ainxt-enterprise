@@ -437,57 +437,13 @@ AINXT_API_URL     = os.getenv("AINXT_API_URL",     "")
 AINXT_API_BEARER  = os.getenv("AINXT_API_BEARER",  "")
 AINXT_SESSION_TTL = int(os.getenv("AINXT_SESSION_TTL", "0") or "0")  # seconds; 0 = not set
 
-# Tier → in-house vLLM model ID mapping for ainxt-api routing.
-# All values come exclusively from env vars (set in .env).
-# AINXT_MODEL_DEFAULT is the fallback for any tier not explicitly set.
-# No hardcoded model names here — change .env to reroute without a code deploy.
-AINXT_MODEL_DEFAULT   = os.getenv("AINXT_MODEL_DEFAULT",   "")
-AINXT_MODEL_SIMPLE    = os.getenv("AINXT_MODEL_SIMPLE",    "") or AINXT_MODEL_DEFAULT
-AINXT_MODEL_MEDIUM    = os.getenv("AINXT_MODEL_MEDIUM",    "") or AINXT_MODEL_DEFAULT
-AINXT_MODEL_COMPLEX   = os.getenv("AINXT_MODEL_COMPLEX",   "") or AINXT_MODEL_DEFAULT
-AINXT_MODEL_LOCAL     = os.getenv("AINXT_MODEL_LOCAL",     "") or AINXT_MODEL_DEFAULT
-AINXT_MODEL_LOCAL_MINI = os.getenv("AINXT_MODEL_LOCAL_MINI", "") or AINXT_MODEL_DEFAULT
-
-# Per-tier operator overrides for ainxt-api, highest precedence. This used to
-# be a dict, AINXT_TIER_MAP — §N.1 step 11's whole subject, because it was a
-# SECOND tier system: its own vocabulary (including `local` and `local_mini`,
-# two deployment topologies the governed eight deliberately do not have), its
-# own vendor aliases, and its own env vars, none of which the Tiers screen
-# could see. The header above called these "in-house vLLM model ID"s while the
-# alias comments named claude-sonnet-4-6 — a map whose own documentation
-# disagreed with itself is what an unowned second source of truth looks like.
-_AINXT_TIER_OVERRIDES: dict = {
-    # Both AINXT_MODEL_LOCAL and AINXT_MODEL_LOCAL_MINI fed tiers that now
-    # resolve through `mini`, so both are still honoured. Dropping the first
-    # would silently ignore a pin a deployment had already set, which is the
-    # one thing a migration billed as a no-op must not do.
-    "mini":    ("AINXT_MODEL_LOCAL_MINI",
-                AINXT_MODEL_LOCAL_MINI or AINXT_MODEL_LOCAL),
-    "simple":  ("AINXT_MODEL_SIMPLE",     AINXT_MODEL_SIMPLE),
-    "medium":  ("AINXT_MODEL_MEDIUM",     AINXT_MODEL_MEDIUM),
-    "complex": ("AINXT_MODEL_COMPLEX",    AINXT_MODEL_COMPLEX),
-}
-
-
 def ainxt_model_for(tier_or_alias: str) -> str:
     """Resolve an ainxt-api session model from a tier name or a legacy alias.
 
-    Replaces AINXT_TIER_MAP. It has to be a function, not a dict: resolving a
-    tier needs a live database read, this module is imported before the
-    database exists, and everything imports this module. Hence the lazy
-    imports in the body — the idiom core/model_registry.py::_role_model
-    already uses for the same reason.
-
-    Precedence:
-      1. AINXT_MODEL_<TIER> — an operator naming a model explicitly. Kept
-         because ainxt-api may be fronting an in-house vLLM deployment whose
-         model ids the platform registry does not carry.
-      2. The administrator's tier assignment.
-      3. AINXT_MODEL_DEFAULT.
-
-    Never raises. An unassigned tier degrades to AINXT_MODEL_DEFAULT: this
-    sits on a chat turn, and a 500 because nobody filled in a Tiers row is a
-    worse answer than the deployment's default model.
+    A function, not a dict: resolving a tier needs a live database read and this
+    module is imported before the database exists (hence the lazy imports).
+    The administrator's tier assignment decides (Phase 8 removed the
+    AINXT_MODEL_<TIER> overrides). Never raises: an unassigned tier gives "".
     """
     from core.logger import logger
     from core.tiers import Tier, resolve_legacy_alias, note_legacy_alias
@@ -495,73 +451,34 @@ def ainxt_model_for(tier_or_alias: str) -> str:
     raw = (tier_or_alias or "").strip()
     key = raw.lower()
 
-    # `local` and `local_mini` named hardware, not a capability. The governed
-    # vocabulary has no equivalent, and LEGACY_INBOUND_ALIASES sends
-    # `local_mini` to intent-classification — correct for its one consumer in
-    # §E (the CIL classifier) but wrong here, because this picks the model for
-    # a whole interactive session rather than for a classification. `mini` is
-    # the honest target for both.
+    # `local` and `local_mini` named hardware, not a capability; a whole
+    # interactive session is `mini`, not intent-classification.
     if key in ("local", "local_mini"):
         tier = Tier.MINI
     elif key in ("", "auto", "default"):
-        # "the CIL offered nothing". gateway.py's own flat default for that
-        # case is "medium" (_fp_hint), so the two now agree.
-        tier = Tier.MEDIUM
-    elif key == "gemini":
-        # A VENDOR name, not a model. resolve_legacy_alias calls it
-        # EXPLICIT_MODEL, which is right for a chat picker — "the user named
-        # this" — but useless here: handing ainxt-api the string "gemini" as a
-        # model id would fail. It resolved to AINXT_MODEL_DEFAULT before and it
-        # still does. Offering a vendor where a model is required is a gap in
-        # the selector; this resolver cannot invent the missing answer, and
-        # guessing a family default would silently pick for the user.
-        note_legacy_alias(key, "ainxt-api")
-        return AINXT_MODEL_DEFAULT
+        tier = Tier.MEDIUM    # gateway.py's flat default for "the CIL offered nothing"
     else:
-        # Boundary translation. These values reach here only from the auto
-        # path or from legacy clients, which is resolve_legacy_alias's
-        # documented use; note_legacy_alias feeds the counter whose reading
-        # zero is what lets the shim be removed in Phase 10.
         resolved = resolve_legacy_alias(key)
         if not isinstance(resolved, Tier):
-            # Either EXPLICIT_MODEL (a concrete SKU such as "claude-opus-5")
-            # or not an alias at all (an in-house id such as
-            # "qwen-3.6-35B-A3B"). Both mean a human named a specific model,
-            # so return it UNCHANGED — including its casing, because model ids
-            # are case-sensitive. Same thing gateway.py's own "concrete,
-            # non-alias model ID" branch does.
             if resolved is not None:
+                # A SKU alias: the registry model it names, else the id as given;
+                # a bare vendor name ("gemini") is never forwarded as a model id.
                 note_legacy_alias(key, "ainxt-api")
+                from models.model_router import resolve_explicit_alias
+                return resolve_explicit_alias(key) or ("" if key == "gemini" else raw)
+            # Not an alias: a human named a specific model; returned unchanged,
+            # casing included, because model ids are case-sensitive.
             return raw
         note_legacy_alias(key, "ainxt-api")
         tier = resolved
-
-    env_name, env_value = _AINXT_TIER_OVERRIDES.get(tier.value, ("", ""))
-    if env_value:
-        if env_name and env_name not in _AINXT_OVERRIDE_WARNED:
-            _AINXT_OVERRIDE_WARNED.add(env_name)
-            logger.warning(
-                "%s=%r is set, so it overrides the %r tier assignment for "
-                "ainxt-api. This variable is DEPRECATED — assign a model to "
-                "%r on Model Governance > Tiers and unset it.",
-                env_name, env_value, tier.value, tier.value,
-            )
-        return env_value
 
     try:
         from core.tier_resolver import resolve_tier
         return resolve_tier(tier).model_id
     except Exception as exc:  # noqa: BLE001 — incl. NoEligibleModel
-        logger.warning(
-            "[ainxt-api] tier %r has no eligible model (%s) — using "
-            "AINXT_MODEL_DEFAULT=%r. Assign one on Model Governance > Tiers.",
-            tier.value, exc, AINXT_MODEL_DEFAULT,
-        )
-        return AINXT_MODEL_DEFAULT
-
-
-# Warned-once set, mirroring models/model_router.py::_TIER_OVERRIDE_WARNED.
-_AINXT_OVERRIDE_WARNED: set = set()
+        logger.warning("[ainxt-api] tier %r has no eligible model (%s). "
+                       "Assign one on Model Governance > Tiers.", tier.value, exc)
+        return ""
 
 
 # Which values ainxt_model_for() treats as a tier request rather than as a
@@ -798,17 +715,6 @@ COMPLIANCE_SCAN_LLM_OUTPUT   = os.getenv("COMPLIANCE_SCAN_LLM_OUTPUT",   "false"
 # production without a redeploy if this regresses latency or accuracy.
 KB_FOLLOWUP_CONDENSE_ENABLED = os.getenv("KB_FOLLOWUP_CONDENSE_ENABLED", "true").lower() == "true"
 
-# KB_FOLLOWUP_CONDENSE_MODEL_CHAIN — DEPRECATED explicit pin for the follow-up
-# condenser, which now asks for Tier.SIMPLE. Removed in Phase 8.
-# Default is empty on purpose: a value here is passed as tier_request(override=),
-# which outranks the tier assignment, so a non-empty default would make
-# governance unreachable. Only the first entry is used; ordering is the tier's
-# job (resolve_tier_candidates walks the admin's priority order).
-KB_FOLLOWUP_CONDENSE_MODEL_CHAIN = [
-    m.strip() for m in os.getenv(
-        "KB_FOLLOWUP_CONDENSE_MODEL_CHAIN", ""
-    ).split(",") if m.strip()
-]
 # Controls whether the deterministic HardBlock engine runs in the v1/messages
 # compliance gate (_compliance_check in messages_compat_router.py).
 # Default ON (true) — safe default, no behaviour change in prod.
@@ -1027,10 +933,7 @@ FORWARD_PROXY_URL = os.getenv("FORWARD_PROXY_URL", os.getenv("HTTPS_PROXY", ""))
 #
 # Backward compat: LITELLM_BASE_URL / LITELLM_API_KEY still accepted.
 #
-# Optional — per-tier model preference (comma-separated, priority order):
-#   LOCAL_SIMPLE_MODELS=llama3-8b,mistral-7b
-#   LOCAL_MEDIUM_MODELS=llama3-70b,mixtral-8x7b
-#   LOCAL_COMPLEX_MODELS=llama3-405b
+# Optional:
 #   LOCAL_MODEL_REFRESH_SECS=300
 LOCAL_LLM_BASE_URL = (os.getenv("LOCAL_LLM_BASE_URL") or os.getenv("LITELLM_BASE_URL", "")).rstrip("/")
 LOCAL_LLM_API_KEY  = os.getenv("LOCAL_LLM_API_KEY") or os.getenv("LITELLM_API_KEY", "sk-local")
@@ -1039,28 +942,6 @@ LOCAL_LLM_ENABLED  = bool(LOCAL_LLM_BASE_URL)
 LITELLM_BASE_URL = LOCAL_LLM_BASE_URL
 globals()["LITELLM_API_KEY"] = LOCAL_LLM_API_KEY
 LITELLM_ENABLED  = LOCAL_LLM_ENABLED
-
-# Which model does document-generation INTENT CLASSIFICATION + titling + fuzzy
-# reference resolution.
-#
-# Default is "haiku" (small, fast CLOUD model — Claude Haiku) because intent
-# routing is SUPER CRITICAL: it decides chat-vs-document for EVERY prompt, and a
-# weaker local model over-triggered doc generation on conversational prompts
-# ("tell me a story", "summarize the plot of Hamlet"). Haiku follows the
-# decision-gate prompt far more reliably. A deterministic artifact-signal veto
-# in models.doc_intent.classify() is the second line of defence regardless of
-# model. Set DOC_INTENT_MODEL=local (or local:kimi-k2.7 / local:glm-5.2) to run
-# classification fully in-house once a strong-enough local model is available.
-# Authoring/refine always stays on the cloud "complex" model for quality.
-DOC_INTENT_MODEL = (os.getenv("DOC_INTENT_MODEL", "") or "haiku").strip() or "haiku"
-
-# Model used for general chat with no codebase/KB scope (no repo_filter, no
-# retrieved context). Defaults to "simple" (local LLM tier) for zero cloud cost.
-# Override with any router hint or local model ID:
-#   GENERAL_CHAT_MODEL=simple          → local LLM (default)
-#   GENERAL_CHAT_MODEL=haiku           → Claude Haiku
-#   GENERAL_CHAT_MODEL=local:llama3.1  → specific local model
-GENERAL_CHAT_MODEL = (os.getenv("GENERAL_CHAT_MODEL", "") or "simple").strip() or "simple"
 
 # ── Startup validation (prod mode only) ───────────────────────
 def validate_prod_config() -> None:
@@ -1455,7 +1336,6 @@ KV_BACKEND_MAP = {db: kv_backend_for(db) for db in range(KV_DB_COUNT)}
 PRESENTON_URL      = os.getenv("PRESENTON_URL",      "")
 PRESENTON_USER     = os.getenv("PRESENTON_USER",     APP_OWNER)
 PRESENTON_PASSWORD = os.getenv("PRESENTON_PASSWORD", "")
-PPT_LLM_MODEL      = os.getenv("PPT_LLM_MODEL",      "complex")            # router tier or model ID; "complex" → CLAUDE_PRIMARY_MODEL
 PPT_IMAGE_PROVIDER = os.getenv("PPT_IMAGE_PROVIDER", "gemini_flash")
 
 # ── Build pipeline (SDLC execution) ──────────────────────────

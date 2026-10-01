@@ -300,8 +300,7 @@ class SwarmRuntime:
             # ``orchestrator_model`` is the per-node modelName the user
             # picked in Agent Configuration (forwarded by the workflow
             # engine — see ``native_engine.py`` swarm runtime factory).
-            # When supplied it overrides ``SWARM_ORCHESTRATOR_MODEL`` /
-            # ``FACTORY_MODEL`` so the same model that runs the parent
+            # When supplied it overrides the factory default so the same model that runs the parent
             # agent also drives swarm planning. This is the single
             # source-of-truth fix for the SIT divergence between the
             # UI model dropdown (sourced from llm_proxy /v1/models) and
@@ -317,8 +316,7 @@ class SwarmRuntime:
         # Aggregator inherits the parent-agent model for the same reason
         # the orchestrator does — keeps planner + reducer on the user-
         # picked model end-to-end. Explicit kwarg wins, then the runtime-
-        # supplied ``aggregator_model``, then SWARM_AGGREGATOR_MODEL env,
-        # then factory default. Falls through harmlessly when the caller
+        # supplied ``aggregator_model``, then the factory default. Falls through harmlessly when the caller
         # constructed an aggregator explicitly.
         if aggregator is None:
             self._aggregator = SwarmAggregator(model=aggregator_model)
@@ -425,7 +423,7 @@ class SwarmRuntime:
             _resolved_factory_model = ""
 
         # The worker tier's "effective" model is what AgentRunner will
-        # actually use: the parent-agent model when set, else FACTORY_MODEL.
+        # actually use: the parent-agent model when set, else the factory default.
         _effective_worker_model = self._worker_model or _resolved_factory_model
 
         dump["setup"] = {
@@ -456,24 +454,12 @@ class SwarmRuntime:
                 # modelName when run-stream snapshotted it).
                 "orchestrator_source": (
                     "parent_agent_modelName" if self._worker_model
-                    else ("env:SWARM_ORCHESTRATOR_MODEL"
-                          if os.getenv("SWARM_ORCHESTRATOR_MODEL")
-                          else "env:FACTORY_MODEL_or_default")
+                    else "factory_default"
                 ),
                 "aggregator_source": (
                     "parent_agent_modelName" if self._worker_model
-                    else ("env:SWARM_AGGREGATOR_MODEL"
-                          if os.getenv("SWARM_AGGREGATOR_MODEL")
-                          else "env:FACTORY_MODEL_or_default")
+                    else "factory_default"
                 ),
-                # Echo the env overrides currently in effect so the dump
-                # is the single source of truth for a misrouted run.
-                "env_overrides": {
-                    "SWARM_ORCHESTRATOR_MODEL": os.getenv("SWARM_ORCHESTRATOR_MODEL") or None,
-                    "SWARM_AGGREGATOR_MODEL":   os.getenv("SWARM_AGGREGATOR_MODEL") or None,
-                    "FACTORY_MODEL":            os.getenv("FACTORY_MODEL") or None,
-                    "LOCAL_LLM_MODEL":          os.getenv("LOCAL_LLM_MODEL") or None,
-                },
             },
             "llm_routing": {
                 # Same helper chain non-swarm agents use — confirms

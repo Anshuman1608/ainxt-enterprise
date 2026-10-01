@@ -129,22 +129,6 @@ _MAX_LOG_CHARS = int(os.getenv("CODEWIKI_MAX_LOG_CHARS", "2000000"))  # ~2MB
 # package's own generic defaults (e.g. fallback_model=glm-4p5). Override any
 # of these via their respective CODEWIKI_* env var if the deployment needs a
 # different model/budget.
-# These name specific locally-served models. They are already overridable per
-# call via CODEWIKI_MAIN_MODEL / _CLUSTER_MODEL / _FALLBACK_MODEL; reading the
-# same vars here means a deployment that sets them once gets them everywhere,
-# including in any code path that consults the default directly.
-_CODEWIKI_DEFAULT_MAIN_MODEL = os.getenv("CODEWIKI_MAIN_MODEL", "")
-# CODEWIKI_CLUSTER_MODEL / CODEWIKI_FALLBACK_MODEL default to the main model
-# when unset (2026-09-05 fix) -- previously these fell back to "" (an empty
-# string re-read of the same, usually-unset var), which `codewiki config set`
-# happily accepted and persisted, only surfacing as "config validate" later
-# reporting "Models not configured" -- confirmed live: BASE_URL/API_KEY/
-# MAIN_MODEL all correctly set was NOT enough for `codewiki generate` to run.
-# Most deployments have no reason to run a different model for clustering/
-# fallback than for main generation, so defaulting to main_model means an
-# operator only ever needs to set ONE model var in the common case.
-_CODEWIKI_DEFAULT_CLUSTER_MODEL = os.getenv("CODEWIKI_CLUSTER_MODEL") or _CODEWIKI_DEFAULT_MAIN_MODEL
-_CODEWIKI_DEFAULT_FALLBACK_MODEL = os.getenv("CODEWIKI_FALLBACK_MODEL") or _CODEWIKI_DEFAULT_MAIN_MODEL
 _CODEWIKI_DEFAULT_MAX_TOKENS_FOR_GENERATION = 32768
 _CODEWIKI_DEFAULT_MAX_TOKENS_FOR_CLUSTERING = 131072
 _CODEWIKI_DEFAULT_MAX_TOKEN_PER_MODULE = 36369
@@ -199,8 +183,7 @@ def _codewiki_llm_from_tier(log_info, log_warning) -> dict | None:
     Why the candidate LIST and not resolve_tier(): CodeWiki's own
     ``--main-model`` / ``--fallback-model`` pair IS a priority ladder, so the
     first two eligible candidates map straight onto it. A deployment with one
-    eligible model gets main == fallback, which is exactly what the
-    CODEWIKI_FALLBACK_MODEL default already does today — not a bug.
+    eligible model gets main == fallback — not a bug.
 
     A candidate is eligible when it clears two bars:
 
@@ -244,10 +227,8 @@ def _codewiki_llm_from_tier(log_info, log_warning) -> dict | None:
         log_warning(
             "codewiki: no model assigned to the 'medium' tier can be used — "
             + "; ".join(rejected or ["the tier has no candidates"])
-            + ". Falling back to CODEWIKI_MAIN_MODEL / CODEWIKI_BASE_URL. Set the "
-              "provider's Base URL on Admin > LLM Providers (CodeWiki requires one "
-              "for every provider, Anthropic included) to govern CodeWiki from "
-              "Admin > Model Governance instead."
+            + ". Set the provider's Base URL on Admin > LLM Providers (CodeWiki "
+              "requires one for every provider, Anthropic included)."
         )
         return None
 
@@ -304,11 +285,8 @@ def _sync_codewiki_config_from_env(log_info, log_warning) -> None:
     required to include it but the OpenAI-compatible client codewiki uses
     does.
 
-    main_model deliberately does NOT fall back to the platform's own default
-    chat/agent model -- that can change independently of codewiki, whereas
-    codewiki's main model has been separately validated and should stay
-    pinned to CODEWIKI_DEFAULT_MAIN_MODEL unless explicitly overridden via
-    CODEWIKI_MAIN_MODEL.
+    The models come from the 'medium' tier's assignment (Phase 8 removed the
+    CODEWIKI_*_MODEL overrides); with nothing assigned this raises.
 
     Non-destructive otherwise:
       - Every individual field beyond base-url/api-key is itself optional in
@@ -320,14 +298,8 @@ def _sync_codewiki_config_from_env(log_info, log_warning) -> None:
         the platform's own env (e.g. rotating the LLM API key) takes effect
         on the very next job without needing to restart the worker.
     """
-    # §N.1 step 6: the tier supplies endpoint, credential and models when the
-    # operator has NOT pinned a model. An explicit CODEWIKI_MAIN_MODEL is a
-    # human decision and still outranks the tier — and because this whole
-    # function is the "configure your LLM a second time" step, skipping the
-    # resolution entirely when it is pinned keeps that path byte-identical.
-    _tier_cfg = None
-    if not (os.getenv("CODEWIKI_MAIN_MODEL") or "").strip():
-        _tier_cfg = _codewiki_llm_from_tier(log_info, log_warning)
+    # §N.1 step 6: the tier supplies endpoint, credential and models.
+    _tier_cfg = _codewiki_llm_from_tier(log_info, log_warning)
 
     base_url = os.getenv("CODEWIKI_BASE_URL") or (_tier_cfg or {}).get("base_url")
     if not base_url:
@@ -365,14 +337,13 @@ def _sync_codewiki_config_from_env(log_info, log_warning) -> None:
     codewiki_python = os.getenv("CODEWIKI_PYTHON", "/opt/codewiki-python/bin/python3.12")
     _tier_main     = (_tier_cfg or {}).get("main_model", "")
     _tier_fallback = (_tier_cfg or {}).get("fallback_model", "")
-    main_model      = (os.getenv("CODEWIKI_MAIN_MODEL")
-                       or _tier_main or _CODEWIKI_DEFAULT_MAIN_MODEL)
-    # Clustering has no reason to differ from main generation, which is why
-    # CODEWIKI_CLUSTER_MODEL already defaults to the main model.
-    cluster_model   = (os.getenv("CODEWIKI_CLUSTER_MODEL")
-                       or _tier_main or _CODEWIKI_DEFAULT_CLUSTER_MODEL)
-    fallback_model  = (os.getenv("CODEWIKI_FALLBACK_MODEL")
-                       or _tier_fallback or _CODEWIKI_DEFAULT_FALLBACK_MODEL)
+    if not _tier_main:
+        raise RuntimeError(
+            "No model is assigned to the 'medium' tier, so CodeWiki has nothing to "
+            "run. Assign one on Admin > Model Governance > Tiers, then retry.")
+    main_model      = _tier_main
+    cluster_model   = _tier_main      # clustering has no reason to differ from generation
+    fallback_model  = _tier_fallback or _tier_main
 
     cmd = [
         codewiki_python, "-m", "codewiki", "config", "set",

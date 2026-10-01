@@ -272,14 +272,9 @@ def _profile_preset(profile: str) -> tuple[str, str]:
 def _is_cli_forbidden_model(model_id: str) -> bool:
     """True if `model_id` is in BLOCKED_MODELS and so must never reach a CLI phase.
 
-    BLOCKED_MODELS is the single source of truth: it already encodes the retired
-    ids plus the import-time kill-switches (ENABLE_OPUS / ENABLE_CLI_OPUS_48 /
-    ENABLE_CLI_OPUS_5 / ENABLE_SONNET_5), so any model an operator has enabled —
-    Opus included — may run any CLI phase.
-
-    ENABLE_OPUS is additionally re-read at CALL time (mirroring
-    core.model_registry.cli_model_for_tier) so flipping the kill-switch off takes
-    effect without a restart even though BLOCKED_MODELS was built at import.
+    BLOCKED_MODELS (the static retired set) is the single source of truth, so
+    any model an operator has enabled may run any CLI phase. Matched
+    case-insensitively here, plus the dated-snapshot rule of is_blocked_model.
 
     core.model_registry is imported LAZILY here (not at module top) to keep
     this module import side-effect-free."""
@@ -287,21 +282,10 @@ def _is_cli_forbidden_model(model_id: str) -> bool:
         return True  # empty/invalid model id — fail closed, never spawn
     mid = model_id.strip().lower()
     try:
-        from core.model_registry import (
-            BLOCKED_MODELS, is_blocked_model,
-            CLAUDE_OPUS_MODEL, CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL,
-        )
-        # Both: the shared matcher adds the dated-snapshot rule, the local set
-        # keeps this guard's case-insensitivity and its call-time Opus read.
+        from core.model_registry import BLOCKED_MODELS, is_blocked_model
         if is_blocked_model(model_id):
             return True
-        opus_off = {m.lower() for m in BLOCKED_MODELS}
-        if os.getenv("ENABLE_OPUS", "true").strip().lower() not in ("true", "1", "yes"):
-            opus_off |= {
-                m.lower() for m in
-                (CLAUDE_OPUS_MODEL, CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL)
-            }
-        if mid in opus_off:
+        if mid in {m.lower() for m in BLOCKED_MODELS}:
             return True
     except Exception as e:  # pragma: no cover - defensive; never let this crash the guard
         logger.warning(f"[SDLC-CLI] model guard: could not import BLOCKED_MODELS: {e}")

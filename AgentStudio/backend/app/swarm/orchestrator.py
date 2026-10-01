@@ -851,18 +851,10 @@ class SwarmOrchestrator:
         # text) so the str-only test seam stays unchanged. ``plan()``
         # reads it when assembling debug dumps for failed attempts.
         self._last_finish_reason: str = ""
-        # Resolution: explicit kwarg → SWARM_ORCHESTRATOR_MODEL env →
-        # global FACTORY_MODEL. We deliberately fall through to
-        # FACTORY_MODEL (not a hardcoded literal) so an operator's
-        # FACTORY_MODEL override implicitly governs the orchestrator
-        # too unless SWARM_ORCHESTRATOR_MODEL is set — keeping a single
-        # source of truth for the platform default.
-        from app.core.factory_utils import FACTORY_MODEL
-        self._model: str = (
-            model
-            or os.getenv("SWARM_ORCHESTRATOR_MODEL")
-            or FACTORY_MODEL
-        )
+        # Resolution: explicit kwarg → factory default (the registry's default model), a single source
+        # of truth for the platform default rather than a hardcoded literal.
+        from app.core.factory_utils import DEFAULT_FACTORY_MODEL
+        self._model: str = model or DEFAULT_FACTORY_MODEL
         self._max_workers = max_workers
 
     @property

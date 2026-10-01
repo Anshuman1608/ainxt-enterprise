@@ -1595,12 +1595,10 @@ class ClaudeDirectClient(BaseLLMClient):
             kwargs["system"] = system_text
         if anth_tools:
             kwargs["tools"] = anth_tools
-        # Some Claude models reject `temperature` outright — see
-        # core.model_registry.models_without_temperature() for the
-        # maintained default list (opus-5, sonnet-5, opus-4-7/4-8, ...),
-        # shared with gateway_claude.py so both dispatch paths agree.
-        from core.model_registry import models_without_temperature
-        if not self._model.startswith(models_without_temperature()):
+        # Some Claude models reject `temperature` outright — the registry row's
+        # supports_temperature, else the shared prefixes (same as gateway_claude.py).
+        from core.model_registry import accepts_temperature
+        if accepts_temperature(self._model):
             kwargs["temperature"] = self._temperature
 
         logger.info(
@@ -1720,28 +1718,22 @@ class ClaudeDirectClient(BaseLLMClient):
 # so the fallback obeys the local integration when no proxy is configured
 # and the proxy integration when it is — identical to primary invocation.
 #
-# The identifier ``claude-sonnet-4-6`` matches the CLI's
-# ``core.model_registry.CLAUDE_PRIMARY_MODEL`` (see
-# ``app/api/generation.py:51`` and ``app/core/factory_utils.py:46``), the
-# same value baked into every workflow_repo template default.
+# Historically ``claude-sonnet-4-6``, the value the CLI and every workflow_repo
+# template default once shared; now the registry's default model.
 
 def resolve_fallback_model() -> str:
     """Resolve the auto-failover model at CALL time.
 
-    Read lazily so a live ``.env`` fix (``ABSTUDIO_FALLBACK_LLM_MODEL``) takes
-    effect on the next ``--reload`` without a full restart. This MUST be a
+    Read lazily so an admin change takes effect without a restart. This MUST be a
     cheap, reliably-available model — the historical hardcoded default
     (``claude-sonnet-4-6``) rejected requests with a 403 on any deployment
     that hadn't configured Anthropic, which surfaced as a confusing factory
     error whenever the primary call had a transient blip and the wrapper
-    failed over. Resolution order: explicit env override → the admin's
-    configured default in core.llm_provider_registry, preferring a free/
+    failed over. Resolution: the admin's configured default in
+    core.llm_provider_registry, preferring a free/
     self-hosted model → "" (the caller then classifies blank as "local" and
     resolves against whatever's enabled — see _build_llm_client_for_model).
     """
-    explicit = os.getenv("ABSTUDIO_FALLBACK_LLM_MODEL", "").strip()
-    if explicit:
-        return explicit
     try:
         from core.llm_provider_registry import get_default_model_id
         return get_default_model_id(prefer_free=True) or ""
@@ -2082,7 +2074,6 @@ def _build_llm_client_for_model(llm_config: LLMConfig) -> BaseLLMClient:
                 logger.warning(f"[LLM] llm_provider_registry unavailable while resolving a "
                                 f"blank local model: {exc}")
                 local_model = None
-            local_model = local_model or os.getenv("LOCAL_LLM_MODEL_NAME", "").strip() or os.getenv("LOCAL_LLM_MODEL", "").strip()
             if not local_model:
                 # Nothing enabled anywhere (no provider configured at all yet) —
                 # sending model="" would just get a cryptic "model is required"

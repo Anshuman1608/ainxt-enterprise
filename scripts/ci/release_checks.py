@@ -222,23 +222,13 @@ def check_python_syntax(cfg) -> list[str]:
 
 
 def check_model_hint_coverage(cfg) -> list[str]:
-    """Every model id the degraded-mode catalogue can advertise must map to a
-    routing hint. Four ids did not, so a caller asking for one model was
-    silently served another — including claude-haiku-4-5 being answered by the
-    far costlier Sonnet.
+    """No catalogue may advertise a model the router cannot dispatch.
 
-    The subject moved. This used to read gateway.py::list_oai_models, which was
-    deleted once measuring showed it unreachable — messages_compat_router claims
-    the same two paths earlier and wins. The catalogue that does serve them is
-    registry-backed, so its ids are runtime values and nothing static can check
-    them; that half is covered by gateway's startup audit
-    (_audit_model_hint_coverage) and tests/routers/test_oai_explicit_pick.py.
-    Do not "restore" a static check for it.
-
-    What remains static is the env-var fallback the CLI catalogue uses when the
-    registry is unreadable (D63) — still literal, still dispatched through the
-    hint table, and the one path where a missing hint is unrecoverable because
-    governance is blind there too.
+    The live catalogue is registry-backed, so its ids are runtime values; that
+    half is gateway's startup audit (_audit_model_hint_coverage) and
+    tests/routers/test_oai_explicit_pick.py. Phase 8 (D111) deleted the
+    env-var fallback catalogues this used to read; this guards their return,
+    and the return of gateway.py::list_oai_models (shadowed, plan.html D79).
     """
     g = ROOT / "gateway.py"
     c = ROOT / "routers" / "messages_compat_router.py"
@@ -252,37 +242,11 @@ def check_model_hint_coverage(cfg) -> list[str]:
         return ["gateway.py: list_oai_models() is back. It is shadowed by "
                 "messages_compat_router::list_models_compat on both of its "
                 "paths and serves no request — see plan.html D79."]
-
-    fn = re.search(r"def _list_models_compat_env_fallback\(.*?\n(?=\n\ndef |\Z)",
-                   compat, re.S)
-    body = fn.group(0) if fn else ""
-
-    # Coverage is structural, not value-based: the fallback's ids are env-backed
-    # constants that are blank until an operator sets them, so there is no
-    # literal to compare. Every constant it advertises must reach a
-    # `_OAI_MODEL_MAP[_ALIAS] = ...` assignment in gateway.py, joined through
-    # gateway's own `X as _X` import aliases — which also keeps the two files
-    # from drifting apart about the same constant.
-    aliases = dict(re.findall(r"^\s*([A-Z][A-Z_0-9]*) as (_[A-Z][A-Z_0-9]*),",
-                              src, re.M))
-    covered = set(re.findall(r"_OAI_MODEL_MAP\[(_[A-Z][A-Z_0-9]*)\]\s*=", src))
-    advertised = set(re.findall(r'"id":\s*([A-Z][A-Z_0-9]*)', body))
-    if not advertised:
-        return ["routers/messages_compat_router.py: could not resolve any "
-                "advertised model id in _list_models_compat_env_fallback — "
-                "this check would pass trivially, so failing instead"]
-
-    bad = []
-    for name in sorted(advertised):
-        alias = aliases.get(name)
-        if alias is None:
-            bad.append(f"routers/messages_compat_router.py: the fallback "
-                       f"advertises {name}, which gateway.py does not import — "
-                       f"it cannot be covered by _OAI_MODEL_MAP")
-        elif alias not in covered:
-            bad.append(f"gateway.py: advertised id {name} ({alias}) has no "
-                       f"_OAI_MODEL_MAP[{alias}] = ... entry")
-    return bad
+    if re.search(r"^def _list_models_compat_env_fallback\(", compat, re.M):
+        return ["routers/messages_compat_router.py: the env-var fallback "
+                "catalogue is back; an unreadable registry gives an empty "
+                "catalogue (D111)"]
+    return []
 
 
 def check_docs_panel_coverage(cfg) -> list[str]:
@@ -854,9 +818,10 @@ def check_tier_migration(cfg) -> list[str]:
 # ── Phase 8 prep: references to the env vars Phase 8 removes may only fall ──
 #
 # The list lives in core/legacy_env.py and is read by AST, not imported, so this
-# script keeps running without the app's dependencies. Measured at Rev 21; lower
-# it as modules stop reading a variable, and set it to 0 when Phase 8 lands.
-_LEGACY_ENV_REF_BASELINE = 1288
+# script keeps running without the app's dependencies. Counts code only — a
+# comment or docstring may name a variable to explain history. Lower it as
+# modules stop reading a variable; 0 once Phase 8 lands.
+_LEGACY_ENV_REF_BASELINE = 312
 _LEGACY_ENV_GLOBS = ("*.py", "*.sh", "*.yml", "*.yaml", ".env.example")
 _LEGACY_ENV_EXCLUDED = ("core/legacy_env.py", "scripts/ci/release_checks.py", "db/phase8_env_prices.py")
 
@@ -869,6 +834,32 @@ def _phase8_vars() -> list[str]:
     return []
 
 
+def _code_text(path, text: str) -> str:
+    """The text a reference can live in: no comments, no docstrings (history may name a var)."""
+    if not path.endswith(".py"):
+        return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+    import io
+    import tokenize
+    try:
+        doc_lines = set()
+        for node in ast.walk(ast.parse(text)):
+            body = getattr(node, "body", None)
+            if isinstance(body, list) and body and isinstance(body[0], ast.Expr) \
+                    and isinstance(getattr(body[0], "value", None), ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                doc_lines.update(range(body[0].lineno, body[0].end_lineno + 1))
+        keep = []
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT:
+                continue
+            if tok.type == tokenize.STRING and tok.start[0] in doc_lines:
+                continue
+            keep.append(tok.string)
+        return " ".join(keep)
+    except (SyntaxError, tokenize.TokenError):
+        return text
+
+
 def legacy_env_refs() -> dict[str, int]:
     names = _phase8_vars()
     if not names:
@@ -879,9 +870,10 @@ def legacy_env_refs() -> dict[str, int]:
         if f in _LEGACY_ENV_EXCLUDED or f.startswith(("tests/", "docs/")) or "/tests/" in f:
             continue
         try:
-            n = len(pattern.findall((ROOT / f).read_text(encoding="utf-8", errors="replace")))
+            text = (ROOT / f).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        n = len(pattern.findall(_code_text(f, text)))
         if n:
             per_file[f] = n
     return per_file

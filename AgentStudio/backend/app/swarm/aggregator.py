@@ -51,7 +51,7 @@ class SwarmAggregator:
 
     def __init__(self, llm_fn=None, *, model: Optional[str] = None):
         self._llm_fn = llm_fn  # tests inject a fake
-        self._model = model or os.getenv("SWARM_AGGREGATOR_MODEL") or None
+        self._model = model or None
 
     @property
     def model(self) -> Optional[str]:

@@ -3706,17 +3706,9 @@ def _sanitize_llm_title(llm_title: str, question: str) -> str:
 # names (core/tiers.py). It used to be the literal hint "local", i.e. a
 # deployment topology standing in for a capability.
 #
-# The override is DOC_TITLE_MODEL, which is new. Titling used to read
-# DOC_INTENT_MODEL — the SAME variable models/doc_intent.py reads for document
-# INTENT CLASSIFICATION, with a different default ("local" here, "haiku"
-# there). One variable, two unrelated consumers: setting it to steer intent
-# classification silently moved titling too, and vice versa. DOC_INTENT_MODEL
-# is still honoured here as a deprecated fallback so nothing changes on
-# upgrade for a deployment that set it.
-_TITLE_MODEL_OVERRIDE = (
-    (os.getenv("DOC_TITLE_MODEL", "") or "").strip()
-    or (os.getenv("DOC_INTENT_MODEL", "") or "").strip()
-)
+# The override is DOC_TITLE_MODEL (titling once shared intent classification's
+# variable; Phase 8 removed that one).
+_TITLE_MODEL_OVERRIDE = (os.getenv("DOC_TITLE_MODEL", "") or "").strip()
 
 
 def _title_route() -> dict:

@@ -1,30 +1,14 @@
 # SPDX-License-Identifier: MIT
 # ============================================================
 # AiNxt MODEL ROUTER
-# Signal-based routing — approved models only.
-#
-# Routing table:
-#   simple   → Local LLM (in-house)        private, free, low-latency
-#   medium   → GPT-5.4                    coding, reasoning, agents
-#   complex  → Claude Sonnet 4.6          complex reasoning, SDLC
-#   deep     → GPT-5-5                    latest OpenAI (explicit selection)
-#   solution → Claude Opus 4.7            final synthesis (explicit selection)
-#   opus-4-8 → Claude Opus 4.8            CLI/IDE opt-in
-#   opus-5   → Claude Opus 5              CLI/IDE opt-in (ENABLE_CLI_OPUS_5)
-#   vision   → Gemini 2.5 Flash           image / visual tasks (auto-detected)
-#   gemini   → Gemini 2.5 Flash           explicit Gemini selection (text)
-#
-# BLOCKED: claude-opus-4-5 and older, GPT-5.2 Pro, GPT-5.2
-#
-# Fallback chains (primary unavailable):
-#   simple   → Local → GPT-5 mini → Claude Sonnet → error
-#   medium   → GPT-5.4 → Claude Sonnet → error
-#   complex  → Claude Sonnet → GPT-5.4 → error
-#   deep     → GPT-5-5 → Claude Sonnet → error
-#   solution → Claude Opus 4.7 → Claude Sonnet → error
-#   opus-4-8 → Claude Opus 4.8 → Claude Sonnet → error
-#   opus-5   → Claude Opus 5   → Claude Sonnet → error
-#   vision   → Gemini → Claude Sonnet → error
+# Every request resolves to one of three dispatch paths:
+#   governed  — a capability tier, resolved through the administrator's
+#               assignments (llm_tier_models), with fallback between a tier's
+#               candidates in priority order (§M.5)
+#   registry  — a model the user named, served as itself
+#   local     — a "local:<id>" pick, served by the in-house gateway
+# No model names live here (Phase 8). Retired ids are refused by
+# core.model_registry.BLOCKED_MODELS.
 #
 # Signals evaluated (in priority order):
 #   1. caller model_hint
@@ -55,15 +39,6 @@ from core.tiers import Tier
 # the module-scope import surface as narrow as it was before Phase 5; a test
 # asserts the two agree (tests/models/test_tier_switchover.py).
 _ROLE_REVIEW = "review"
-from core.model_registry import (
-    OPENAI_SIMPLE_MODEL,
-    OPENAI_CODING_MODEL,
-    CLAUDE_PRIMARY_MODEL,
-    CLAUDE_HAIKU,
-    GEMINI_TEXT_MODEL,
-    GEMINI_IMAGE_MODEL,
-    LOCAL_LLM_DISPLAY,
-)
 from core.circuit_breaker import get_breaker
 
 # ── LLM Proxy config ──────────────────────────────────────────
@@ -823,12 +798,9 @@ AclFilter = Callable[[List[str]], List[str]]
 # MIGRATED CALL SITES  (Phase 6)
 # ============================================================
 #
-# Several §D.2 tasks have a per-feature env var that names a model or a hint
-# — CIL_INTENT_MODEL, DOC_INTENT_MODEL, ENRICH_MODEL. §I.3 replaces each with
-# a tier request while KEEPING the variable as a deprecated override for one
-# release, so an operator who had pinned something does not lose the pin on
-# upgrade. That is three-way logic (override / tier / pre-migration hint) and
-# it should exist once, not once per feature.
+# One helper turns a migrated call site's tier into routing kwargs. Phase 8
+# removed the per-feature env overrides (§I.3); the only override left is
+# SDLC_MODEL_<STAGE>, which names a TIER (sdlc_stage_route).
 
 _TIER_OVERRIDE_WARNED: set = set()
 
@@ -840,23 +812,11 @@ def tier_request(tier: Tier, legacy_hint: str,
 
     Returns a mapping to splat into generate()/stream():
 
-        model_router.generate(prompt, **tier_request(
-            Tier.INTENT_CLASSIFICATION, "local_mini",
-            _INTENT_MODEL, override_name="CIL_INTENT_MODEL"))
+        model_router.generate(prompt, **tier_request(Tier.INTENT_CLASSIFICATION, "local_mini"))
 
-    Precedence, highest first:
-
-      1. `override` — a non-blank per-feature env var. The operator named a
-         model explicitly and governance must not second-guess that, for the
-         same reason a user's dropdown pick is not governed. Warned once per
-         variable per process, because it is going away in Phase 8.
-      2. `tier` — the administrator's assignment, when governance is on.
-      3. `legacy_hint` — what this call site passed before it was migrated,
-         used whenever (2) produces nothing. This is D15; see _coerce_tier.
-
-    `legacy_hint` is REQUIRED rather than optional so a migration cannot
-    forget it — the failure it prevents is silent, and a positional argument
-    is the cheapest way to make forgetting impossible.
+    `override`, when non-blank, is a bare hint that replaces the tier (warned
+    once per `override_name`). `legacy_hint` is validated by _coerce_tier and
+    kept for the D15 audit trail; it is not consulted for routing.
     """
     if override and override.strip():
         value = override.strip()
@@ -909,7 +869,7 @@ def chat_complexity_route(complexity: Optional[str]) -> dict:
     agents/tools.py reaches the empty case by default: its no-repo-context
     downgrade assigns ``os.getenv("DOWNGRADE_MODEL", "")``. Coercing that to a
     tier would have raised on the first such turn — the same assumption that
-    bit §N.1 step 6 on ENRICH_MODEL.
+    bit §N.1 step 6 on chunk enrichment.
     """
     key = (complexity or "").strip().lower()
     if not key:
@@ -956,18 +916,19 @@ def sdlc_stage_route(stage: str) -> dict:
         return {"model_hint": ""}
 
     tier, legacy_hint, extra = entry
-    # SDLC_MODEL_<STAGE> survives as a DEPRECATED per-stage pin (§I, Phase 8),
-    # applied through tier_request's override so it warns once per variable
-    # per process exactly like CIL_INTENT_MODEL and DOC_INTENT_MODEL do.
+    # SDLC_MODEL_<STAGE> may name one of the eight TIERS (§I.3, Phase 8): the
+    # stage then asks that tier. Anything else is ignored with a warning.
     override_name = f"SDLC_MODEL_{stage.strip().upper()}"
-    route = tier_request(tier, legacy_hint, os.getenv(override_name, ""),
-                         override_name=override_name)
-    # An override won: it is a bare hint, and a §M constraint on top of an
-    # explicitly named model would be answering a question the operator did
-    # not ask.
-    if "tier" not in route:
-        return route
-    return {**route, **extra}
+    pinned = (os.getenv(override_name) or "").strip().lower()
+    if pinned:
+        try:
+            tier = Tier(pinned)
+        except ValueError:
+            if override_name not in _TIER_OVERRIDE_WARNED:
+                _TIER_OVERRIDE_WARNED.add(override_name)
+                logger.warning("%s=%r is not one of the eight tier names; ignored. "
+                               "Assign models on Model Governance > Tiers.", override_name, pinned)
+    return {**tier_request(tier, legacy_hint), **extra}
 
 
 def sdlc_llm_route(hint=None) -> dict:
@@ -980,7 +941,6 @@ def sdlc_llm_route(hint=None) -> dict:
 
       dict  → routing kwargs from sdlc_stage_route(); used as-is.
       str   → a legacy hint or a concrete model id; route() decides which.
-              SDLC_MODEL_<STAGE> can still name a raw id (§I, Phase 8).
       None  → Tier.COMPLEX, without the review role ("solution" as a bare hint
               carries it through _ALIAS_EXTRAS; this does not). Deliberate
               (D43) — the review role belongs to the two review gates.
@@ -1465,13 +1425,8 @@ def hint_to_model_id(hint: str) -> Optional[str]:
 def _registry_has_family(family: str) -> bool:
     """True if at least one enabled registry model exists for `family`.
 
-    Used by _get_claude()/_get_openai()/_get_gemini()'s "is this provider
-    configured at all" gate, alongside the .env role constants. Without this,
-    those gates returned None whenever CLAUDE_PRIMARY_MODEL/OPENAI_SIMPLE_
-    MODEL/GEMINI_TEXT_MODEL was blank — which install.sh's admin-only
-    provider setup always leaves blank — silently breaking "Auto (Routing)"
-    and every complexity-tier dispatch even though _resolve_tier_model()
-    (see below) fixed what model gets requested once a gateway is obtained.
+    The whole of _get_claude()/_get_openai()/_get_gemini()'s "is this provider
+    configured at all" gate since Phase 8 removed the .env model constants.
     """
     try:
         from core.llm_provider_registry import get_enabled_models
@@ -1756,11 +1711,8 @@ class ModelRouter:
         return self._local
 
     def _get_openai(self) -> Optional[object]:
-        # If no model is configured for this provider, treat it as unavailable.
-        # Model IDs come entirely from env — an empty value means the operator
-        # has not configured OpenAI, so skip it rather than sending an empty
-        # model ID to the API (which would return an error).
-        if not OPENAI_SIMPLE_MODEL and not OPENAI_CODING_MODEL and not _registry_has_family("openai"):
+        # A provider with no enabled registry model is treated as unavailable.
+        if not _registry_has_family("openai"):
             return None
         proxy = _llm_proxy_url()
         if self._openai is not None and isinstance(self._openai, _ProxyGateway) != bool(proxy):
@@ -1777,8 +1729,7 @@ class ModelRouter:
         return self._openai
 
     def _get_claude(self) -> Optional[object]:
-        # If no model is configured for this provider, treat it as unavailable.
-        if not CLAUDE_PRIMARY_MODEL and not CLAUDE_HAIKU and not _registry_has_family("anthropic"):
+        if not _registry_has_family("anthropic"):
             return None
         proxy = _llm_proxy_url()
         if self._claude is not None and isinstance(self._claude, _ProxyGateway) != bool(proxy):
@@ -1795,8 +1746,7 @@ class ModelRouter:
         return self._claude
 
     def _get_gemini(self) -> Optional[object]:
-        # If no model is configured for this provider, treat it as unavailable.
-        if not GEMINI_TEXT_MODEL and not GEMINI_IMAGE_MODEL and not _registry_has_family("gemini"):
+        if not _registry_has_family("gemini"):
             return None
         proxy = _llm_proxy_url()
         if self._gemini is not None and isinstance(self._gemini, _ProxyGateway) != bool(proxy):
@@ -1825,13 +1775,8 @@ class ModelRouter:
 
         For anthropic/openai, prefers the existing cached singleton
         (self._get_claude()/_get_openai()) but falls back to constructing one
-        directly when that returns None — which happens when
-        CLAUDE_PRIMARY_MODEL/OPENAI_SIMPLE_MODEL is unset, i.e. a provider
-        configured PURELY through the admin screen with no matching .env
-        vars at all (gateway_claude.py/gateway_openai.py's __init__ still
-        succeeds in that case via resolve_credential_for_family — see the
-        LLM provider config design doc's Phase 9 notes — only the env-var
-        presence *gate* in _get_claude()/_get_openai() would otherwise block it).
+        directly when that returns None (the gateways' __init__ resolves the
+        credential via resolve_credential_for_family).
         """
         if not provider_model:
             return None, None
@@ -2553,7 +2498,7 @@ class ModelRouter:
         """The one hop of a "local:<id>" pick: the in-house gateway, never a cloud fallback."""
         def _label(ctx, gw):
             actual = ctx.get("local_model") or getattr(gw, "_last_selected_model", None)
-            return f"Local ({actual})" if actual else LOCAL_LLM_DISPLAY
+            return f"Local ({actual})" if actual else "Local (In-house)"
         return _Attempt(
             family="local",
             model=lambda ctx: ctx.get("local_model") or None,

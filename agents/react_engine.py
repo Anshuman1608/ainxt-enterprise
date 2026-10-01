@@ -4,7 +4,7 @@ ReACT Engine — plan → act → observe → reflect → repeat
 
 Reusable iterative reasoning engine for Threads @AiNxt and SDLC pipeline.
 - Reasoning iterations use Claude Sonnet 4.6 (cost control)
-- Final synthesis uses "solution" model hint (Opus if ENABLE_OPUS=true, else Sonnet)
+- Final synthesis uses the "solution" hint: the complex tier, preferring the review role
 - Max 3 iterations (same ceiling as Orchestrator)
 """
 from __future__ import annotations

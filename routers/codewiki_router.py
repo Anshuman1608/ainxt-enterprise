@@ -62,13 +62,9 @@ def codewiki_status(current_user: dict = Depends(get_current_user)):
     requires. Worker liveness mirrors index_router.py's
     _index_worker_liveness_warning() pattern, just pointed at codewiki_queue.
     """
-    # CODEWIKI_MAIN_MODEL has no real fallback either (same as BASE_URL/
-    # API_KEY) -- CODEWIKI_CLUSTER_MODEL/CODEWIKI_FALLBACK_MODEL are excluded
-    # here since workers/codewiki_worker.py now defaults both to whatever
-    # CODEWIKI_MAIN_MODEL resolves to when unset, so they're never actually
-    # required on their own (2026-09-05 fix).
+    # The models come from the 'medium' tier (Phase 8), so only the endpoint is checked here.
     missing_env = [
-        name for name in ("CODEWIKI_BASE_URL", "CODEWIKI_API_KEY", "CODEWIKI_MAIN_MODEL")
+        name for name in ("CODEWIKI_BASE_URL", "CODEWIKI_API_KEY")
         if not os.getenv(name)
     ]
 

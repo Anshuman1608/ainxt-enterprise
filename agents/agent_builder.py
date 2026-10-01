@@ -975,8 +975,7 @@ class AgentRunner:
         try:
             from core.kafka_producer import produce as _kproduce, TOPIC_AGENT_EVENTS as _TOPIC_AGENT_EVENTS
             from models.model_router import model_router as _mr
-            from core.model_registry import OPENAI_CODING_MODEL as _ocm
-            _model_label = getattr(_mr, "last_model_label", _ocm)
+            _model_label = getattr(_mr, "last_model_label", "") or "unknown"
             _in_tok  = int(len(user_message.split()) * 1.3)
             _out_tok = int(len(answer.split()) * 1.3)
             _kproduce(_TOPIC_AGENT_EVENTS, {

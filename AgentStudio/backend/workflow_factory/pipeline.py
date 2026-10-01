@@ -134,7 +134,7 @@ def dedupe_names(names: list[str]) -> list[str]:
 # No model ids are hardcoded here — the table is intentionally empty so that
 # no vendor's models are assumed. Operators who want short-name aliases (e.g.
 # "fast" → their preferred fast model) should extend this table via a local
-# override or set ABSTUDIO_AGENT_DEFAULT_MODEL in their environment.
+# override, or set the default model in Admin → LLM Providers.
 # The _TIER_PREFERENCES_FALLBACK list below is the multi-provider preference path.
 _MODEL_ALIASES: dict = {}
 

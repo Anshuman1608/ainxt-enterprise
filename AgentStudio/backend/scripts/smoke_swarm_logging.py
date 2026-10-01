@@ -138,7 +138,8 @@ CapabilityManifest.build = staticmethod(_stub_build)  # type: ignore[assignment]
 # ---------------------------------------------------------------------------
 
 async def main() -> int:
-    parent_model = os.getenv("CLAUDE_PRIMARY_MODEL", "")
+    from app.core.config import factory_model
+    parent_model = factory_model()
     runtime = SwarmRuntime(
         runner_factory=_runner_factory,
         orchestrator=_StubOrchestrator(model=parent_model),

@@ -77,7 +77,7 @@ AGENTS_FILE = AGENT_DATA_DIR / "agents.json"
 LOGS_FILE = AGENT_DATA_DIR / "agent_logs.jsonl"
 
 from app.core.factory_utils import (
-    FACTORY_MODEL,
+    DEFAULT_FACTORY_MODEL,
     resolve_factory_model as _resolve_factory_model,
     build_factory_llm_config as _build_factory_llm_config,
     call_factory_llm as _call_llm,
@@ -1903,7 +1903,7 @@ class AgentAssembler:
             "skills": all_skills,
             "trigger": blueprint.get("trigger", "manual"),
             "persona": blueprint.get("persona", ""),
-            # Resolve fresh from env so a live FACTORY_MODEL fix (or a local-only
+            # Resolve fresh so a changed default model (or a local-only
             # constraint) is reflected in the assembled agent's default model.
             "model": _resolve_factory_model(),
             "model_params": {
@@ -3016,7 +3016,7 @@ def _worker_spec_to_agent_dict(spec) -> dict:
         "provider":       "custom",
         # Worker inherits parent-agent model (set on the WorkerSpec by
         # the SwarmRuntime — see app/swarm/runtime.py). Falling back to
-        # "" preserves the legacy behaviour of resolving via FACTORY_MODEL
+        # "" preserves the legacy behaviour of resolving via the factory default
         # downstream, which itself routes through the LLM_PROXY helpers.
         "model":          getattr(spec, "worker_model", "") or "",
         "model_name":     getattr(spec, "worker_model", "") or "",
@@ -4184,11 +4184,11 @@ class AgentRunner:
             #   * the parent swarm via ``_worker_spec_to_agent_dict`` —
             #     synthetic workers now carry ``spec.worker_model``.
             # Without this forward-prop, nested swarms silently fell
-            # back to FACTORY_MODEL (e.g. Qwen30B), which is exactly the
+            # back to the factory default (e.g. Qwen30B), which is exactly the
             # mismatch users see when a Sonnet-picked workflow spawns
             # a subagent that itself decomposes: parent sonnet, nested
             # swarm Qwen. ``None`` is fine — the SwarmOrchestrator's own
-            # resolution chain then falls through to env / FACTORY_MODEL
+            # resolution chain then falls through to the factory default
             # as before, preserving backwards compatibility for agents
             # that never set a model.
             _nested_parent_model = (
@@ -4225,7 +4225,7 @@ class AgentRunner:
             # error is debuggable.
             logger.warning(f'[AGENT] AgentRunner: swarm tool init skipped: {_swarm_init_exc}')
             _swarm_tool = None
-        model = agent.get("model") or agent.get("model_name") or FACTORY_MODEL
+        model = agent.get("model") or agent.get("model_name") or DEFAULT_FACTORY_MODEL
         # Agent's configured output-token cap (top-level ``max_tokens`` column
         # on the agents row). Was previously ignored — the run loop hardcoded
         # 2048, silently overriding whatever the user set and truncating long

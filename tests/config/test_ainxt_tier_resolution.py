@@ -48,11 +48,7 @@ def _assigned(monkeypatch: pytest.MonkeyPatch):
     import core.tier_resolver as tr
     monkeypatch.setattr(tr, "resolve_tier",
                         lambda tier, *a, **kw: _RM(f"model-for-{Tier(tier).value}"))
-    for name, _ in cfg._AINXT_TIER_OVERRIDES.values():
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(cfg, "_AINXT_TIER_OVERRIDES",
-                        {k: (n, "") for k, (n, _v) in cfg._AINXT_TIER_OVERRIDES.items()})
-    cfg._AINXT_OVERRIDE_WARNED.clear()
+    monkeypatch.setattr("models.model_router.resolve_explicit_alias", lambda alias: None)
 
 
 # ── The old map's keys all still resolve ──────────────────────────────────
@@ -111,13 +107,12 @@ def test_a_local_model_reference_passes_through():
 
 
 def test_a_bare_vendor_name_is_not_forwarded_as_a_model_id(monkeypatch):
-    """"gemini" resolves to EXPLICIT_MODEL, but it is a VENDOR, not a model.
-    Passing it through would hand ainxt-api the string "gemini" as a model id.
-    It keeps resolving to AINXT_MODEL_DEFAULT exactly as before — picking a
-    vendor instead of a model is a gap in the selector, not something this
-    resolver can invent an answer for."""
-    monkeypatch.setattr(cfg, "AINXT_MODEL_DEFAULT", "the-default")
-    assert cfg.ainxt_model_for("gemini") == "the-default"
+    """"gemini" is a VENDOR: it resolves to that vendor's registry model, or
+    nothing — never the bare word as a model id (Phase 8 removed the default)."""
+    assert cfg.ainxt_model_for("gemini") == ""
+    monkeypatch.setattr("models.model_router.resolve_explicit_alias",
+                        lambda alias: "gemini-x" if alias == "gemini" else None)
+    assert cfg.ainxt_model_for("gemini") == "gemini-x"
 
 
 def test_gemini_stays_in_the_alias_set_so_the_gateway_keeps_routing_it_here():
@@ -138,51 +133,26 @@ def test_an_explicit_sku_alias_is_a_model_not_a_tier():
     assert cfg.ainxt_model_for("sonnet-5") == "sonnet-5"
 
 
-# ── Operator overrides (D28) ──────────────────────────────────────────────
-
-
-def test_an_env_override_still_wins_over_the_assignment(monkeypatch):
-    monkeypatch.setattr(cfg, "_AINXT_TIER_OVERRIDES",
-                        {**cfg._AINXT_TIER_OVERRIDES,
-                         "complex": ("AINXT_MODEL_COMPLEX", "pinned-by-operator")})
-    assert cfg.ainxt_model_for("complex") == "pinned-by-operator"
-
-
-def test_the_override_warns_once_per_variable(monkeypatch, caplog):
-    """Warned so the bypass is visible and countable — that reading zero is
-    what lets Phase 10 remove the variable."""
-    monkeypatch.setattr(cfg, "_AINXT_TIER_OVERRIDES",
-                        {**cfg._AINXT_TIER_OVERRIDES,
-                         "medium": ("AINXT_MODEL_MEDIUM", "pinned")})
-    import logging
-    with caplog.at_level(logging.WARNING):
-        cfg.ainxt_model_for("medium")
-        cfg.ainxt_model_for("gpt")
-    assert sum("AINXT_MODEL_MEDIUM" in r.message for r in caplog.records) == 1
-
-
 # ── Never raise into a chat turn ──────────────────────────────────────────
 
 
-def test_an_unassigned_tier_degrades_to_the_default(monkeypatch):
+def test_an_unassigned_tier_gives_no_model(monkeypatch):
     from core.tier_resolver import NoEligibleModel
     import core.tier_resolver as tr
 
     def _boom(tier, *a, **kw):
         raise NoEligibleModel(Tier(tier), None, {})
     monkeypatch.setattr(tr, "resolve_tier", _boom)
-    monkeypatch.setattr(cfg, "AINXT_MODEL_DEFAULT", "fallback-model")
-    assert cfg.ainxt_model_for("complex") == "fallback-model"
+    assert cfg.ainxt_model_for("complex") == ""
 
 
-def test_a_database_outage_degrades_to_the_default(monkeypatch):
+def test_a_database_outage_gives_no_model(monkeypatch):
     import core.tier_resolver as tr
 
     def _boom(tier, *a, **kw):
         raise RuntimeError("could not connect to server")
     monkeypatch.setattr(tr, "resolve_tier", _boom)
-    monkeypatch.setattr(cfg, "AINXT_MODEL_DEFAULT", "fallback-model")
-    assert cfg.ainxt_model_for("medium") == "fallback-model"
+    assert cfg.ainxt_model_for("medium") == ""
 
 
 # ── The constraint that forced the design ─────────────────────────────────

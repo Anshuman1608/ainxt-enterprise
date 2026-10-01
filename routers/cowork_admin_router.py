@@ -40,18 +40,12 @@ async def get_my_prefs(current_user: dict = Depends(get_current_user)):
 
 @router.get("/model-config")
 async def get_model_config(current_user: dict = Depends(get_current_user)):
-    """Buddy model selection policy — OPS-CONFIGURABLE via gateway env vars so the
-    default/locked model can change per deployment without a UI rebuild.
+    """Buddy model selection policy, read by the desktop at startup.
 
-    Env:
-      BUDDY_FORCED_MODEL   default model id the desktop pins to (default Opus 4.8)
-      BUDDY_MODEL_LOCKED   "true" = hide the picker + disable switching (default true)
-    The desktop reads this at startup; when locked=false the picker returns.
+    Unlocked since Phase 8 removed the env pin; a lock needs an admin
+    setting (plan.html §Q.4). With locked=false the desktop shows its picker.
     """
-    import os
-    forced = os.getenv("BUDDY_FORCED_MODEL", "").strip()
-    locked = os.getenv("BUDDY_MODEL_LOCKED", "true").strip().lower() in ("1", "true", "yes")
-    return {"forced_model": forced, "locked": locked}
+    return {"forced_model": "", "locked": False}
 
 
 @router.get("/queue-config")

@@ -52,21 +52,12 @@ DIGEST_TYPE_HOD     = "hod"
 DIGEST_TYPE_MANAGER = "manager"
 
 # ── Configuration ─────────────────────────────────────────────────────────
-# May be one of the eight governed TIER names (see core.tiers), a raw model ID
-# (e.g. "claude-sonnet-4-6"), or a legacy router alias.
-#
-# Phase 6 §N.1 step 4 / §F. The "tier alias OR raw id" form was a
-# tier-creation escape hatch: "sonnet" and "claude" are vendor aliases that
-# _HINT_MAP happened to accept, so this variable could name a NINTH tier that
-# exists nowhere else. It now resolves through the eight-name vocabulary when
-# it names a tier, and stays a user-explicit model pick when it names a model
-# — which is the same split the chat model picker uses.
-#
-# BLANK STILL MEANS "no LLM at all": the deterministic fallback runs and no
-# model is billed. That is deliberate and unchanged — turning digest LLM
-# inference on for every deployment that never configured it is exactly the
-# R2 cost surprise this migration is supposed to make visible, not cause.
-HOD_STATEMENT_LLM_MODEL = os.getenv("HOD_STATEMENT_LLM_MODEL", "").strip()
+# LLM narration is opt-in — a policy switch (§I.5), not model identity. Off
+# means the deterministic fallback and nothing billed; on asks the `medium`
+# tier, so an administrator decides which model narrates (Phase 8 removed the
+# model env var this replaced).
+HOD_STATEMENT_LLM_ENABLED = (os.getenv("HOD_STATEMENT_LLM_ENABLED", "false").strip().lower()
+                             in ("1", "true", "yes", "on"))
 _IST_TZ = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -238,20 +229,15 @@ def _call_llm_for_inferences(
 ) -> Tuple[Optional[Dict[str, Any]], bool, int, str]:
     """One-shot LLM call routed through models.model_router.
 
-    ``model_hint`` is passed as the model identifier — the router's
-    ``_HINT_MAP`` accepts both raw model IDs (e.g. ``claude-sonnet-4-6``) and
-    tier aliases (``sonnet``, ``claude``, ``medium``, …) and dispatches to
-    the matching gateway (Claude / OpenAI / Gemini / Local LLM).
-
-    When ``model_hint`` is ``None`` or empty, falls back to the module-level
-    ``HOD_STATEMENT_LLM_MODEL`` env var.
+    ``model_hint`` is a tier name or a model id. When ``None`` or empty, the
+    `medium` tier if HOD_STATEMENT_LLM_ENABLED, else no LLM call at all.
 
     Returns ``(parsed_inferences_or_None, ok, elapsed_ms, model_used)``.
     ``ok=False`` means the caller must apply the deterministic fallback.
     """
-    effective_model = (model_hint or "").strip() or HOD_STATEMENT_LLM_MODEL
+    effective_model = (model_hint or "").strip() or ("medium" if HOD_STATEMENT_LLM_ENABLED else "")
     if not effective_model:
-        logger.warning("digest_service: llm skipped — no model configured (HOD_STATEMENT_LLM_MODEL unset)")
+        logger.warning("digest_service: llm skipped — narration is off (HOD_STATEMENT_LLM_ENABLED unset)")
         return None, False, 0, ""
 
     user_msg = json.dumps({
@@ -274,9 +260,7 @@ def _call_llm_for_inferences(
         from core.tiers import Tier
 
         # A configured TIER routes through the administrator's assignment; a
-        # configured MODEL ID is a deliberate pin and is passed through
-        # untouched. legacy_hint is the value itself, so governance-off
-        # behaviour is byte-identical to before (D15).
+        # configured MODEL ID is a deliberate pin and is passed through untouched.
         #
         # Only the four TEXT tiers are accepted by name. The modality tiers
         # cannot serve a text digest, and they have no legacy hint to fall
@@ -473,7 +457,7 @@ def generate_and_send_digest(
     month, year : int
         Billing period.
     model_hint : str or None
-        LLM model hint; ``None`` → ``HOD_STATEMENT_LLM_MODEL`` env var.
+        LLM model hint; ``None`` → the medium tier when narration is enabled.
     db : Session or None
         SQLAlchemy session; creates its own if ``None``.
 

@@ -262,17 +262,13 @@ def test_the_channel_choice_follows_the_model(src):
 
 
 def test_both_tool_branches_prefer_the_resolved_model(src):
-    assert '_tool_model_id          if _tool_provider == "claude" else' in src
+    assert '_tool_model_id if _tool_provider == "claude" else' in src
     assert 'if _tool_provider in ("openai", "gemini") and _tool_model_id:' in src
 
 
-def test_the_explicit_sku_rungs_survive(src):
-    """§G keeps them, and they are also the governance-off answer — so
-    deleting them would break rollback as well as the user's pick."""
-    for rung in ("CLAUDE_OPUS_48_MODEL    if _model_hint == \"opus-4-8\" else",
-                 "CLAUDE_OPUS_5_MODEL     if _model_hint == \"opus-5\" else",
-                 "CLAUDE_SONNET_5_MODEL   if _model_hint == \"sonnet-5\" else"):
-        assert rung in src, f"missing explicit-pick rung: {rung}"
+def test_a_sku_pick_is_the_registry_model_it_names(src):
+    """§G: opus-4-8 / opus-5 / sonnet-5 resolve through the registry, not env (Phase 8)."""
+    assert '_cl_alias(_model_hint) if _model_hint in ("opus-4-8", "opus-5", "sonnet-5")' in src
 
 
 def test_the_image_turn_still_forces_the_proxy(src):

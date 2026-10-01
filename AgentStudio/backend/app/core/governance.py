@@ -109,28 +109,18 @@ _LOCAL_MODEL_IDS_TTL_S = 300.0  # re-discover at most every 5 minutes
 # from the pre-branch baseline — no regression introduced here.
 
 
-def _env_local_model_ids() -> Set[str]:
-    """Local model IDs declared via env vars (no network needed).
-
-    Covers the same env allowlists the local gateway and model registry read:
-    LOCAL_VISION_MODELS, LOCAL_SIMPLE/MEDIUM/COMPLEX_MODELS, and the single
-    LOCAL_LLM_MODEL_NAME / LOCAL_LLM_MODEL default.
-    """
+def _registry_local_model_ids() -> Set[str]:
+    """Deployment-local model ids from the registry (privacy_class, or the ollama family)."""
     ids: Set[str] = set()
-    for var in (
-        "LOCAL_VISION_MODELS",
-        "LOCAL_SIMPLE_MODELS",
-        "LOCAL_MEDIUM_MODELS",
-        "LOCAL_COMPLEX_MODELS",
-    ):
-        for m in os.getenv(var, "").split(","):
-            m = m.strip().lower()
-            if m:
-                ids.add(m)
-    for var in ("LOCAL_LLM_MODEL_NAME", "LOCAL_LLM_MODEL"):
-        m = (os.getenv(var) or "").strip().lower()
-        if m:
-            ids.add(m)
+    try:
+        from core.llm_provider_registry import get_enabled_models
+        for m in get_enabled_models():
+            caps = m.get("capabilities") or {}
+            if m.get("family") == "ollama" or caps.get("privacy_class") == "deployment_local":
+                ids.add((m.get("model_id") or "").strip().lower())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[AGENT] _registry_local_model_ids: registry unavailable — {exc}")
+    ids.discard("")
     return ids
 
 
@@ -139,15 +129,15 @@ def _local_model_ids() -> Set[str]:
 
     Sourced from the live local gateway catalogue (``list_models()`` — the same
     discovery that feeds the Agent/Workflow model picker's "Local (In-house)"
-    group) merged with the LOCAL_* env allowlists. Falls back to just the env
-    IDs when the gateway is unavailable so detection still works offline.
+    group) merged with the registry's deployment-local models, so detection
+    still works when the gateway is unavailable.
     """
     global _LOCAL_MODEL_IDS_CACHE, _LOCAL_MODEL_IDS_TS
     now = time.monotonic()
     if _LOCAL_MODEL_IDS_CACHE is not None and (now - _LOCAL_MODEL_IDS_TS) < _LOCAL_MODEL_IDS_TTL_S:
         return _LOCAL_MODEL_IDS_CACHE
 
-    ids = _env_local_model_ids()
+    ids = _registry_local_model_ids()
     env_count = len(ids)
     gateway_ok = False
     try:
@@ -158,13 +148,13 @@ def _local_model_ids() -> Set[str]:
                 ids.add(mid)
         gateway_ok = True
     except Exception as exc:  # noqa: BLE001
-        logger.debug(f"[AGENT] _local_model_ids: local gateway unavailable — env-only: {exc}")
+        logger.debug(f"[AGENT] _local_model_ids: local gateway unavailable — registry-only: {exc}")
 
     _LOCAL_MODEL_IDS_CACHE = ids
     _LOCAL_MODEL_IDS_TS = now
     logger.info(
         f"[AGENT] _local_model_ids: refreshed local model catalogue "
-        f"(env={env_count}, gateway_ok={gateway_ok}, total={len(ids)}): {sorted(ids)}"
+        f"(registry={env_count}, gateway_ok={gateway_ok}, total={len(ids)}): {sorted(ids)}"
     )
     return ids
 
@@ -175,7 +165,7 @@ def _is_local_model(model_name: str) -> bool:
     Local models in this platform are identified by the in-house gateway
     catalogue (e.g. ``Kimi-k2.7``, ``glm-5.2``) — names that carry no obvious
     "local"/"llama" token — so a pure substring heuristic misses them. We check
-    the authoritative gateway + env allowlist first, then fall back to the
+    the authoritative gateway + registry first, then fall back to the
     substring/prefix heuristic for ``local:``-prefixed ids and ollama/llama
     names.
     """
@@ -309,15 +299,12 @@ def _resolve_budget_failure_fallback_model() -> str:
     budget-store outage.
 
     Delegates to ``llm_handler.resolve_fallback_model()`` — the platform's
-    existing auto-failover resolver (explicit ``ABSTUDIO_FALLBACK_LLM_MODEL``
-    override → the admin's configured default in core.llm_provider_registry,
-    preferring a free/self-hosted model → ""), the same one ``llm_handler``
+    existing auto-failover resolver (the admin's configured default in
+    core.llm_provider_registry, preferring a free/self-hosted model → ""),
+    the same one ``llm_handler``
     already uses for its transparent primary→fallback switch, so a
     budget-outage downgrade lands on the model the deployment has already
-    chosen for that role. Previously this read ``ABSTUDIO_FALLBACK_LLM_MODEL``
-    directly and denied every paid run whenever that env var was unset, even
-    on a deployment with a perfectly good free/local model configured via the
-    admin "LLM Providers" screen.
+    chosen for that role.
 
     The resolved value is still validated with ``_is_local_model``: a *paid*
     model here would defeat the purpose (spend must not continue while the
@@ -330,14 +317,14 @@ def _resolve_budget_failure_fallback_model() -> str:
     configured = (resolve_fallback_model() or "").strip()
     if not configured:
         logger.error(
-            '[AGENT] No budget-outage fallback model is configured (ABSTUDIO_FALLBACK_LLM_MODEL '
-            'is unset and no default model is enabled in core.llm_provider_registry) — paid runs '
-            'will be denied while the budget store is down.'
+            '[AGENT] No budget-outage fallback model is configured (no default model is '
+            'enabled in core.llm_provider_registry) — paid runs will be denied while the '
+            'budget store is down.'
         )
         return ""
     if not _is_local_model(configured):
         logger.error(
-            f'[AGENT] ABSTUDIO_FALLBACK_LLM_MODEL={configured!r} is not a local/in-house '
+            f'[AGENT] the fallback model {configured!r} is not a local/in-house '
             f'model — refusing to use a paid model as the budget-outage fallback '
             f'(that would keep spending while the budget store is blind). Paid runs '
             f'will be denied until the budget store recovers.'
