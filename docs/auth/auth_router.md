@@ -190,8 +190,6 @@ These endpoints implement the DAST fix for **concurrent session control** — us
 | `/auth/sessions` | DELETE | `revoke_other_sessions` | Revoke all sessions except the current one ("sign out everywhere else") |
 | `/auth/sessions/{session_id}` | DELETE | `revoke_specific_session` | Revoke a specific session by ID (fine-grained termination) |
 
-> **Note**: The [session_router](session_router.md) module exposes duplicate session endpoints at a different mount path. Both delegate to `auth.session_manager` for the underlying operations.
-
 ---
 
 ### SSO Endpoints

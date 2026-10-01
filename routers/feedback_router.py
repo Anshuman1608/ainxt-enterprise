@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # ============================================================
-# FEEDBACK ROUTER — /chat/messages/{message_id}/feedback
+# FEEDBACK ROUTER — reads /chat/messages/{message_id}/feedback
+# (the POST is routers/chat_router.py::submit_message_feedback)
 # ============================================================
 #
 # Lets engineers rate individual AI responses (thumbs up / down).
@@ -16,87 +17,6 @@ from auth.dependencies import get_current_user as _require_auth
 from core.logger import logger
 
 router = APIRouter(prefix="/chat", tags=["feedback"])
-
-
-class FeedbackRequest(BaseModel):
-    rating:            int              # +1 = thumbs up, -1 = thumbs down
-    issue:             Optional[str] = None   # thumbs-down category
-    sub_issue:         Optional[str] = None   # sub-category
-    comment:           Optional[str] = None   # free-text (max 1000 chars)
-    user_prompt:       Optional[str] = None   # the question that triggered the response
-    assistant_summary: Optional[str] = None   # first 800 chars of the response
-
-
-@router.post("/messages/{message_id}/feedback", status_code=200)
-async def submit_feedback(
-    message_id: str,
-    body: FeedbackRequest,
-    current_user: dict = Depends(_require_auth),
-):
-    """
-    Submit thumbs-up (+1) or thumbs-down (-1) feedback on an AI response.
-    Linked to message_feedback table (ORM: MessageFeedback).
-
-    SEC-10: Rate-limited to 1 submission per user per message (dedup via Redis SETNX).
-    Prevents feedback flooding that could poison chunk quality scores.
-    """
-    if body.rating not in (1, -1):
-        raise HTTPException(status_code=422, detail="rating must be +1 or -1")
-
-    user_id = current_user.get("user_id") or current_user.get("sub") or current_user.get("id", "")
-
-    # SEC-10: per-user per-message dedup (1 feedback per message per user per 24h)
-    try:
-        from core.kv import get_kv
-        from core.config import RDB_CACHE
-        _rc = get_kv(RDB_CACHE, decode_responses=True)
-        _dedup_key = f"feedback:dedup:{user_id}:{message_id}"
-        if not _rc.set(_dedup_key, "1", nx=True, ex=86400):
-            # Already submitted — allow update (upsert below handles it) but don't re-count
-            pass  # upsert path still runs; dedup only prevents new row spam
-    except Exception:
-        pass  # Redis unavailable — allow submission (non-critical guard)
-
-    try:
-        from db.database import SessionLocal
-        from db.models import MessageFeedback
-
-        db = SessionLocal()
-        try:
-            # Upsert: one rating per user per message
-            existing = db.query(MessageFeedback).filter_by(
-                message_id=message_id, user_id=user_id
-            ).first()
-
-            if existing:
-                existing.rating            = body.rating
-                existing.issue             = body.issue
-                existing.sub_issue         = body.sub_issue
-                existing.comment           = body.comment[:1000]           if body.comment           else existing.comment
-                existing.user_prompt       = body.user_prompt[:2000]       if body.user_prompt       else existing.user_prompt
-                existing.assistant_summary = body.assistant_summary[:1000] if body.assistant_summary else existing.assistant_summary
-            else:
-                db.add(MessageFeedback(
-                    message_id        = message_id,
-                    user_id           = user_id,
-                    rating            = body.rating,
-                    issue             = body.issue,
-                    sub_issue         = body.sub_issue,
-                    comment           = body.comment[:1000]           if body.comment           else None,
-                    user_prompt       = body.user_prompt[:2000]       if body.user_prompt       else None,
-                    assistant_summary = body.assistant_summary[:1000] if body.assistant_summary else None,
-                ))
-
-            db.commit()
-        finally:
-            db.close()
-
-        logger.info(f"feedback: msg={message_id} user={user_id} rating={body.rating}")
-        return {"ok": True, "message_id": message_id, "rating": body.rating}
-
-    except Exception as e:
-        logger.error(f"feedback: failed for msg={message_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save feedback")
 
 
 @router.get("/messages/{message_id}/feedback", status_code=200)

@@ -207,6 +207,77 @@ def test_governance_off_changes_nothing(helper, monkeypatch):
         assert helper.fn(hint) == (None, ""), f"{hint!r} resolved with governance off"
 
 
+# ── D90: an explicit pick is served as itself ──────────────────────────────
+
+
+def _pin_registry(monkeypatch, rows):
+    import core.llm_provider_registry as reg
+    monkeypatch.setattr(reg, "get_model", lambda mid: rows.get(mid), raising=True)
+
+
+@pytest.mark.parametrize("family,provider", [
+    ("anthropic", "claude"), ("openai", "openai"), ("google", "gemini"),
+])
+@pytest.mark.parametrize("flag", ["true", None])
+def test_an_explicit_pick_is_served_as_itself(helper, monkeypatch, family, provider, flag):
+    """Flag on or off — the router's registry branch is flag-independent, so
+    plain chat already honours the pick and tool calls must agree."""
+    if flag:
+        monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", flag)
+    else:
+        monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
+    _pin_registry(monkeypatch, {"vendor-m": {"family": family}})
+    _pin_candidates(monkeypatch, [_Cand("assigned-model", "anthropic")])
+    assert helper.fn("whatever-hint", "vendor-m") == (provider, "vendor-m")
+
+
+def test_the_pick_beats_the_hint_it_prefix_matches(helper, governed, monkeypatch):
+    """`claude-opus-5-5` prefix-matches the hint `opus-5`, whose ladder rung is
+    CLAUDE_OPUS_5_MODEL — blank on an admin-configured install."""
+    _pin_registry(monkeypatch, {"claude-opus-5-5": {"family": "anthropic"}})
+    _pin_candidates(monkeypatch, [_Cand("claude-sonnet-5-5", "anthropic")])
+    assert helper.fn("opus-5", "claude-opus-5-5") == ("claude", "claude-opus-5-5")
+
+
+@pytest.mark.parametrize("flag,expected", [
+    ("true", ("claude", "claude-x")),   # the tier's Auto model, as before
+    (None, (None, "")),                 # the .env ladder, as before
+])
+def test_a_pick_with_no_tool_channel_keeps_todays_answer(helper, monkeypatch, caplog,
+                                                         flag, expected):
+    """An Ollama pick cannot carry tools. Today it falls through to Auto, and
+    returning early instead sent it to a ladder that is blank here."""
+    if flag:
+        monkeypatch.setenv("TIER_GOVERNANCE_ENABLED", flag)
+    else:
+        monkeypatch.delenv("TIER_GOVERNANCE_ENABLED", raising=False)
+    _pin_registry(monkeypatch, {"llama3.2:1b": {"family": "ollama"}})
+    _pin_candidates(monkeypatch, [_Cand("claude-x", "anthropic")])
+    with caplog.at_level("WARNING"):
+        assert helper.fn(None, "llama3.2:1b") == expected
+    assert "no tool-call channel" in caplog.text
+
+
+def test_no_pick_leaves_the_tier_path_alone(helper, governed, monkeypatch):
+    _pin_registry(monkeypatch, {})
+    _pin_candidates(monkeypatch, [_Cand("claude-x", "anthropic")])
+    assert helper.fn(None, "") == ("claude", "claude-x")
+    assert helper.fn(None) == ("claude", "claude-x")
+
+
+def test_the_handler_passes_the_pick(src):
+    assert "_oai_tool_channel(_model_hint, _explicit_id)" in src
+
+
+def test_an_unlabelled_turn_is_not_billed_as_openai_coding(src):
+    """D91: the seed and the fallback named a SKU that did not run."""
+    handler = src[src.index("\ndef openai_chat_completions("):]
+    handler = handler[:handler.index("def _record_usage") + 2000]
+    assert '"model": _OPENAI_CODING, "cost"' not in handler
+    assert 'req.model or _OPENAI_CODING\n' not in handler.split("def _record_usage", 1)[1]
+    assert '_meta["model"] = req.model or "unknown"' in handler
+
+
 # ── The call sites consume it ──────────────────────────────────────────────
 
 

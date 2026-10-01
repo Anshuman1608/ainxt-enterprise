@@ -33,20 +33,24 @@ GATEWAY = ROOT / "gateway.py"
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options"}
 
 #: Measured 2026-10-01 against the live route table. May fall, never rise.
-#: Was 10; list_oai_models' two paths went when the function was deleted (D79).
-BASELINE_SHADOWED = 8
+#: Was 10; D79 removed two, D94 the last eight.
+BASELINE_SHADOWED = 0
 
-#: The survivors, with the module pair that collides. Each is a real dead
-#: handler, none is in this change's scope.
-KNOWN_SHADOWED = {
-    ("DELETE", "/ainxt/v1/api/auth/sessions"),
-    ("DELETE", "/ainxt/v1/api/auth/sessions/{session_id}"),
-    ("GET", "/ainxt/v1/api/auth/sessions"),
-    ("GET", "/ainxt/v1/api/auth/sso/provider"),
-    ("GET", "/ainxt/v1/api/chats"),
-    ("GET", "/ainxt/v1/api/chats/{chat_id}/messages"),
-    ("POST", "/ainxt/v1/api/chat/messages/{message_id}/feedback"),
-    ("POST", "/ainxt/v1/api/index/submit"),
+KNOWN_SHADOWED: set = set()
+
+#: Who serves each path that used to be registered twice (D94). Three of the
+#: dead copies held what the live one lacked — an ownership check, the
+#: thumbs-down fields, a correct SSO flag — so those were ported before the
+#: copy went. Pinning the survivor catches the wrong side being deleted.
+SURVIVORS = {
+    ("DELETE", "/ainxt/v1/api/auth/sessions"): "routers/auth_router.py",
+    ("DELETE", "/ainxt/v1/api/auth/sessions/{session_id}"): "routers/auth_router.py",
+    ("GET", "/ainxt/v1/api/auth/sessions"): "routers/auth_router.py",
+    ("GET", "/ainxt/v1/api/auth/sso/provider"): "routers/auth_router.py",
+    ("GET", "/ainxt/v1/api/chats"): "routers/chat_router.py",
+    ("GET", "/ainxt/v1/api/chats/{chat_id}/messages"): "routers/chat_router.py",
+    ("POST", "/ainxt/v1/api/chat/messages/{message_id}/feedback"): "routers/chat_router.py",
+    ("POST", "/ainxt/v1/api/index/submit"): "routers/index_router.py",
 }
 
 
@@ -187,6 +191,13 @@ def test_the_shadowed_set_is_exactly_the_recorded_one(collisions: dict) -> None:
         f"fixed (update KNOWN_SHADOWED and BASELINE_SHADOWED): "
         f"{sorted(KNOWN_SHADOWED - set(collisions))}"
     )
+
+
+@pytest.mark.parametrize("key", sorted(SURVIVORS))
+def test_the_live_handler_is_the_one_that_survived(mounted: list, key) -> None:
+    method, path = key
+    owners = [m for meth, p, _h, m in mounted if (meth, p) == key]
+    assert owners == [SURVIVORS[key]], f"{method} {path} is served by {owners}"
 
 
 @pytest.mark.parametrize("path", ["/ainxt/v1/api/models", "/ainxt/v1/api/v1/models"])

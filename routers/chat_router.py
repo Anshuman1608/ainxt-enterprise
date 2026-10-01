@@ -388,12 +388,15 @@ def list_chats(current_user: dict = Depends(get_current_user)):
 @router.get("/chats/{chat_id}/messages")
 def get_chat_messages(chat_id: str, current_user: dict = Depends(get_current_user)):
     """Load the last 100 messages for a chat session."""
+    user_id = current_user.get("sub") or current_user.get("user_id", "")
     try:
         from db.database import SessionLocal
         from db.models import Chat, ChatMessage, ChatArtifact, ChatAttachment
         db = SessionLocal()
         try:
-            chat = db.query(Chat).filter(Chat.id == chat_id).first()
+            chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user_id).first()
+            if not chat:
+                raise HTTPException(status_code=404, detail="Chat not found")
             msgs = (
                 db.query(ChatMessage)
                 .filter(ChatMessage.chat_id == chat_id)
@@ -504,6 +507,8 @@ def get_chat_messages(chat_id: str, current_user: dict = Depends(get_current_use
             }
         finally:
             db.close()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -514,12 +519,13 @@ def get_chat_messages(chat_id: str, current_user: dict = Depends(get_current_use
 @router.delete("/chats/{chat_id}")
 def delete_chat(chat_id: str, current_user: dict = Depends(get_current_user)):
     """Delete a chat and all its messages."""
+    user_id = current_user.get("sub") or current_user.get("user_id", "")
     try:
         from db.database import SessionLocal
         from db.models import Chat
         db = SessionLocal()
         try:
-            chat = db.query(Chat).filter(Chat.id == chat_id).first()
+            chat = db.query(Chat).filter(Chat.id == chat_id, Chat.user_id == user_id).first()
             if not chat:
                 raise HTTPException(status_code=404, detail="Chat not found")
             db.delete(chat)
@@ -2887,6 +2893,13 @@ from pydantic import BaseModel as _BM
 class _FeedbackBody(_BM):
     rating: int  # +1 thumbs-up, -1 thumbs-down
     rag_mode: Optional[str] = None  # sent by FE: "off" (Chat.jsx) | "on"/"auto" (KbChat.jsx)
+    # The thumbs-down modal's fields. Ported from the shadowed feedback_router
+    # handler, which stored them while this one silently dropped them.
+    issue:             Optional[str] = None
+    sub_issue:         Optional[str] = None
+    comment:           Optional[str] = None
+    user_prompt:       Optional[str] = None
+    assistant_summary: Optional[str] = None
 
 @router.post("/chat/messages/{message_id}/feedback")
 def submit_message_feedback(
@@ -2922,6 +2935,11 @@ def submit_message_feedback(
                 message_id=message_id,
                 user_id=user_id,
                 rating=body.rating,
+                issue=body.issue,
+                sub_issue=body.sub_issue,
+                comment=body.comment[:1000] if body.comment else None,
+                user_prompt=body.user_prompt[:2000] if body.user_prompt else None,
+                assistant_summary=body.assistant_summary[:1000] if body.assistant_summary else None,
             )
             db.add(fb)
             db.commit()

@@ -254,8 +254,14 @@ def test_blocked_enabled_models_reports_exactly_the_complement(db_rows):
 #: a dated retired id fails to import the module at all, taking every Claude
 #: model with it — the failure its own comment at :118 describes. Phase 8
 #: deletes the constant.
+#:
+#: agents/sdlc_cli_engine.py calls is_blocked_model() first and then keeps a
+#: lowercased copy: the SDLC guard is case-insensitive and re-reads ENABLE_OPUS
+#: at call time, neither of which the shared matcher does. It only adds to the
+#: matcher's answer, never subtracts. Found by D95's alias resolution.
 ALLOWED_DIRECT = {
     "gateway_claude.py",
+    "agents/sdlc_cli_engine.py",
 }
 
 #: services/llm_proxy/ is a VENDORED service with its own
@@ -269,27 +275,62 @@ SWEEP = ("core", "models", "routers", "services", "agents", "store", "db",
          "gateway_local_llm.py")
 
 
-def _membership_tests(path: pathlib.Path) -> list[int]:
-    """Lines doing `x in BLOCKED_MODELS` / `x not in BLOCKED_MODELS`."""
+def _refers_to_deny_list(node: ast.AST, aliases: set) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and (sub.id == "BLOCKED_MODELS" or sub.id in aliases):
+            return True
+        if isinstance(sub, ast.Attribute) and sub.attr == "BLOCKED_MODELS":
+            return True
+    return False
+
+
+def _deny_list_aliases(tree: ast.AST) -> set:
+    """Every name bound to BLOCKED_MODELS: `import … as X`, `X = set(…)`, and
+    aliases of aliases. By binding, not spelling (D95) — `_blocked` slipped
+    past a name-shape match in gateway.py."""
+    aliases: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for n in node.names:
+                if n.name == "BLOCKED_MODELS":
+                    aliases.add(n.asname or n.name)
+    while True:
+        before = len(aliases)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _refers_to_deny_list(node.value, aliases):
+                aliases.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        if len(aliases) == before:
+            return aliases
+
+
+def _membership_lines(source: str) -> list[int]:
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        tree = ast.parse(source)
     except SyntaxError:
         return []
-    hits = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Compare):
-            continue
-        if not any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
-            continue
-        for comp in node.comparators:
-            # `in BLOCKED_MODELS`, `in set(BLOCKED_MODELS)` and `in blocked`
-            # where `blocked` was bound from it — db/migrate.py used the last
-            # shape, which is why this matches the local alias too.
-            for sub in ast.walk(comp):
-                if isinstance(sub, ast.Name) and (
-                        sub.id.endswith("BLOCKED_MODELS") or sub.id == "blocked"):
-                    hits.append(node.lineno)
-    return hits
+    aliases = _deny_list_aliases(tree)
+    return [node.lineno for node in ast.walk(tree)
+            if isinstance(node, ast.Compare)
+            and any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops)
+            and any(_refers_to_deny_list(c, aliases) for c in node.comparators)]
+
+
+def _membership_tests(path: pathlib.Path) -> list[int]:
+    """Lines doing `x in BLOCKED_MODELS`, through any binding of it."""
+    return _membership_lines(path.read_text(encoding="utf-8", errors="replace"))
+
+
+@pytest.mark.parametrize("source,hit", [
+    ("from core.model_registry import BLOCKED_MODELS\nx in BLOCKED_MODELS", True),
+    ("from core.model_registry import BLOCKED_MODELS as _b\nx in _b", True),
+    ("import core.model_registry as m\nb = set(m.BLOCKED_MODELS)\nx not in b", True),
+    ("import core.model_registry as m\nx in m.BLOCKED_MODELS", True),
+    ("from core.model_registry import BLOCKED_MODELS as _b\nc = _b\nd = c\nx in d", True),
+    ("blocked = {'a'}\nx in blocked", False),
+    ("from core.model_registry import is_blocked_model\nis_blocked_model(x)", False),
+])
+def test_the_ratchet_sees_every_binding(source, hit):
+    assert bool(_membership_lines(source)) is hit
 
 
 def test_the_deny_list_is_consulted_through_one_matcher():

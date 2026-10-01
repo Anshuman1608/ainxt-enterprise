@@ -742,7 +742,6 @@ The full per-page listing follows, grouped the same way.
 - [profile](auth/profile.md)
 - [profile_router](auth/profile_router.md)
 - [scim_router](auth/scim_router.md)
-- [session_router](auth/session_router.md)
 - [user_management](auth/user_management.md)
 - [vault_router](auth/vault_router.md)
 

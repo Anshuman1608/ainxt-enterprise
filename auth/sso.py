@@ -558,32 +558,6 @@ def _http_get_bearer(url: str, access_token: str) -> dict:
 sso_router = APIRouter(prefix="/auth/sso", tags=["auth"])
 
 
-@sso_router.get("/provider")
-def sso_provider_info():
-    """Return the active SSO provider and a ready-to-use login URL.
-
-    Response: {provider, enabled, login_url}
-    """
-    provider = get_sso_provider()
-    enabled  = provider != "none"
-    login_url = None
-    if enabled:
-        # No localhost default: reuses the canonical (also no-default) core.config value.
-        _base = os.getenv("PLATFORM_BASE_URL", _CONFIG_PLATFORM_BASE_URL)
-        redirect_uri = os.getenv(
-            "SSO_REDIRECT_URI", f"{_base}/auth/sso/callback"
-        )
-        try:
-            login_url = get_sso_login_url(redirect_uri=redirect_uri)
-        except Exception:
-            login_url = None
-    return {
-        "provider":  provider,
-        "enabled":   enabled,
-        "login_url": login_url,
-    }
-
-
 @sso_router.get("/callback")
 def sso_callback(
     request: Request,

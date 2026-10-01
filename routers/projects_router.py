@@ -13,7 +13,6 @@ from pydantic import BaseModel
 
 from core.logger import logger, set_request_id, set_chat_context, bind_context, set_span_id
 from auth.dependencies import get_current_user
-from core.model_registry import MODEL_COST_PER_1M as _MODEL_COST_PER_1M
 from core.security_validation import (
     validate_security,
     validate_description,
@@ -207,6 +206,16 @@ def delete_project(project_id: str, current_user=Depends(get_current_user)):
     return {"success": True}
 
 
+def _project_ask_cost(model: str, in_tok: int, out_tok: int) -> float:
+    """USD for one project turn, from the platform's one cost authority (D78)."""
+    if (model or "").lower() in ("", "unknown"):
+        # Don't bill a run we couldn't identify at a guessed paid rate.
+        logger.warning("ProjectAsk: model unidentified — recording 0 cost")
+        return 0.0
+    from services.endpoint_model_catalog import estimate_cost_usd
+    return float(estimate_cost_usd(model, in_tok, out_tok))
+
+
 @router.post("/projects/{project_id}/ask")
 def ask_project(
     project_id: str,
@@ -384,17 +393,7 @@ def ask_project(
                 in_tok  = int(len(question.split()) * 1.3)
                 out_tok = int(len(full.split()) * 1.3)
 
-            # Local/Ollama models are free — check before applying paid rates
-            _ml = (model or "").lower()
-            if _ml in ("", "unknown"):
-                # Don't bill a run we couldn't identify at a guessed paid rate.
-                logger.warning("ProjectAsk: model unidentified — recording 0 cost")
-                cost = 0.0
-            elif "ollama" in _ml or "local" in _ml or "llama" in _ml:
-                cost = 0.0
-            else:
-                rates = _MODEL_COST_PER_1M.get(model, (2.00, 8.00))
-                cost  = round((in_tok * rates[0] + out_tok * rates[1]) / 1_000_000, 6)
+            cost = _project_ask_cost(model, in_tok, out_tok)
 
             meta = {
                 "chat_id":  chat_id,

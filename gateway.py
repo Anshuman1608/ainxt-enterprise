@@ -1172,7 +1172,6 @@ from routers.mailbox_router import router as mailbox_router
 from routers.projects_router import router as projects_router
 from routers.marketplace_router import router as marketplace_router
 from routers.auth_router import router as auth_router
-from routers.session_router import router as session_router   # DAST fix — concurrent session endpoints
 from routers.notifications_router import router as notifications_router
 from routers.mcp_governance_router import router as mcp_governance_router
 from core.config import ENABLE_WEBHOOKS as _ENABLE_WEBHOOKS
@@ -1384,7 +1383,6 @@ app.include_router(mailbox_router,          prefix="/ainxt/v1/api")
 app.include_router(projects_router,         prefix="/ainxt/v1/api")
 app.include_router(marketplace_router,      prefix="/ainxt/v1/api")
 app.include_router(auth_router,             prefix="/ainxt/v1/api")
-app.include_router(session_router,          prefix="/ainxt/v1/api")   # DAST fix — concurrent session endpoints
 app.include_router(notifications_router,    prefix="/ainxt/v1/api")
 app.include_router(mcp_governance_router,   prefix="/ainxt/v1/api")
 if _ENABLE_WEBHOOKS:
@@ -10953,12 +10951,15 @@ _FAMILY_TO_TOOL_PROVIDER = {
 }
 
 
-def _oai_tool_channel(model_hint: Optional[str]) -> tuple:
+def _oai_tool_channel(model_hint: Optional[str], explicit_id: str = "") -> tuple:
     """(provider, model_id) for a tool-call turn, or (None, "") to keep today's.
 
-    Returns ``(None, "")`` — meaning "leave the existing .env expression
-    exactly as it is" — in three cases, which together are the whole of this
-    function's flag-off parity contract (D57):
+    An explicit enabled registry id (``_oai_explicit_model_id``) is served as
+    itself, flag on or off, exactly as the plain-chat lane already does (D90).
+
+    Otherwise returns ``(None, "")`` — meaning "leave the existing .env
+    expression exactly as it is" — in three cases, which together are the
+    whole of this function's flag-off parity contract (D57):
 
       * governance is off;
       * the hint is a USER'S PICK rather than a capability request;
@@ -10977,10 +10978,29 @@ def _oai_tool_channel(model_hint: Optional[str]) -> tuple:
     No hint at all means Auto, which on a tool-call turn is agentic code
     generation against visible context — §D.2's `complex`.
     """
+    if explicit_id:
+        try:
+            from core.llm_provider_registry import get_model as _reg_get_model
+            row = _reg_get_model(explicit_id)
+        except Exception as exc:                  # noqa: BLE001
+            logger.warning("[IDE-TOOLS] explicit-pick lookup failed for %r (%s)",
+                           explicit_id, exc)
+            row = None
+        if row:
+            provider = _FAMILY_TO_TOOL_PROVIDER.get(row["family"])
+            if provider:
+                return provider, explicit_id
+            # No early return: falling through is what keeps today's answer
+            # in both flag states (the tier's Auto model on, the .env ladder off).
+            logger.warning(
+                "[IDE-TOOLS] %r is a %s model, which has no tool-call channel — "
+                "serving this turn the way it was served before the pick was honoured.",
+                explicit_id, row["family"])
+
     try:
         from core.tiers import Tier as _TCh
         from core.tier_resolver import resolve_tier_candidates as _rtc
-        from core.model_registry import BLOCKED_MODELS as _blocked
+        from core.model_registry import is_blocked_model as _is_blocked
         from core.tiers import governance_enabled as _gov_on
         from models.model_router import _HINT_MAP as _hm, _LEGACY_TO_GOVERNED as _l2g
     except Exception as exc:                      # noqa: BLE001
@@ -11009,7 +11029,7 @@ def _oai_tool_channel(model_hint: Optional[str]) -> tuple:
 
     rejected = []
     for cand in candidates:
-        if cand.model_id in _blocked:
+        if _is_blocked(cand.model_id):
             rejected.append(f"{cand.model_id} (on the blocked list)")
             continue
         provider = _FAMILY_TO_TOOL_PROVIDER.get(cand.family)
@@ -11615,7 +11635,7 @@ def openai_chat_completions(
     # Phase 6.6 — the tool-call channel and model, resolved once for the whole
     # turn. ("", None) means "keep every .env expression below exactly as it
     # is", which is both the governance-off path and the user's-own-pick path.
-    _tool_provider, _tool_model_id = _oai_tool_channel(_model_hint)
+    _tool_provider, _tool_model_id = _oai_tool_channel(_model_hint, _explicit_id)
     if _tool_provider:
         logger.info(f"[IDE-TOOLS] tier governance → {_tool_provider}/{_tool_model_id}")
     # Extract bare model name when IDE sends "local:Kimi-k2.5" so the local
@@ -11658,8 +11678,8 @@ def openai_chat_completions(
     logger.info(f"{_log_tag} USER_MSG  chars={len(last_user)}  (masked chars={len(_safe_last_user)})")
     logger.info(f"{_log_tag} USER_MSG↓ {_safe_last_user[:400]!r}{'...[truncated]' if len(_safe_last_user) > 400 else ''}")
 
-    # Shared metadata dict
-    _meta = {"out_tok": 0, "in_tok": 0, "model": _OPENAI_CODING, "cost": 0.0, "latency": 0.0}
+    # Shared metadata dict. No model until one actually runs (D91).
+    _meta = {"out_tok": 0, "in_tok": 0, "model": "", "cost": 0.0, "latency": 0.0}
 
     completion_id = f"chatcmpl-{request_id[:8]}"
     created_ts    = int(time.time())
@@ -11673,7 +11693,7 @@ def openai_chat_completions(
         if _meta["in_tok"] == 0:
             _meta["in_tok"]  = int(len(safe_question.split()) * 1.3)
         if not _meta["model"]:
-            _meta["model"] = req.model or _OPENAI_CODING
+            _meta["model"] = req.model or "unknown"
         _meta["cost"] = _estimate_cost(_meta["model"], _meta["in_tok"], _meta["out_tok"])
 
         # ── Budget: read before + increment + read after ──────────
@@ -14974,147 +14994,6 @@ def get_client_activity(
 
 
 # ============================================================
-# MY CHATS — GET /chats
-# Returns the authenticated user's chat list (for sidebar restore)
-# ============================================================
-
-@_v1.get("/chats", tags=["chat"])
-def list_my_chats(
-    request: Request,
-    limit: int = 200,
-    _caller=Depends(_require_auth),
-):
-    """
-    Return the current user's chats ordered by most recently updated.
-
-    Scoped by client_source: the web UI never sees CLI/IDE chats and vice
-    versa. The 'channel' isolation is non-negotiable — engineers' CLI
-    prompts often contain code-paste content that doesn't belong in a
-    shared sidebar list. ClientSourceMiddleware sets request.state from
-    the X-AiNxt-Client header (or User-Agent fallback).
-    """
-    from db.database import SessionLocal
-    from db.models import Chat, ChatMessage
-    from sqlalchemy import func
-
-    user_id = _caller.get("sub") if isinstance(_caller, dict) else None
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    requester_src = getattr(request.state, "client_source", "platform")
-
-    db = SessionLocal()
-    try:
-        # Subquery: count messages per chat
-        msg_counts = (
-            db.query(
-                ChatMessage.chat_id,
-                func.count(ChatMessage.id).label("cnt"),
-            )
-            .group_by(ChatMessage.chat_id)
-            .subquery()
-        )
-        q = (
-            db.query(Chat, msg_counts.c.cnt)
-            .outerjoin(msg_counts, Chat.id == msg_counts.c.chat_id)
-            .filter(Chat.user_id == user_id)
-            .filter(Chat.client_source == requester_src)
-            .order_by(Chat.updated_at.desc())
-            .limit(limit)
-        )
-        rows = q.all()
-        chats = [
-            {
-                "id":            c.id,
-                "title":         c.title or "New Chat",
-                "message_count": cnt or 0,
-                "updated_at":    c.updated_at.isoformat() if c.updated_at else None,
-                "client_source": c.client_source,
-            }
-            for c, cnt in rows
-        ]
-        return {"chats": chats, "client_source": requester_src}
-    finally:
-        db.close()
-
-
-# ============================================================
-# CHAT MESSAGES — GET /chats/{chat_id}/messages
-# Returns messages for a single chat (owned by the caller)
-# ============================================================
-
-@_v1.get("/chats/{chat_id}/messages", tags=["chat"])
-def get_chat_messages(
-    request: Request,
-    chat_id: str,
-    limit: int = 500,
-    _caller=Depends(_require_auth),
-):
-    """
-    Return all messages for a chat the caller owns.
-
-    In addition to user-id ownership, we enforce channel isolation: the
-    requesting client must match the chat's client_source. A web user
-    cannot pull a CLI conversation by guessing its UUID, and the reverse.
-    """
-    from db.database import SessionLocal
-    from db.models import Chat, ChatMessage
-
-    caller_id = _caller.get("sub") if isinstance(_caller, dict) else None
-    if not caller_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    requester_src = getattr(request.state, "client_source", "platform")
-
-    db = SessionLocal()
-    try:
-        chat = db.query(Chat).filter(Chat.id == chat_id).first()
-        if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
-        # Owners and admins can read; no one else
-        caller_role = _caller.get("role", "user") if isinstance(_caller, dict) else "user"
-        if chat.user_id and chat.user_id != caller_id and caller_role != "admin":
-            raise HTTPException(status_code=403, detail="Not your chat")
-        # Channel isolation: the chat must have been created on the same
-        # client_source as the requester. Admins can cross channels for
-        # debugging (their tools need to see everything).
-        if caller_role != "admin" and (chat.client_source or "platform") != requester_src:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Chat not found in {requester_src} channel "
-                       f"(belongs to {chat.client_source})",
-            )
-
-        rows = (
-            db.query(ChatMessage)
-            .filter(ChatMessage.chat_id == chat_id)
-            .order_by(ChatMessage.created_at.asc())
-            .limit(limit)
-            .all()
-        )
-        return {
-            "chat_id": chat_id,
-            "messages": [
-                {
-                    "id":         m.id,
-                    "role":       m.role,
-                    "content":    m.content,
-                    "model_used": m.model_used,
-                    "tokens_used": m.tokens_used,
-                    "cost_usd":   m.cost_usd,
-                    "in_tok":     m.in_tok,
-                    "out_tok":    m.out_tok,
-                    "latency":    m.latency,
-                    "created_at": m.created_at.isoformat() if m.created_at else None,
-                }
-                for m in rows
-            ],
-        }
-    finally:
-        db.close()
-
-
-# ============================================================
 # CHAT HISTORY — GET /chats/{user_id}/history
 # Admin/security endpoint: full prompt+response audit trail per user
 # ============================================================
@@ -16294,61 +16173,14 @@ async def ask_stream(job_id: str, request: Request):
 
 # ── Index endpoints ───────────────────────────────────────────
 
-class IndexRequest(BaseModel):
-    repo_name:    str
-    repo_path:    str
-    drop_index:   bool      = False
-    file_filter:  List[str] = []
-
-
-@_v1.post("/index/submit", tags=["index"])
-def index_submit(
-    req: IndexRequest,
-    authorization: Optional[str] = _Header(default=None),
-    _user: dict = Depends(_require_auth),
-):
-    """Enqueue a codebase indexing job. Returns {job_id}."""
-    user_id = "system"
-    if authorization and authorization.lower().startswith("bearer "):
-        try:
-            from auth.jwt_handler import decode_token as _dt2
-            pl = _dt2(authorization[7:].strip())
-            if pl:
-                user_id = pl.get("sub") or pl.get("email") or "system"
-        except Exception:
-            pass
-
-    # RBAC — operator or higher can trigger indexing
-    from auth.rbac import require_permission as _rp
-    _caller_role = _user.get("role", "viewer")
-    from auth.rbac import has_permission as _hp
-    if not _hp(_caller_role, "codebase:write"):
-        raise HTTPException(status_code=403, detail="codebase:write permission required (operator+)")
-
-    from core.job_queue import check_queue_pressure, enqueue_index_job, Q_INDEX
-    pressure = check_queue_pressure(Q_INDEX)
-    if not pressure["allowed"]:
-        raise HTTPException(status_code=503, detail={"error": "index_queue_full", **pressure})
-
-    job_id = enqueue_index_job(
-        repo_name=req.repo_name,
-        repo_path=req.repo_path,
-        triggered_by=user_id,
-        drop_index=req.drop_index,
-        file_filter=req.file_filter or None,
-    )
-    return {"job_id": job_id, "repo_name": req.repo_name}
-
-
 # SECURITY (AppSec finding — Information Disclosure / CWE-200, CWE-306):
 # this endpoint previously had no auth dependency at all, exposing internal
 # codebase-indexing status/metadata for any repo name to any anonymous
-# caller, while its sibling POST /index/submit already requires a verified
-# caller (plus codebase:write).
+# caller, while POST /index/submit (routers/index_router.py) requires one.
 # Fix: added `_user: dict = Depends(_require_auth)` as a function
 # parameter so FastAPI rejects unauthenticated requests with 401 before
-# the handler runs. No extra permission check added (read-only, unlike
-# the write endpoint above) — any authenticated user may still poll status.
+# the handler runs. No extra permission check added (read-only) — any
+# authenticated user may still poll status.
 @_v1.get("/index/{repo_name}/status", tags=["index"])
 def index_status(repo_name: str, _user: dict = Depends(_require_auth)):
     """Return indexing status for a repo (polls repo_index_status table)."""

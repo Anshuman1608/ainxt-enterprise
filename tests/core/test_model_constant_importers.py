@@ -172,6 +172,8 @@ def _tracked_py() -> list[str]:
         # tests legitimately name models; llm_proxy is vendored (§Q.5, U2)
         if not f.startswith(("tests/", "services/llm_proxy/"))
         and f != "core/model_registry.py"
+        # still in the index but deleted on disk: an uncommitted removal
+        and (ROOT / f).exists()
     ]
 
 

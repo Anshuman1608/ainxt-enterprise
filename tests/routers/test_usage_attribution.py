@@ -135,13 +135,12 @@ def test_no_sku_constant_is_imported(rel):
 
 
 def test_an_unidentified_project_run_is_not_billed_at_a_guessed_rate():
-    """The label feeds MODEL_COST_PER_1M.get(model, (2.00, 8.00)) two lines
-    later, so an unknown model must short-circuit to zero rather than pick up
-    whatever the default happens to be."""
+    """The cost authority prices an unknown id at a conservative default, so
+    an unidentified run must short-circuit to zero before it gets there."""
+    from routers.projects_router import _project_ask_cost
+
+    for label in ("", "unknown", "UNKNOWN", None):
+        assert _project_ask_cost(label, 1_000_000, 1_000_000) == 0.0, label
     src = (ROOT / "routers" / "projects_router.py").read_text(
         encoding="utf-8", errors="replace")
-    assert '_ml in ("", "unknown")' in src, (
-        "the unknown-model guard is gone — an unidentified run will be "
-        "billed at the (2.00, 8.00) default"
-    )
     assert "_OPENAI_CODING" not in src

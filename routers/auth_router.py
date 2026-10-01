@@ -1320,7 +1320,8 @@ def sso_provider_info():
     provider = get_sso_provider()
     return {
         "provider": provider,
-        "enabled":  provider is not None,
+        # get_sso_provider() returns "none", never None, when SSO is off.
+        "enabled":  provider != "none",
     }
 
 
