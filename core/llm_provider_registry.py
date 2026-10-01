@@ -174,18 +174,40 @@ def invalidate_cache() -> None:
         logger.warning(f"[llm_provider_registry] cache invalidation failed: {exc}")
 
 
-def get_enabled_models(channel: Optional[str] = None) -> list[dict]:
-    """All enabled models across all enabled providers.
+def _all_enabled_rows() -> list[dict]:
+    """Enabled rows as the DB holds them — the cache layer, no policy.
 
-    `channel` (e.g. "web", "cli", "ide-vscode", "api") filters against each
-    model's `capabilities.channels` list; a model with no `channels` entry is
-    visible on every channel (the common case — most models aren't
-    channel-restricted).
+    What goes in the KV, and the only thing that may: BLOCKED_MODELS is
+    env-derived PER PROCESS while this cache is shared across every worker, so
+    applying the deny-list before the write would let one worker's flags decide
+    another worker's catalogue.
     """
     models = _read_cache()
     if models is None:
         models = _load_from_db()
         _write_cache(models)
+    return models
+
+
+def get_enabled_models(channel: Optional[str] = None) -> list[dict]:
+    """All enabled models across all enabled providers, minus the deny-list.
+
+    `channel` (e.g. "web", "cli", "ide-vscode", "api") filters against each
+    model's `capabilities.channels` list; a model with no `channels` entry is
+    visible on every channel (the common case — most models aren't
+    channel-restricted).
+
+    BLOCKED_MODELS is applied HERE (D87) rather than at each catalogue, so
+    every reader inherits it — the four pickers, get_model(),
+    get_default_model_id(), the tier resolver and model_router. Before this,
+    three callers filtered and ~17 did not, which is how the platform came to
+    advertise a model its own request path answers 400 for. The three
+    (model_governance_router, endpoint_model_catalog, db/migrate) are now
+    redundant and kept: each is a defence at a different layer.
+    """
+    from core.model_registry import is_blocked_model
+
+    models = [m for m in _all_enabled_rows() if not is_blocked_model(m["model_id"])]
 
     if channel:
         models = [
@@ -194,6 +216,18 @@ def get_enabled_models(channel: Optional[str] = None) -> list[dict]:
             or channel in m["capabilities"]["channels"]
         ]
     return models
+
+
+def blocked_enabled_models() -> list[dict]:
+    """The complement of get_enabled_models()'s deny-list filter.
+
+    Rows an admin enabled that the platform will not serve. They now vanish
+    from every picker, so the operator needs somewhere to find out why —
+    gateway.py's boot audit and doctor.sh both read this (D89).
+    """
+    from core.model_registry import is_blocked_model
+
+    return [m for m in _all_enabled_rows() if is_blocked_model(m["model_id"])]
 
 
 def get_model(model_id: str) -> Optional[dict]:

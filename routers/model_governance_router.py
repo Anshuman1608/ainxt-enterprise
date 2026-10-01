@@ -203,7 +203,7 @@ def _all_model_ids() -> List[str]:
     return a list of blank strings — see the LLM provider config design
     doc's post-launch fixes.
     """
-    from core.model_registry import BLOCKED_MODELS
+    from core.model_registry import is_blocked_model
 
     try:
         from core.llm_provider_registry import get_enabled_models
@@ -211,9 +211,10 @@ def _all_model_ids() -> List[str]:
     except Exception:
         model_ids = []
 
-    # Exclude any model that is currently blocked (e.g. a retired id an admin
-    # accidentally synced back in).
-    return [m for m in model_ids if m not in BLOCKED_MODELS]
+    # Redundant since D87 — get_enabled_models() applies the deny-list itself —
+    # and kept as a second layer. Through the shared matcher, so it cannot
+    # answer differently from the one above it.
+    return [m for m in model_ids if not is_blocked_model(m)]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────

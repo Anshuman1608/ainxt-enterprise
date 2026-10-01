@@ -288,15 +288,20 @@ def _is_cli_forbidden_model(model_id: str) -> bool:
     mid = model_id.strip().lower()
     try:
         from core.model_registry import (
-            BLOCKED_MODELS, CLAUDE_OPUS_MODEL, CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL,
+            BLOCKED_MODELS, is_blocked_model,
+            CLAUDE_OPUS_MODEL, CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL,
         )
-        blocked = {m.lower() for m in BLOCKED_MODELS}
+        # Both: the shared matcher adds the dated-snapshot rule, the local set
+        # keeps this guard's case-insensitivity and its call-time Opus read.
+        if is_blocked_model(model_id):
+            return True
+        opus_off = {m.lower() for m in BLOCKED_MODELS}
         if os.getenv("ENABLE_OPUS", "true").strip().lower() not in ("true", "1", "yes"):
-            blocked |= {
+            opus_off |= {
                 m.lower() for m in
                 (CLAUDE_OPUS_MODEL, CLAUDE_OPUS_48_MODEL, CLAUDE_OPUS_5_MODEL)
             }
-        if mid in blocked:
+        if mid in opus_off:
             return True
     except Exception as e:  # pragma: no cover - defensive; never let this crash the guard
         logger.warning(f"[SDLC-CLI] model guard: could not import BLOCKED_MODELS: {e}")

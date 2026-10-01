@@ -8485,11 +8485,12 @@ def _part_ad1_tier_models_2026_09_25():
     db = SessionLocal()
     try:
         try:
-            blocked = set(_reg.BLOCKED_MODELS)
+            _blocked = _reg.is_blocked_model
         except Exception:
-            blocked = set()
+            def _blocked(_mid):
+                return False
 
-        models = [m for m in get_enabled_models() if m["model_id"] not in blocked]
+        models = [m for m in get_enabled_models() if not _blocked(m["model_id"])]
         if not models:
             print("  ✓ Part AD1: no enabled models in the registry — all 8 tiers "
                   "left unassigned (configure providers in the admin screen)")

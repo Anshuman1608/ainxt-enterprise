@@ -23,6 +23,7 @@
 # ============================================================
 
 import os
+import re
 
 from core.logger import logger
 
@@ -477,6 +478,34 @@ _BLOCKED_MODELS_EXTRA: set[str] = {
 if _BLOCKED_MODELS_EXTRA:
     BLOCKED_MODELS.update(_BLOCKED_MODELS_EXTRA)
 
+
+# A vendor's dated snapshot of a model is that model: providers list
+# "claude-sonnet-4-5-20250929" where this set says "claude-sonnet-4-5", so an
+# exact-match deny-list silently stops applying the moment an admin runs
+# "Sync models". Measured on a live deployment: two retired models were being
+# advertised and served that way.
+_DATED_SNAPSHOT = re.compile(r"-\d{8}$")
+
+
+def is_blocked_model(model_id: str) -> bool:
+    """The one place `BLOCKED_MODELS` is interpreted (D85).
+
+    Every caller — the catalogue filter in core.llm_provider_registry and the
+    per-request gates — goes through here, so "advertised" and "servable"
+    cannot drift apart again.
+
+    An empty id deliberately keeps today's answer rather than a better one:
+    `""` IS in BLOCKED_MODELS on an admin-only install (the blank SKU
+    constants get added under their flags), and gateway_claude.py:118 records
+    what changing that costs.
+    """
+    mid = (model_id or "").strip()
+    if mid in BLOCKED_MODELS:
+        return True
+    base = _DATED_SNAPSHOT.sub("", mid)
+    return base != mid and base in BLOCKED_MODELS
+
+
 def _role_model(env_value: str, family: str, tag: str) -> str:
     """Fall back to a registry-configured model when a role-specific env
     constant (CLAUDE_PRIMARY_MODEL, OPENAI_CODING_MODEL, etc.) is blank.
@@ -648,10 +677,13 @@ def _legacy_cli_model_for_tier(hint: str) -> str:
         return LOCAL_LLM_MODEL_NAME
 
     enable_opus = os.getenv("ENABLE_OPUS", "true").lower() in ("true", "1", "yes")
-    blocked = set(BLOCKED_MODELS)
-    if not enable_opus:
-        blocked.add(CLAUDE_OPUS_MODEL)
-        blocked.add(CLAUDE_OPUS_48_MODEL)
+    # Two extras on top of the shared matcher: this function re-reads
+    # ENABLE_OPUS at call time rather than at import, so a test that flips it
+    # sees the change.
+    _opus_off = set() if enable_opus else {CLAUDE_OPUS_MODEL, CLAUDE_OPUS_48_MODEL}
+
+    def blocked(mid: str) -> bool:
+        return mid in _opus_off or is_blocked_model(mid)
 
     _tier_to_role = {
         "solution":  (_tier_env_override("solution") or CLAUDE_OPUS_MODEL,    "anthropic", "opus"),
@@ -668,14 +700,14 @@ def _legacy_cli_model_for_tier(hint: str) -> str:
         # return it verbatim. BLOCKED_MODELS is the only gate — an operator who
         # names a model has opted in to it. The value is used solely as a
         # model-id string / argv element, never in a shell.
-        if hint and hint.strip() and hint.strip() not in blocked:
+        if hint and hint.strip() and not blocked(hint.strip()):
             return hint.strip()
         return _role_model(_tier_env_override("complex") or CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
 
     env_value, family, tag = _tier_to_role[_key]
     model_id = _role_model(env_value, family, tag)
 
-    if model_id in blocked:
+    if blocked(model_id):
         return _role_model(_tier_env_override("complex") or CLAUDE_PRIMARY_MODEL, "anthropic", "complex")
     return model_id
 
@@ -730,7 +762,7 @@ def cli_tier_model_id(tier, legacy_hint: str, override: str = "", *,
             # Historical: the ainxt CLI has no Ollama bridge, so "local" meant
             # the cheap Anthropic model, not the in-house one. Preserved.
             return _role_model(CLAUDE_HAIKU, "anthropic", "haiku")
-        if value in set(BLOCKED_MODELS):
+        if is_blocked_model(value):
             return _role_model(_tier_env_override("complex") or CLAUDE_PRIMARY_MODEL,
                                "anthropic", "complex")
         return value
@@ -747,10 +779,9 @@ def cli_tier_model_id(tier, legacy_hint: str, override: str = "", *,
         try:
             from core.tier_resolver import Constraints, resolve_tier_candidates
             from core.tiers import Tier
-            blocked = set(BLOCKED_MODELS)
             for cand in resolve_tier_candidates(
                     Tier(tier), Constraints(require_role=require_role)):
-                if cand.model_id in blocked:
+                if is_blocked_model(cand.model_id):
                     rejected.append(f"{cand.model_id} (blocked on this deployment)")
                     continue
                 if not cli_model_is_addressable(cand.model_id):

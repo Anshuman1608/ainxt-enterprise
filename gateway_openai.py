@@ -125,9 +125,9 @@ class OpenAIGateway:
 
     def generate_with_model(self, prompt, model):
 
-        from core.model_registry import BLOCKED_MODELS
+        from core.model_registry import is_blocked_model
 
-        if model in BLOCKED_MODELS:
+        if is_blocked_model(model):
             raise Exception(f"Blocked model attempted: {model}")
 
         # compliance check already exists

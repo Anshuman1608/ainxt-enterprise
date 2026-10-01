@@ -35,7 +35,7 @@ from core.logger import logger
 # imports, no I/O) — a top-level import is safe and keeps this module simple.
 from core.model_registry import (
     CLAUDE_OPUS_MODEL, CLAUDE_OPUS_46_MODEL,
-    BLOCKED_MODELS, cli_coder_model, cli_tier_model_id,
+    is_blocked_model, cli_coder_model, cli_tier_model_id,
 )
 
 
@@ -138,12 +138,13 @@ def fix_model() -> str:
                      model=default_model, source="default")
         return default_model
 
-    blocked = set(BLOCKED_MODELS)
+    # ENABLE_OPUS is re-read at call time, so those two stay local; everything
+    # else goes through the shared matcher (D85).
+    opus_off = set()
     if os.getenv("ENABLE_OPUS", "true").strip().lower() not in ("true", "1", "yes"):
-        blocked.add(CLAUDE_OPUS_MODEL)
-        blocked.add(CLAUDE_OPUS_46_MODEL)
+        opus_off = {CLAUDE_OPUS_MODEL, CLAUDE_OPUS_46_MODEL}
 
-    model = default_model if raw in blocked else raw
+    model = default_model if (raw in opus_off or is_blocked_model(raw)) else raw
     logger.info("[SDLC-GOV] Resolved governance fixer model", model=model, source="env")
     return model
 

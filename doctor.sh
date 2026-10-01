@@ -470,6 +470,23 @@ if [[ -n "$tables" && "$tables" -ge 50 ]]; then
       pass "llm models classified" "all have privacy_class"
     fi
 
+    # BLOCKED_MODELS withdraws a model from every picker, so an admin can
+    # enable one and never see it offered. Not SQL: the deny-list is built
+    # from env flags in core/model_registry.py, so only the gateway knows it.
+    # "OK " prefix distinguishes "the gateway answered, nothing is blocked"
+    # from "the gateway did not answer" — both are an empty model list.
+    # The "OK" prefix distinguishes "the gateway answered, nothing is blocked"
+    # from "the gateway did not answer" — both are otherwise an empty list.
+    blocked_raw="$(docker exec ainxt-gateway python -c 'from core.llm_provider_registry import blocked_enabled_models as b; print("OK " + ", ".join(m["model_id"] for m in b()))' 2>/dev/null | grep '^OK' | tail -1)"
+    if [[ -z "$blocked_raw" ]]; then
+      skip "llm deny-list clear" "gateway not reachable"
+    elif [[ "$blocked_raw" != "OK" ]]; then
+      warno "llm deny-list clear" "enabled but withdrawn: ${blocked_raw#OK }" \
+            "BLOCKED_MODELS refuses these, so no picker offers them and no request can use them — disable them in Admin > LLM Providers, or remove the id from the deny-list"
+    else
+      pass "llm deny-list clear" "no enabled model is on the deny-list"
+    fi
+
     # modality decides eligibility for the image/video tiers.
     no_modality="$(run_sql "SELECT count(*) FROM ainxt.llm_models WHERE enabled = TRUE AND capabilities->>'modality' IS NULL" | tr -d ' \r')"
     if [[ -n "$no_modality" && "$no_modality" -gt 0 ]]; then

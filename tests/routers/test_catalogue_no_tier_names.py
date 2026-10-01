@@ -123,6 +123,11 @@ _LOCAL = {
 
 _ROWS = [_CLOUD, _UNASSIGNED, _LOCAL]
 
+#: Captured before the autouse fixture below can replace it, so the one test
+#: that needs the REAL function (the deny-list case) can put it back.
+_REAL_GET_ENABLED_MODELS = __import__(
+    "core.llm_provider_registry", fromlist=["x"]).get_enabled_models
+
 
 @pytest.fixture(autouse=True)
 def _registry(monkeypatch):
@@ -285,6 +290,40 @@ def test_a_model_with_no_tier_assignment_is_still_offered(name, monkeypatch):
         f"{name} dropped {_UNASSIGNED['model_id']}, whose capabilities are "
         f"None — §H says it must still be selectable"
     )
+
+
+@pytest.mark.parametrize("name", list(CATALOGUES))
+def test_no_catalogue_advertises_a_blocked_model(name, monkeypatch):
+    """D83, end to end through the real filter.
+
+    Note what this test has to undo. The autouse `_registry` fixture above
+    replaces `get_enabled_models` itself, and the deny-list filter lives
+    INSIDE that function — so written the usual way this test would stub out
+    the thing it is checking and pass against any implementation. It restores
+    the real function and stubs `_read_cache` instead, one layer down.
+    """
+    import core.llm_provider_registry as reg
+    import core.model_registry as mreg
+
+    # Stubbing below _load_from_db() means supplying ITS shape: that function
+    # normalises `capabilities` to {} (`model.capabilities or {}`), so the
+    # None _UNASSIGNED carries for the §H test never reaches this layer.
+    rows = [dict(r, capabilities=r["capabilities"] or {}) for r in _ROWS] + [{
+        "id": "uuid-retired", "model_id": "vendor-x-0",
+        "display_name": "Vendor X 0", "family": "openai",
+        "provider_id": "p9", "provider_slug": "vendorco",
+        "provider_name": "VendorCo", "base_url": None,
+        "capabilities": dict(_CAPS), "is_default": False, "sort_order": 9,
+    }]
+    monkeypatch.setattr(mreg, "BLOCKED_MODELS", {"vendor-x-0"})
+    monkeypatch.setattr(reg, "get_enabled_models", _REAL_GET_ENABLED_MODELS)
+    monkeypatch.setattr(reg, "_read_cache", lambda: [dict(r) for r in rows])
+
+    blob = json.dumps(CATALOGUES[name](monkeypatch))
+    assert "vendor-x-0" not in blob, (
+        f"{name} advertises a deny-listed model; the request path answers "
+        f"400 for it")
+    assert _CLOUD["model_id"] in blob, f"{name} returned nothing usable"
 
 
 @pytest.mark.parametrize("name", ["GET /ide/models", "GET /v1/models + /models"])

@@ -66,7 +66,7 @@ def get_cloud_models() -> List[str]:
     strings — see the LLM provider config design doc's post-launch fixes.
     """
     try:
-        from core.model_registry import BLOCKED_MODELS
+        from core.model_registry import is_blocked_model
         from core.llm_provider_registry import get_enabled_models
     except Exception as exc:
         logger.warning("endpoint_catalog: registry import failed → %s", exc)
@@ -76,7 +76,7 @@ def get_cloud_models() -> List[str]:
         out: List[str] = []
         for m in get_enabled_models():
             mid = m["model_id"]
-            if not mid or mid in BLOCKED_MODELS or m["family"] == "ollama":
+            if not mid or is_blocked_model(mid) or m["family"] == "ollama":
                 continue
             if m["capabilities"].get("billing_tier") == "free":
                 continue

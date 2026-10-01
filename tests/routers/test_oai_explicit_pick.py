@@ -39,8 +39,14 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 GATEWAY = ROOT / "gateway.py"
 
-#: The ids GET /v1/models serves on a Claude-only deployment, measured
+#: The ids GET /v1/models served on a Claude-only deployment, measured
 #: 2026-10-01 from get_cli_style_models(). Every one must come back verbatim.
+#:
+#: D83 has since withdrawn three of them (the last three below) as retired, so
+#: the live catalogue is 9. The list is kept at 11 on purpose: these cases
+#: assert what _oai_explicit_model_id() does with an id the registry reports
+#: as enabled, and the fake registry below is what decides that. The deny-list
+#: is a separate layer, covered by test_a_deny_listed_id_is_refused_outright.
 SERVED_CLOUD_IDS = [
     "claude-sonnet-5-5",
     "claude-opus-5-5",
@@ -236,3 +242,49 @@ def test_the_audit_accepts_a_registry_id_without_a_hint(tree):
     body = ast.unparse(fn)
     assert "get_model" in body, "the audit still demands a hint for every id"
     assert "_oai_model_hint" in body
+
+
+# ── the deny-list layer (D83/D88) ──────────────────────────────────────────
+
+
+def test_a_blocked_id_is_not_resolved_as_an_explicit_pick(explicit_model_id,
+                                                          monkeypatch):
+    """get_enabled_models() applies the deny-list, and get_model() reads
+    through it, so a retired id stops being an explicit pick for free."""
+    import core.llm_provider_registry as reg
+    monkeypatch.setattr(reg, "get_model", lambda mid: None)
+    assert explicit_model_id("claude-opus-4-6") == ""
+
+
+def test_a_deny_listed_id_is_refused_outright(src):
+    """Without this gate the endpoint would answer a retired id by falling
+    through to _oai_model_hint(), which prefix-matches it onto SOME other
+    model and serves that — measured: all three now auto-route to
+    llama3.2:1b. That is exactly the silent substitution D81 removed."""
+    assert "_is_blocked_oai(req.model)" in src
+    assert '"code": "model_not_available"' in src
+
+
+def test_the_gate_runs_before_the_turn_is_traced(tree):
+    """The CLI lane rejects before the routing log for a reason — a refused
+    request should not first appear as a routed one. This asserts the same
+    ordering here: the gate precedes the compliance pass that builds the
+    prompt, so a 400 costs nothing."""
+    fn = _fn(tree, "openai_chat_completions")
+    lines = [n.lineno for n in ast.walk(fn)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "id", "") == "_is_blocked_oai"]
+    assert len(lines) == 1, f"expected one deny-list gate, found {len(lines)}"
+    redaction = [n.lineno for n in ast.walk(fn)
+                 if isinstance(n, ast.Call)
+                 and getattr(n.func, "attr", "") == "validate_input"]
+    assert redaction and lines[0] < min(redaction), (
+        "the deny-list gate runs after the compliance pass; a refused request "
+        "pays for the whole prompt build first")
+
+
+def test_an_empty_model_does_not_trip_the_gate(src):
+    """"" IS in BLOCKED_MODELS on an admin-only install (the blank SKU
+    constants), and an OpenAI client that omits `model` must still auto-route
+    rather than get a 400."""
+    assert '(req.model or "").strip() and _is_blocked_oai(req.model)' in src

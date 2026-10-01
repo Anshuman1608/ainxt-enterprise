@@ -563,8 +563,8 @@ async def _stream_claude(
 ) -> AsyncGenerator[str, None]:
     # Last-resort block: the handler already rejects blocked models before calling
     # _stream_claude(), but guard here too in case of direct internal calls.
-    from core.model_registry import BLOCKED_MODELS
-    if model_hint in BLOCKED_MODELS:
+    from core.model_registry import is_blocked_model
+    if is_blocked_model(model_hint):
         logger.warning(
             f"[CLI] _stream_claude: blocked model reached stream layer model={model_hint} user={user_id}"
         )
@@ -3026,8 +3026,8 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
     # Reject immediately if the requested model is disabled (e.g. any Opus model
     # when ENABLE_OPUS=false). This fires before the routing log so a blocked
     # request never appears as "routing … provider=claude" in the logs.
-    from core.model_registry import BLOCKED_MODELS as _BLOCKED_MODELS
-    if model_hint in _BLOCKED_MODELS:
+    from core.model_registry import is_blocked_model as _is_blocked_model
+    if _is_blocked_model(model_hint):
         logger.warning(
             f"[CLI] blocked model rejected user={user_id} "
             f"requested={req.model!r} resolved={model_hint!r}"

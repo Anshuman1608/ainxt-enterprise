@@ -1836,12 +1836,17 @@ def _start_cli_mcp_loopback_listener() -> None:
 
 @app.on_event("startup")
 async def startup():
-    # Advertised-model / routing-hint coverage. Runs here rather than at import
-    # time so every model constant in list_oai_models() is defined.
+    # Advertised-model audits. Here rather than at import time because both
+    # read the registry, which needs the DB.
     try:
         _audit_model_hint_coverage()
     except Exception as _mhc_err:
         logger.warning("Model hint coverage audit failed: %s", _mhc_err)
+
+    try:
+        _audit_blocked_but_enabled()
+    except Exception as _bm_err:
+        logger.warning("Blocked-model audit failed: %s", _bm_err)
 
     # ------------------------------------------------------------
     # PLATFORM VERSION
@@ -11099,6 +11104,31 @@ def _audit_model_hint_coverage() -> list:
     return unmapped
 
 
+def _audit_blocked_but_enabled() -> list:
+    """Name the rows an admin enabled that the deny-list withdraws (D89).
+
+    get_enabled_models() now applies BLOCKED_MODELS, so such a model simply
+    stops appearing in every picker. Silent is the wrong shape for that: the
+    operator turned it on in Admin → LLM Providers and has no other way to
+    learn why it is not offered.
+    """
+    try:
+        from core.llm_provider_registry import blocked_enabled_models
+        rows = blocked_enabled_models()
+    except Exception as exc:
+        logger.warning("Blocked-model audit: registry read failed: %s", exc)
+        return []
+    if rows:
+        logger.warning(
+            "MODEL DENY-LIST: %d enabled model(s) are withdrawn by BLOCKED_MODELS "
+            "and serve no request: %s. Disable them in Admin > LLM Providers, or "
+            "remove the id from the deny-list.",
+            len(rows),
+            ", ".join(f"{m['model_id']!r} ({m['display_name']})" for m in rows),
+        )
+    return rows
+
+
 def _messages_have_image(msgs) -> bool:
     """True if any message carries an image_url content part (multimodal turn)."""
     for m in msgs:
@@ -11155,6 +11185,27 @@ def openai_chat_completions(
                 ),
                 "type": "invalid_request_error",
                 "code": "direct_access_disabled",
+            }},
+        )
+
+    # ── Blocked-model gate (D88) ──────────────────────────────────────────
+    # Before the tracing and the compliance pass, for the reason the CLI lane
+    # gives: a refused request should not first appear in the logs as a routed
+    # one. Without this a deny-listed id falls through to _oai_model_hint(),
+    # which prefix-matches it onto a different model and serves that silently.
+    from core.model_registry import is_blocked_model as _is_blocked_oai
+    if (req.model or "").strip() and _is_blocked_oai(req.model):
+        from fastapi.responses import JSONResponse as _JR_oai_blocked
+        logger.warning("[IDE] blocked model rejected requested=%r", req.model)
+        return _JR_oai_blocked(
+            status_code=400,
+            content={"error": {
+                "message": (
+                    f"Model '{req.model}' is not available. Some models are "
+                    f"disabled. Please select a different model."
+                ),
+                "type": "invalid_request_error",
+                "code": "model_not_available",
             }},
         )
 
